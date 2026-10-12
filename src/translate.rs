@@ -396,7 +396,7 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str, urust_name: 
     }
     ty.push_str(&format!("('s, {}, 'abort, 'i, 'o) function_body", self_ty));
     format!(
-        "definition {} :: {} where\n  {}\nmicro_rust_notation (call) {} (\"{}\")\n\n",
+        "definition \"{}\" :: {} where\n  {}\nmicro_rust_notation (call) {} (\"{}\")\n\n",
         name,
         cart(&ty),
         cart(&format!(
@@ -426,9 +426,9 @@ fn subst_markers(fe: &Frontend<'_>, body: &str, caller_scc: Option<&HashSet<DefI
         let s = match (kind, rec) {
             ("C", false) | ("H", false) => name.clone(),
             ("Z", false) => format!("{}()", name),
-            ("C", true) => format!("\\<epsilon>\\<open>{}_fuel fuel_rec\\<close>", name),
-            ("H", true) => format!("({}_fuel fuel_rec)", name),
-            ("Z", true) => format!("\\<epsilon>\\<open>funcall0 ({}_fuel fuel_rec)\\<close>", name),
+            ("C", true) => format!("\\<epsilon>\\<open>rec_{}\\<close>", name),
+            ("H", true) => format!("rec_{}", name),
+            ("Z", true) => format!("\\<epsilon>\\<open>funcall0 rec_{}\\<close>", name),
             _ => unreachable!(),
         };
         out.push_str(&s);
@@ -476,50 +476,71 @@ fn emit_funs(fe: &mut Frontend<'_>) -> String {
             out.push_str(&emit_def(fe, d, &body));
             continue;
         }
+        // A recursive group f1..fk is defined by iterating a non-recursive step functional
+        // `urust_fuel` times, starting from functions that panic ("out of fuel").
         let set: HashSet<DefId> = comp.iter().copied().collect();
-        let mut heads = vec![];
-        let mut eqs = vec![];
+        let members: Vec<&FunDef> = comp.iter().map(|c| &defs[by_id[c]]).collect();
+        let k = members.len();
+        let step = format!("{}_rec_step", members[0].name);
+        let tys: Vec<String> = members.iter().map(|d| fe.fun_type(&d.param_tys, &d.ret_ty)).collect();
+        let tuple_ty = tys.iter().map(|t| format!("({})", t)).collect::<Vec<_>>().join(" \\<times> ");
+        let recs: Vec<String> = members.iter().map(|d| format!("rec_{}", d.name)).collect();
+        let binder = if k == 1 { recs[0].clone() } else { format!("({})", recs.join(", ")) };
+        let lam = |d: &FunDef| if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
+        let bodies: Vec<String> = members
+            .iter()
+            .map(|d| {
+                let body = subst_markers(fe, &d.body, Some(&set), &names);
+                format!("{}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>", lam(d), indent(&body, 4))
+            })
+            .collect();
+        let bottoms: Vec<String> = members
+            .iter()
+            .map(|d| format!("{}FunctionBody \\<lbrakk> panic!(\"out of fuel\") \\<rbrakk>", lam(d)))
+            .collect();
         writeln!(
             out,
-            "text \\<open>Recursive group, translated with a fuel parameter: {}\\<close>\n",
-            comp.iter().map(|c| defs[by_id[c]].name.clone()).collect::<Vec<_>>().join(", ")
+            "text \\<open>Recursive group {}: defined by iterating {} \\<^term>\\<open>urust_fuel\\<close> times.\\<close>\n",
+            members.iter().map(|d| d.name.clone()).collect::<Vec<_>>().join(", "),
+            step
         )
         .unwrap();
-        for c in &comp {
-            let d = &defs[by_id[c]];
-            let ty = fe.fun_type(&d.param_tys, &d.ret_ty);
-            heads.push(format!("{}_fuel :: {}", d.name, cart(&format!("nat \\<Rightarrow> {}", ty))));
-            let lam = if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
-            let body = subst_markers(fe, &d.body, Some(&set), &names);
-            eqs.push(cart(&format!(
-                "{}_fuel 0 = ({}FunctionBody \\<lbrakk> panic!(\"out of fuel\") \\<rbrakk>)",
-                d.name, lam
-            )));
-            eqs.push(cart(&format!(
-                "{}_fuel (Suc fuel_rec) = ({}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>)",
-                d.name,
-                lam,
-                indent(&body, 4)
-            )));
-        }
-        writeln!(out, "fun {} where\n  {}\n", heads.join("\nand "), eqs.join("\n| ")).unwrap();
-        for c in &comp {
-            let d = &defs[by_id[c]];
+        let tuple = |xs: &[String]| if xs.len() == 1 { format!("({})", xs[0]) } else { format!("({})", xs.join(",\n   ")) };
+        writeln!(
+            out,
+            "definition \"{}\" :: {} where\n  {}\n",
+            step,
+            cart(&format!("({}) \\<Rightarrow> ({})", tuple_ty, tuple_ty)),
+            cart(&format!("{} \\<equiv> \\<lambda>{}. {}", step, binder, tuple(&bodies)))
+        )
+        .unwrap();
+        let start = tuple(&bottoms);
+        for (i, d) in members.iter().enumerate() {
+            let iter = format!("(({} ^^ urust_fuel) {})", step, start);
+            let proj = if k == 1 {
+                iter
+            } else {
+                let mut s = iter;
+                for _ in 0..i {
+                    s = format!("(snd {})", s);
+                }
+                if i + 1 < k { format!("(fst {})", s) } else { s }
+            };
             writeln!(out, "(* Rust: {} *)", d.rust_path).unwrap();
             for cm in &d.comments {
                 writeln!(out, "(* {} *)", cm).unwrap();
             }
-            let ty = fe.fun_type(&d.param_tys, &d.ret_ty);
             writeln!(
                 out,
-                "definition {} :: {} where\n  {}\n",
+                "definition \"{}\" :: {} where\n  {}\n",
                 d.name,
-                cart(&ty),
-                cart(&format!("{} \\<equiv> {}_fuel urust_fuel", d.name, d.name))
+                cart(&tys[i]),
+                cart(&format!("{} \\<equiv> {}", d.name, proj))
             )
             .unwrap();
         }
     }
+
     fe.fun_defs = defs;
     out
 }
@@ -534,7 +555,7 @@ fn emit_def(fe: &Frontend<'_>, d: &FunDef, body: &str) -> String {
     let lam = if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
     writeln!(
         out,
-        "definition {} :: {} where\n  \\<open>{} \\<equiv> {}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>\\<close>\n",
+        "definition \"{}\" :: {} where\n  \\<open>{} \\<equiv> {}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>\\<close>\n",
         d.name,
         cart(&ty),
         d.name,
@@ -552,7 +573,7 @@ fn emit_ext_funs(funs: &std::collections::BTreeMap<String, ExtFun>, what: &str) 
         let lam = if ps.is_empty() { String::new() } else { format!("\\<lambda>{}. ", ps.join(" ")) };
         writeln!(
             out,
-            "(* Rust: {} *)\ndefinition {} :: {} where\n  {}\n",
+            "(* Rust: {} *)\ndefinition \"{}\" :: {} where\n  {}\n",
             f.rust_path,
             f.hol_name,
             cart(&f.hol_type),
@@ -577,7 +598,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
 
     // external / placeholder types
     let mut te = header(&format!("{}_TypesExternal_Template", c));
-    te.push_str("  imports \"Micro_Rust_Std_Lib.StdLib_All\"\nbegin\n\n");
+    te.push_str("  imports \"Micro_Rust_Std_Lib.Micro_Rust_Std_Lib\"\nbegin\n\n");
     te.push_str("text \\<open>Types without a uRust model. Replace these declarations by models.\\<close>\n\n");
     for (n, t) in &fe.ext_types {
         let args = if t.arity == 0 {

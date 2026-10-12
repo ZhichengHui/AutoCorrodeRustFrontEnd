@@ -37,6 +37,31 @@ const RESERVED: &[&str] = &[
     "is_err", "unwrap", "expect", "clone", "fold_left",
 ];
 
+/// Isar outer-syntax keywords: not usable as names of `definition`s.
+const OUTER_KEYWORDS: &[&str] = &[
+    "record", "keywords", "imports", "theory", "begin", "end", "definition", "abbreviation", "lemma",
+    "theorem", "corollary", "proposition", "fun", "function", "primrec", "datatype", "codatatype",
+    "type_synonym", "typedecl", "locale", "context", "text", "txt", "section", "subsection",
+    "chapter", "paragraph", "notation", "no_notation", "consts", "axiomatization", "instance",
+    "instantiation", "class", "interpretation", "sublocale", "global_interpretation", "inductive",
+    "coinductive", "termination", "value", "term", "thm", "typ", "prop", "export_code", "declare",
+    "lemmas", "named_theorems", "method", "attribute", "syntax", "translations", "experiment",
+    "bundle", "include", "including", "includes", "unbundle", "proof", "qed", "by", "apply", "done",
+    "oops", "sorry", "using", "unfolding", "fix", "assume", "presume", "obtain", "show", "have",
+    "thus", "hence", "then", "from", "with", "note", "moreover", "ultimately", "also", "finally",
+    "next", "case", "where", "and", "for", "fixes", "assumes", "shows", "obtains", "defines",
+    "notes", "constrains", "is", "if", "when", "open", "overloaded", "pervasive", "private",
+    "qualified", "monos", "binder", "infix", "infixl", "infixr", "structure", "ML", "setup",
+    "simproc_setup", "hide_const", "hide_type", "hide_fact", "adhoc_overloading", "nitpick",
+    "quickcheck", "sledgehammer", "print_theorems", "find_theorems", "datatype_record",
+    "micro_rust_record", "micro_rust_notation", "nonterminal", "parse_translation",
+    "print_translation", "parse_ast_translation", "type_notation", "default_sort", "oracle",
+    "partial_function", "nominal_function", "fun_cases", "inductive_set", "specification",
+    "functor", "free_constructors", "lift_definition", "quotient_type", "typedef", "copy_bnf",
+    "bnf", "old_datatype", "old_rep_datatype", "code_printing", "code_identifier", "schematic_goal",
+    "supply", "guess", "let", "write", "back", "defer", "prefer", "subgoal", "unfolding",
+];
+
 /// Single-letter / short names above are not dangerous as plain lambda binders, but
 /// they are dangerous as case-pattern binders only if they are constants. We keep the
 /// list conservative but do not rename one-letter variables: those are never HOL constants.
@@ -77,7 +102,7 @@ pub fn local_name(s: &str) -> String {
 pub fn global_name(segments: &[String]) -> String {
     let joined: Vec<String> = segments.iter().map(|s| ident_chars(s)).collect();
     let base = joined.join("_");
-    if is_reserved(&base) { format!("{}_fn", base) } else { base }
+    if is_reserved(&base) || OUTER_KEYWORDS.contains(&base.as_str()) { format!("{}_fn", base) } else { base }
 }
 
 /// HOL type names that must not be redefined.
@@ -92,7 +117,11 @@ const RESERVED_TYPES: &[&str] = &[
 
 pub fn type_name(segments: &[String]) -> String {
     let base = global_name_raw(segments);
-    if RESERVED_TYPES.contains(&base.as_str()) { format!("{}_t", base) } else { base }
+    if RESERVED_TYPES.contains(&base.as_str()) || OUTER_KEYWORDS.contains(&base.as_str()) {
+        format!("{}_t", base)
+    } else {
+        base
+    }
 }
 
 fn global_name_raw(segments: &[String]) -> String {

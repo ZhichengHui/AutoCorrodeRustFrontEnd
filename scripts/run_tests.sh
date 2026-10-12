@@ -42,6 +42,8 @@ done
 {
   echo "session Frontend_Tests = AutoCorrode +"
   echo "  options [document = false, timeout = 3600]"
+  echo "  directories"
+  for t in "${theories[@]}"; do echo "    \"$(echo "$t" | tr -d '"' | cut -d/ -f1)\""; done
   echo "  theories"
   for t in "${theories[@]}"; do echo "    $t"; done
 } > "$OUT/ROOT"

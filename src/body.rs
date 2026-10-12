@@ -40,7 +40,8 @@ impl Tr {
     pub fn new(s: impl Into<String>, prec: u32) -> Tr { Tr { s: s.into(), prec } }
     /// Render with at least precedence `p`, adding parentheses otherwise.
     pub fn at(&self, p: u32) -> String {
-        if self.prec >= p { self.s.clone() } else { format!("({})", self.s) }
+        // `(|` is the ASCII form of the record bracket: separate it from a closure
+        if self.prec >= p { self.s.clone() } else if self.s.starts_with('|') { format!("( {})", self.s) } else { format!("({})", self.s) }
     }
 }
 
@@ -167,6 +168,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if h.contains("'r") {
             let _ = sp;
             return unsup("mutable local of a generic type (needs a locale prism for a type parameter)");
+        }
+        if h.contains("unsupported_") {
+            return unsup(format!("mutable local of the unsupported type `{}`", t));
         }
         self.fe.need_alloc(&h);
         Ok(())
@@ -550,7 +554,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Tup(es) => {
                 if es.is_empty() { return Ok(Tr::atom("()")) }
                 if es.len() == 1 { return unsup("1-tuple") }
-                let v: R<Vec<String>> = es.iter().map(|x| self.val(x).map(|t| t.s)).collect();
+                let v: R<Vec<String>> = es.iter().map(|x| self.val(x).map(|t| t.at(11))).collect();
                 Ok(Tr::new(format!("({})", v?.join(", ")), 998))
             }
             ExprKind::Binary(op, l, r) => self.binary(e, op.node, l, r),
@@ -629,7 +633,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Struct(qp, fields, tail) => self.struct_expr(e, qp, fields, tail),
             ExprKind::Array(es) => {
                 if es.is_empty() { return Ok(Tr::atom("[]")) }
-                let v: R<Vec<String>> = es.iter().map(|x| self.val(x).map(|t| t.s)).collect();
+                let v: R<Vec<String>> = es.iter().map(|x| self.val(x).map(|t| t.at(11))).collect();
                 Ok(Tr::atom(format!("[{}]", v?.join(", "))))
             }
             ExprKind::Repeat(..) => unsup("array repeat expression"),
@@ -746,7 +750,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Some("Option") => return Ok(Tr::atom("None")),
             Some("Ordering") => {
                 let v = self.tcx.adt_def(adt).variant(vidx.into()).name.to_string();
-                return Ok(Tr::atom(v));
+                return Ok(Tr::atom(format!("Ordering::{}", v)));
             }
             _ => {}
         }
@@ -1001,8 +1005,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Res::Local(hid) => {
                 let Some(l) = self.locals.get(&hid).cloned() else { return unsup("call of unknown local") };
                 if l.cell { return unsup("call of a closure stored in a mutable local") }
+                if !matches!(Self::peel_refs(self.ty_of(callee)).kind(), ty::Closure(..)) {
+                    return unsup("call through a generic `Fn` parameter (trait call in generic code)");
+                }
                 let mut argv = vec![];
-                for a in args { argv.push(self.val(a)?.s); }
+                for a in args { argv.push(self.val(a)?.at(11)); }
                 if argv.is_empty() { Ok(Tr::new(format!("{}()", l.name), 999)) } else {
                     if argv.len() > 8 { return unsup("call with more than 8 arguments") }
                     Ok(Tr::new(format!("{}({})", l.name, argv.join(", ")), 999))
@@ -1059,7 +1066,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let vname = self.tcx.adt_def(adt).variant(vidx.into()).name.to_string();
             return match (k, vname.as_str()) {
                 ("Option", "Some") | ("Result", "Ok") | ("Result", "Err") => {
-                    Ok(Tr::new(format!("{}({})", vname, argv[0].s), 999))
+                    Ok(Tr::new(format!("{}({})", vname, argv[0].at(11)), 999))
                 }
                 _ => unsup("constructor of a standard library type"),
             };
@@ -1067,7 +1074,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !adt.is_local() { return unsup("constructor of an external type") }
         if argv.len() > 8 { return unsup("constructor with more than 8 fields") }
         let n = self.fe.variant_call_name(adt, vidx);
-        let a: Vec<String> = argv.into_iter().map(|t| t.s).collect();
+        let a: Vec<String> = argv.into_iter().map(|t| t.at(11)).collect();
         Ok(Tr::new(format!("{}({})", n, a.join(", ")), 999))
     }
 
@@ -1075,7 +1082,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if self.fe.is_trait_item(did) { return unsup("call of a trait default method") }
         self.calls.insert(did);
         let m = self.fe.marker(did);
-        let a: Vec<String> = argv.iter().map(|t| t.s.clone()).collect();
+        let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
         Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a))
     }
 
@@ -1091,7 +1098,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn named_call(&self, name: &str, argv: Vec<Tr>) -> Tr {
-        let a: Vec<String> = argv.into_iter().map(|t| t.s).collect();
+        let a: Vec<String> = argv.into_iter().map(|t| t.at(11)).collect();
         self.callee_app(name, name, &format!("{}()", name), a)
     }
 
@@ -1344,7 +1351,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let n = self.fe.variant_call_name(adt, vidx);
             let fs: Vec<String> = (0..nf).map(|k| {
                 let fname = self.fe.field_name(adt, vidx, k);
-                format!("{}: {}", fname, vals[k].s)
+                format!("{}: {}", fname, vals[k].at(11))
             }).collect();
             Tr::atom(format!("{} {{ {} }}", n, fs.join(", ")))
         };
@@ -1401,7 +1408,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, label: Option<rustc_ast::Label>, src: LoopSource) -> R<Tr> {
         let lp = Self::label_prefix(label);
-        let _ = e;
+        if !Self::is_unit_like(self.ty_of(e)) {
+            return unsup("loop producing a value (`break` with a value)");
+        }
         match src {
             LoopSource::While => {
                 // loop { if cond { body } else { break } }
@@ -1514,25 +1523,110 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn match_expr(&mut self, scrut: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         let st = self.ty_adj(scrut);
         let sv = self.val(scrut)?;
-        if self.int_like(st) {
+        if self.int_like(st) || arms.iter().all(|a| self.chainable(a.pat)) {
             return self.match_chain(sv, arms);
         }
+        let needs_split = arms
+            .iter()
+            .any(|a| Self::irrefutable_shape(a.pat) && (a.guard.is_some() || Self::has_lit(a.pat)));
+        if !needs_split {
+            let m = self.match_arms(&sv, arms)?;
+            return Ok(Tr::new(format!("match {} {{\n{}\n}}", sv.at(20), m), 20));
+        }
+        let tmp = self.fresh("scrut");
+        let tv = Tr::atom(tmp.clone());
+        let m = self.match_arms(&tv, arms)?;
+        Ok(Tr::atom(format!("{{\nlet {} = {};\nmatch {} {{\n{}\n}}\n}}", tmp, sv.at(20), tmp, m)))
+    }
+
+    /// The arms of a uRust `match` on `v`. An arm whose pattern cannot fail but which has a
+    /// condition (guard or literal sub-pattern) becomes a single arm whose body tests the
+    /// condition and matches the remaining arms otherwise: uRust would else generate a
+    /// redundant catch-all case, which HOL rejects.
+    fn match_arms(&mut self, v: &Tr, arms: &'tcx [hir::Arm<'tcx>]) -> R<String> {
         let mut out = vec![];
-        for arm in arms {
+        for (i, arm) in arms.iter().enumerate() {
             let p = self.pat(arm.pat)?;
             let mut conds = p.conds.clone();
             if let Some(g) = arm.guard {
-                if contains_let(g) { return unsup("`if let` guard") }
+                if contains_let(g) {
+                    return unsup("`if let` guard");
+                }
                 let gv = self.val(g)?;
                 conds.push(gv.at(44));
             }
             let mut body = p.prologue.join("\n");
-            if !body.is_empty() { body.push('\n'); }
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            let irref = Self::irrefutable_shape(arm.pat);
+            if irref && !conds.is_empty() {
+                let rest = if i + 1 < arms.len() {
+                    format!("match {} {{\n{}\n}}", v.at(20), self.match_arms(v, &arms[i + 1..])?)
+                } else {
+                    "panic!(\"non-exhaustive match\")".to_string()
+                };
+                let then = self.branch(arm.body)?;
+                body.push_str(&format!("if {} {{\n{}\n}} else {{\n{}\n}}", conds.join(" && "), then, rest));
+                out.push(format!("  {} \\<Rightarrow> {{\n{}\n}}", p.pat, body));
+                break;
+            }
             body.push_str(&self.branch(arm.body)?);
             let guard = if conds.is_empty() { String::new() } else { format!(" if {}", conds.join(" && ")) };
             out.push(format!("  {}{} \\<Rightarrow> {{\n{}\n}}", p.pat, guard, body));
+            if irref {
+                break; // later arms are unreachable
+            }
         }
-        Ok(Tr::new(format!("match {} {{\n{}\n}}", sv.at(20), out.join(",\n")), 20))
+        Ok(out.join(",\n"))
+    }
+
+    /// Patterns that match every value of their type once literal sub-patterns are turned
+    /// into conditions: wildcards, bindings, literals, ranges and tuples of such.
+    fn irrefutable_shape(p: &'tcx hir::Pat<'tcx>) -> bool {
+        match p.kind {
+            PatKind::Wild | PatKind::Range(..) => true,
+            PatKind::Expr(pe) => matches!(pe.kind, hir::PatExprKind::Lit { .. }),
+            PatKind::Binding(_, _, _, sub) => sub.map(Self::irrefutable_shape).unwrap_or(true),
+            PatKind::Tuple(ps, _) => ps.iter().all(Self::irrefutable_shape),
+            PatKind::Ref(q, _, _) | PatKind::Deref(q) => Self::irrefutable_shape(q),
+            _ => false,
+        }
+    }
+
+    fn has_lit(p: &'tcx hir::Pat<'tcx>) -> bool {
+        match p.kind {
+            PatKind::Range(..) => true,
+            PatKind::Expr(pe) => matches!(pe.kind, hir::PatExprKind::Lit { .. }),
+            PatKind::Binding(_, _, _, Some(s)) => Self::has_lit(s),
+            PatKind::Tuple(ps, _) => ps.iter().any(Self::has_lit),
+            PatKind::Ref(q, _, _) | PatKind::Deref(q) => Self::has_lit(q),
+            _ => false,
+        }
+    }
+
+    /// Patterns handled by the `if`-chain translation (`pat_cond`).
+    fn chainable(&self, p: &'tcx hir::Pat<'tcx>) -> bool {
+        match p.kind {
+            PatKind::Wild | PatKind::Range(..) => true,
+            PatKind::Expr(pe) => match pe.kind {
+                hir::PatExprKind::Lit { .. } => true,
+                hir::PatExprKind::Path(ref qp) => match self.typeck.qpath_res(qp, pe.hir_id) {
+                    Res::Def(DefKind::Ctor(CtorOf::Variant, CtorKind::Const), c) => {
+                        let adt = self.tcx.parent(self.tcx.parent(c));
+                        self.fe.std_adt(adt) == Some("Ordering")
+                    }
+                    Res::Def(DefKind::Const | DefKind::AssocConst { .. }, _) => true,
+                    _ => false,
+                },
+            },
+            PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), _, _, sub) => {
+                sub.map(|s| self.chainable(s)).unwrap_or(true)
+            }
+            PatKind::Or(ps) | PatKind::Tuple(ps, _) => ps.iter().all(|q| self.chainable(q)),
+            PatKind::Ref(q, _, _) | PatKind::Deref(q) => self.chainable(q),
+            _ => false,
+        }
     }
 
     /// `match` on integers / chars / strings as an `if` chain.
@@ -1614,6 +1708,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 Ok((Some(cs.join(" || ")), vec![]))
             }
+            PatKind::Tuple(ps, ddpos) => {
+                let t = Self::peel_refs(self.typeck.pat_ty(pat));
+                let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
+                if n > 16 { return unsup("tuple with more than 16 components") }
+                let mut cs = vec![];
+                let mut binds = vec![];
+                for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
+                    if let Some(p) = p {
+                        let proj = Tr::new(format!("{}.{}", v.at(998), k), 998);
+                        let (c, b) = self.pat_cond(p, &proj)?;
+                        if let Some(c) = c { cs.push(format!("({})", c)); }
+                        binds.extend(b);
+                    }
+                }
+                Ok((if cs.is_empty() { None } else { Some(cs.join(" && ")) }, binds))
+            }
             PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_cond(p, v),
             _ => unsup("pattern in a match on a scalar"),
         }
@@ -1654,6 +1764,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         }
                         unsup("constant in pattern")
                     }
+                    Res::Def(DefKind::Ctor(CtorOf::Variant, CtorKind::Const), c) => {
+                        let var = self.tcx.parent(c);
+                        let adt = self.tcx.parent(var);
+                        let vidx = self.tcx.adt_def(adt).variant_index_with_id(var).as_usize();
+                        self.unit_ctor(adt, vidx)
+                    }
                     _ => unsup("path in pattern expression"),
                 }
             }
@@ -1691,6 +1807,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 match sub {
                     None => Ok(n),
+                    Some(s) if matches!(s.kind, PatKind::Range(..))
+                        || matches!(s.kind, PatKind::Expr(pe) if matches!(pe.kind, hir::PatExprKind::Lit { .. })) =>
+                    {
+                        // `n @ 1..=9`: put the condition on `n` itself
+                        let (c, _) = self.pat_cond(s, &Tr::atom(n.clone()))?;
+                        if let Some(c) = c {
+                            conds.push(format!("({})", c));
+                        }
+                        Ok(n)
+                    }
                     Some(s) => {
                         let inner = self.pat_rec(s, conds, pro, false)?;
                         Ok(format!("{} @ {}", n, if inner.contains(' ') { format!("({})", inner) } else { inner }))
@@ -1744,12 +1870,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         _ => {}
                     }
                 }
-                let t = Self::peel_refs(self.typeck.pat_ty(pat));
-                if t.is_bool() {
-                    if let hir::PatExprKind::Lit { lit, .. } = pe.kind {
-                        if let LitKind::Bool(b) = lit.node { return Ok(if b { "true".into() } else { "false".into() }) }
-                    }
-                }
                 let v = self.pat_expr(pe, pat)?;
                 let tmp = self.fresh("lit");
                 conds.push(format!("{} == {}", tmp, v.at(45)));
@@ -1774,7 +1894,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     parts.push(self.pat_rec(p, &mut c2, &mut p2, false)?);
                     if !c2.is_empty() || !p2.is_empty() { return unsup("or-pattern with literal sub-patterns or mutable bindings") }
                 }
-                Ok(format!("({})", parts.join(" | ")))
+                Ok(parts.join(" | "))
             }
             PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro, false),
             PatKind::Slice(before, None, after) if after.is_empty() => {

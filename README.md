@@ -67,3 +67,22 @@ NO_ISABELLE=1 scripts/run_tests.sh   # translation only
 
 The Isabelle build runs under `systemd-run … MemoryMax=4G` and needs the heap of
 session `AutoCorrode` built from the merged AutoCorrode checkout (`AUTOCORRODE`).
+
+| Case | Content |
+|---|---|
+| `t01_basic` | arithmetic, `if`, `while`, compound assignment, `/=`, casts, deferred `let`, consts, `char`/`&str` |
+| `t02_structs` | structs, tuple/unit structs, methods (`&self`, `&mut self`, `self`), `&mut` to a field, update syntax, destructuring |
+| `t03_enums` | enums, guards, literal and range sub-patterns, `@`, or-patterns, `Option`/`Result`, `?`, `if let`, `while let`, `let … else` |
+| `t04_loops` | `for` over ranges, slices, `Vec`, arrays, tuples; `break`/`continue`, labels, `return` in loops |
+| `t05_recursion` | recursion and mutual recursion (fuel), recursive and mutually recursive types |
+| `t06_signed` | `i8`…`i64`, negation, negative literals, signed casts and ranges, negative patterns |
+| `t07_refs` | `&mut` parameters, swaps, borrows of locals and fields, `Vec` indexing through `&mut`, reborrows |
+| `t08_generics` | generic functions and structs, trait impls, `impl Add`, derived `Clone`/`PartialEq` |
+| `t09_closures` | closures without mutation of captured variables |
+| `t10_unsupported` | one function per unsupported feature: all become placeholders |
+| `t11_std` | standard library models (`Option`, `Result`, `Vec`, `cmp`, `checked_add`, …), external templates, panics, assertions |
+| `t12_items` | modules, nested items, statics, reordering, names that clash with Isabelle keywords, 9-argument calls |
+| `t13_scalar_match` | `match` on integers, chars, bools, strings, tuples |
+| `t14_algorithms` | binary search, bubble sort, a stack with `Result` errors, checksum |
+| `t15_mixed` | struct consts, statics, consts in patterns, `Vec` field updates in loops, generic `Fn` parameter |
+| `t16_tokenizer` | byte tokenizer and state machine |
