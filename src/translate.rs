@@ -298,10 +298,19 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
         fn_placeholder(fe, &mut fd, "const generic parameter");
         return fd;
     }
+    if let Some(p) = fd.param_tys.iter().find(|p| p.contains("unsupported_")) {
+        // the body could only use such a parameter through operations with no uRust model
+        let msg = format!("parameter of unsupported type `{}`", p);
+        fn_placeholder(fe, &mut fd, &msg);
+        return fd;
+    }
     if fd.ret_ty.contains("unsupported_") {
         // no uRust value of a placeholder type can be produced
-        let msg = format!("result type `{}`", tcx.fn_sig(did).instantiate_identity().skip_binder().output());
-        let msg = if kind == "fn" { msg } else { "type of constant".to_string() };
+        let msg = if kind == "fn" {
+            format!("result type `{}`", tcx.fn_sig(did).instantiate_identity().skip_binder().output())
+        } else {
+            format!("type `{}` of a constant", tcx.type_of(did).instantiate_identity().skip_normalization())
+        };
         fn_placeholder(fe, &mut fd, &msg);
         return fd;
     }
@@ -330,6 +339,11 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
 // Emission
 // ----------------------------------------------------------------------
 
+/// Text inside an Isabelle comment `(* .. *)`: comments nest, so `(*` and `*)` are broken up.
+fn cmt(s: &str) -> String {
+    s.replace("(*", "( *").replace("*)", "* )")
+}
+
 fn cart(s: &str) -> String {
     format!("\\<open>{}\\<close>", s)
 }
@@ -357,7 +371,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 tparams.insert(0, "'addr".into());
             }
             let head = if tparams.is_empty() { tn.clone() } else { format!("({}) {}", tparams.join(", "), tn) };
-            writeln!(out, "(* Rust: {} *)", tcx.def_path_str(d)).unwrap();
+            writeln!(out, "(* Rust: {} *)", cmt(&tcx.def_path_str(d))).unwrap();
             if has_const {
                 writeln!(out, "(* PLACEHOLDER: const generic parameters are not supported *)").unwrap();
                 fe.note_placeholder("const generic parameter", tcx.def_span(d));
@@ -416,9 +430,10 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
     out
 }
 
-/// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`,
-/// registered as the uRust callable `urust_name`.
-fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str, urust_name: &str) -> String {
+/// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.
+/// It is called by its HOL name: a uRust notation for the Rust name could clash with
+/// notations registered elsewhere (AutoCorrode's own tests register e.g. "Foo").
+fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str, _urust_name: &str) -> String {
     let ps: Vec<String> = (0..ftys.len()).map(|i| format!("a{}", i)).collect();
     let mut ty = String::new();
     for t in ftys {
@@ -427,7 +442,7 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str, urust_name: 
     }
     ty.push_str(&format!("('s, {}, 'abort, 'i, 'o) function_body", self_ty));
     format!(
-        "definition \"{}\" :: {} where\n  {}\nmicro_rust_notation (call) {} (\"{}\")\n\n",
+        "definition \"{}\" :: {} where\n  {}\n\n",
         name,
         cart(&ty),
         cart(&format!(
@@ -436,9 +451,7 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str, urust_name: 
             ps.join(" "),
             ctor,
             ps.join(" ")
-        )),
-        name,
-        urust_name
+        ))
     )
 }
 
@@ -557,9 +570,9 @@ fn emit_funs(fe: &mut Frontend<'_>) -> String {
                 }
                 if i + 1 < k { format!("(fst {})", s) } else { s }
             };
-            writeln!(out, "(* Rust: {} *)", d.rust_path).unwrap();
+            writeln!(out, "(* Rust: {} *)", cmt(&d.rust_path)).unwrap();
             for cm in &d.comments {
-                writeln!(out, "(* {} *)", cm).unwrap();
+                writeln!(out, "(* {} *)", cmt(cm)).unwrap();
             }
             writeln!(
                 out,
@@ -578,9 +591,9 @@ fn emit_funs(fe: &mut Frontend<'_>) -> String {
 
 fn emit_def(fe: &Frontend<'_>, d: &FunDef, body: &str) -> String {
     let mut out = String::new();
-    writeln!(out, "(* Rust: {} *)", d.rust_path).unwrap();
+    writeln!(out, "(* Rust: {} *)", cmt(&d.rust_path)).unwrap();
     for c in &d.comments {
-        writeln!(out, "(* {} *)", c).unwrap();
+        writeln!(out, "(* {} *)", cmt(c)).unwrap();
     }
     let ty = fe.fun_type(&d.param_tys, &d.ret_ty);
     let lam = if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
@@ -605,7 +618,7 @@ fn emit_ext_funs(funs: &std::collections::BTreeMap<String, ExtFun>, what: &str) 
         writeln!(
             out,
             "(* Rust: {} *)\ndefinition \"{}\" :: {} where\n  {}\n",
-            f.rust_path,
+            cmt(&f.rust_path),
             f.hol_name,
             cart(&f.hol_type),
             cart(&format!(
@@ -637,7 +650,13 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
         } else {
             format!("({}) ", (0..t.arity).map(|i| format!("'t{}", i)).collect::<Vec<_>>().join(", "))
         };
-        writeln!(te, "(* {} *)\ntypedecl {}{}\n", t.comment, args, n).unwrap();
+        if t.arity == 0 {
+            writeln!(te, "(* {} *)\ntypedecl {}\n", cmt(&t.comment), n).unwrap();
+        } else {
+            // a one-constructor datatype (a BNF): recursive types may be nested through it
+            let vs: Vec<String> = (0..t.arity).map(|i| format!("'t{}", i)).collect();
+            writeln!(te, "(* {} *)\ndatatype {}{} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
+        }
     }
     te.push_str("end\n");
 
@@ -694,8 +713,8 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
 
     let mut fu = header(&format!("{}_Funs", c));
     writeln!(fu, "  imports {}_FunsExternal_Template {}_FunsForeign_Template\nbegin\n\ncontext {}\nbegin\n", c, c, ctx).unwrap();
-    for cmt in &fe.item_comments {
-        writeln!(fu, "(* {} *)", cmt).unwrap();
+    for ic in &fe.item_comments {
+        writeln!(fu, "(* {} *)", cmt(ic)).unwrap();
     }
     if !fe.item_comments.is_empty() {
         fu.push('\n');

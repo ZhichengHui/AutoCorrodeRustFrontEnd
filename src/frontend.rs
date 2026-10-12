@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::Span;
 
 use crate::names;
@@ -247,11 +247,11 @@ impl<'tcx> Frontend<'tcx> {
         n
     }
 
-    /// uRust name under which the constructor *function* is registered.
+    /// HOL name of the constructor *function* (`X_mk`, `X_V_mk`) called from uRust.
     pub fn variant_call_name(&mut self, adt: DefId, vidx: usize) -> String {
         let tn = self.adt_name(adt);
         let def = self.tcx.adt_def(adt);
-        if def.is_enum() { self.variant_ctor_name(adt, vidx) } else { tn }
+        if def.is_enum() { format!("{}_mk", self.variant_ctor_name(adt, vidx)) } else { format!("{}_mk", tn) }
     }
 
     pub fn field_name(&mut self, adt: DefId, vidx: usize, fidx: usize) -> String {
@@ -391,7 +391,7 @@ impl<'tcx> Frontend<'tcx> {
             ty::Dynamic(..) => self.placeholder_type("dyn_trait", 0),
             ty::Alias(..) => {
                 // associated-type projections that can be resolved (e.g. `<V2 as Add>::Output`)
-                if let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
+                if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
                     if !matches!(n.kind(), ty::Alias(..)) {
                         return self.ty(n);
                     }

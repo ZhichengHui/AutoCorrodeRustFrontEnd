@@ -26,7 +26,7 @@ for line in errs.splitlines():
     if not line.startswith("***"):
         continue
     cur.append(line[4:])
-    m = re.search(r'At command .*?of "[^"]*/bench/' + re.escape(suite) + r'/([^/]+)/', line)
+    m = re.search(r'At command .*?of "[^"]*/bench/' + re.escape(suite) + r'/(?:c\d+/)?([^/]+)/', line)
     if m:
         stem = m.group(1)
         if stem not in first_err:
@@ -41,7 +41,8 @@ if os.path.exists(p):
 
 counts = {}
 lines = []
-for stem, name, st, ph in rows:
+for row in rows:
+    stem, name, st, ph = row[:4]
     isa = "-"
     if st == "translated":
         # exit code 0: every theory was checked (possibly in an earlier, unchanged build)

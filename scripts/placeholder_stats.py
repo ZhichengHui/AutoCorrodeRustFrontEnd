@@ -15,7 +15,7 @@ for out in sys.argv[1:]:
     zero = sum(1 for r in tr if r[3] == "0")
     total = sum(int(r[3]) for r in tr)
     print(f"{os.path.basename(out)}: translated={len(tr)} without-placeholders={zero} placeholders={total}")
-    for f in glob.glob(os.path.join(out, "*", "PLACEHOLDERS.txt")):
+    for f in glob.glob(os.path.join(out, "*", "*", "PLACEHOLDERS.txt")):
         for line in open(f):
             if line.startswith("- "):
                 k = re.sub(r"^- line \d+: ", "", line.strip())

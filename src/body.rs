@@ -469,7 +469,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     AutoBorrowMutability::Not => PV::Val(self.to_val(pv)),
                 },
                 Adjust::Borrow(_) => return unsup("raw or pinned auto-borrow"),
-                Adjust::Pointer(PointerCoercion::Unsize) => pv,
+                Adjust::Pointer(PointerCoercion::Unsize) => {
+                    // array -> slice is the identity on lists; a coercion to `dyn Trait` is not
+                    if adj.target.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(t) if matches!(t.kind(), ty::Dynamic(..)))) {
+                        return unsup("coercion to a trait object");
+                    }
+                    pv
+                }
                 Adjust::Pointer(_) => return unsup("pointer coercion"),
                 Adjust::GenericReborrow(_) => pv,
             };
@@ -834,7 +840,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// Evaluate a constant, unless it is generic or a trait's associated constant
     /// (evaluating those would make rustc abort).
     fn const_eval(&self, did: DefId) -> Option<rustc_middle::mir::interpret::EvalToConstValueResult<'tcx>> {
-        if self.fe.is_trait_item(did) || self.tcx.generics_of(did).requires_monomorphization(self.tcx) {
+        if self.fe.is_trait_item(did) || self.tcx.is_static(did) || self.tcx.generics_of(did).requires_monomorphization(self.tcx) {
             return None;
         }
         Some(self.tcx.const_eval_poly(did))
@@ -1190,6 +1196,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         e: &'tcx hir::Expr<'tcx>,
     ) -> R<Tr> {
         if argv.len() > 16 { return unsup("call with more than 16 arguments") }
+        if self.tcx.fn_sig(did).skip_binder().c_variadic() {
+            return unsup("call of a C-variadic function");
+        }
         if self.fe.local_fn_with_body(did) && !self.fe.is_trait_item(did) {
             return self.local_call(did, argv);
         }
@@ -1709,7 +1718,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn match_chain(&mut self, sv: Tr, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         let tmp = self.fresh("scrut");
         let tv = Tr::atom(tmp.clone());
-        let mut branches: Vec<(Option<String>, String)> = vec![];
+        let mut branches: Vec<(Option<String>, String, bool)> = vec![];
         for arm in arms {
             let (cond, binds) = self.pat_cond(arm.pat, &tv)?;
             let mut body = binds.join("\n");
@@ -1724,17 +1733,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 None => cond,
             };
-            branches.push((cond, body));
+            branches.push((cond, body, arm.guard.is_none()));
         }
-        let mut acc: Option<String> = None;
-        for (cond, body) in branches.into_iter().rev() {
-            acc = Some(match (cond, acc) {
-                (None, _) => body,
-                (Some(c), None) => format!("if {} {{\n{}\n}} else {{\n panic!(\"non-exhaustive match\")\n}}", c, body),
-                (Some(c), Some(rest)) => format!("if {} {{\n{}\n}} else {{\n{}\n}}", c, body, rest),
-            });
-        }
-        let acc = acc.unwrap_or_else(|| "panic!(\"empty match\")".into());
+        let acc = if_chain(branches);
         Ok(Tr::atom(format!("{{\nlet {} = {};\n{}\n}}", tmp, sv.at(20), acc)))
     }
 
@@ -2059,6 +2060,42 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 }
 
+
+/// `if c1 { b1 } else { if c2 { b2 } else { .. } }` for (condition, body, condition-is-pure)
+/// branches; `None` is an unconditional branch. Deeply nested `if`s make Isabelle's parser
+/// blow up, so long chains of pure conditions are grouped: `if c1 || .. || ck { chain of the
+/// group } else { .. }` with groups of about sqrt(n) branches (same first-match semantics, since
+/// the conditions have no effects).
+fn if_chain(branches: Vec<(Option<String>, String, bool)>) -> String {
+    fn linear(branches: Vec<(Option<String>, String, bool)>) -> String {
+        let mut acc: Option<String> = None;
+        for (cond, body, _) in branches.into_iter().rev() {
+            acc = Some(match (cond, acc) {
+                (None, _) => body,
+                (Some(c), None) => format!("if {} {{\n{}\n}} else {{\n panic!(\"non-exhaustive match\")\n}}", c, body),
+                (Some(c), Some(rest)) => format!("if {} {{\n{}\n}} else {{\n{}\n}}", c, body, rest),
+            });
+        }
+        acc.unwrap_or_else(|| "panic!(\"empty match\")".into())
+    }
+    let n = branches.len();
+    if n <= 6 || !branches.iter().all(|b| b.2) {
+        return linear(branches);
+    }
+    let g = (n as f64).sqrt().ceil() as usize;
+    let mut groups = vec![];
+    let mut it = branches.into_iter().peekable();
+    while it.peek().is_some() {
+        let grp: Vec<_> = it.by_ref().take(g).collect();
+        let cond = if grp.iter().any(|b| b.0.is_none()) {
+            None
+        } else {
+            Some(grp.iter().map(|b| format!("({})", b.0.as_ref().unwrap())).collect::<Vec<_>>().join(" || "))
+        };
+        groups.push((cond, linear(grp), true));
+    }
+    linear(groups)
+}
 
 fn paren_if(c: &str) -> String {
     if c.contains(' ') { format!("({})", c) } else { c.to_string() }
