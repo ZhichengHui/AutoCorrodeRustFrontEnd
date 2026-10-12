@@ -3,4 +3,3 @@ __pycache__/
 .claude/
 /target/
 /out/
-/tests/benchmarks/crust/

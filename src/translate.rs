@@ -405,7 +405,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                     decls.push(format!("{} = make_{} {}", head, tn, args.join(" ")));
                 }
                 if !v.fields.is_empty() {
-                    after.push_str(&ctor_fun(&format!("{}_mk", tn), &format!("make_{}", tn), &ftys, &head, &tn));
+                    after.push_str(&ctor_fun(&format!("{}_mk", tn), &format!("make_{}", tn), &ftys, &head));
                 }
             } else {
                 let mut ctors = vec![];
@@ -416,7 +416,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                     let args: Vec<String> = ftys.iter().map(|t| cart(t)).collect();
                     ctors.push(if args.is_empty() { cn.clone() } else { format!("{} {}", cn, args.join(" ")) });
                     if !ftys.is_empty() {
-                        after.push_str(&ctor_fun(&format!("{}_mk", cn), &cn, &ftys, &head, &cn));
+                        after.push_str(&ctor_fun(&format!("{}_mk", cn), &cn, &ftys, &head));
                     }
                 }
                 decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
@@ -431,9 +431,9 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
 }
 
 /// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.
-/// It is called by its HOL name: a uRust notation for the Rust name could clash with
-/// notations registered elsewhere (AutoCorrode's own tests register e.g. "Foo").
-fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str, _urust_name: &str) -> String {
+/// It is called by its HOL name, because uRust notations are global and a Rust name may
+/// already denote other backends.
+fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str) -> String {
     let ps: Vec<String> = (0..ftys.len()).map(|i| format!("a{}", i)).collect();
     let mut ty = String::new();
     for t in ftys {
