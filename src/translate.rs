@@ -86,11 +86,8 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         match item.kind {
             hir::ItemKind::Struct(..) | hir::ItemKind::Enum(..) => adts.push(did),
             hir::ItemKind::Union(..) => {
-                fe.item_comments.push(format!(
-                    "PLACEHOLDER: union `{}` is not supported (declared as an abstract type)",
-                    tcx.item_name(did)
-                ));
-                fe.note_placeholder("union", item.span);
+                let m = fe.placeholder("union (declared as an abstract type)", Some(tcx.def_span(did)));
+                fe.item_comments.push(m);
             }
             _ => {}
         }
@@ -165,26 +162,26 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             hir::ItemKind::Const(..) => bodies.push((did, "const")),
             hir::ItemKind::Static(m, ..) => {
                 if m.is_mut() {
-                    fe.item_comments.push(format!("PLACEHOLDER: `static mut {}` is not supported", tcx.item_name(did)));
-                    fe.note_placeholder("static mut", item.span);
+                    let m = fe.placeholder("static mut", Some(tcx.def_span(did)));
+                    fe.item_comments.push(m);
                 } else {
                     bodies.push((did, "static"));
                 }
             }
-            hir::ItemKind::Trait { ident, .. } => {
-                fe.item_comments.push(format!(
-                    "PLACEHOLDER: trait `{}` -- trait definitions are not translated; their implementations are translated as ordinary functions",
-                    ident
-                ));
-                fe.note_placeholder("trait definition", item.span);
+            hir::ItemKind::Trait { .. } => {
+                let m = fe.placeholder(
+                    "trait definition (its implementations are translated as ordinary functions)",
+                    Some(tcx.def_span(did)),
+                );
+                fe.item_comments.push(m);
             }
             hir::ItemKind::TraitAlias(..) => {
-                fe.item_comments.push("PLACEHOLDER: trait alias".into());
-                fe.note_placeholder("trait alias", item.span);
+                let m = fe.placeholder("trait alias", Some(tcx.def_span(did)));
+                fe.item_comments.push(m);
             }
             hir::ItemKind::GlobalAsm { .. } => {
-                fe.item_comments.push("PLACEHOLDER: global_asm! is not supported".into());
-                fe.note_placeholder("global assembly", item.span);
+                let m = fe.placeholder("global assembly", Some(item.span));
+                fe.item_comments.push(m);
             }
             hir::ItemKind::Impl(_) => {
                 if tcx.is_automatically_derived(did) {
@@ -192,11 +189,11 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
                 }
                 if let Some(tr) = tcx.impl_opt_trait_ref(did) {
                     if tcx.item_name(tr.skip_binder().def_id).as_str() == "Drop" {
-                        fe.item_comments.push(format!(
-                            "NOTE: `impl Drop for {}`: `drop` is translated as an ordinary function; destructor calls are not inserted",
-                            fe.short_ty_name(tcx.type_of(did).instantiate_identity().skip_normalization())
-                        ));
-                        fe.note_placeholder("destructor (Drop) semantics", item.span);
+                        let m = fe.placeholder(
+                            "destructor semantics (drop is translated as an ordinary function; destructor calls are not inserted)",
+                            Some(tcx.def_span(did)),
+                        );
+                        fe.item_comments.push(m);
                     }
                 }
             }
@@ -206,8 +203,8 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
                     if matches!(tcx.def_kind(fdid), DefKind::Fn) {
                         fe.ext_fun(fdid, true);
                     } else {
-                        fe.item_comments.push(format!("PLACEHOLDER: foreign static `{}`", tcx.item_name(fdid)));
-                        fe.note_placeholder("foreign static", tcx.def_span(fdid));
+                        let m = fe.placeholder("foreign static", Some(tcx.def_span(fdid)));
+                        fe.item_comments.push(m);
                     }
                 }
             }
@@ -225,8 +222,8 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             hir::ImplItemKind::Fn(..) => bodies.push((did, "fn")),
             hir::ImplItemKind::Const(..) => bodies.push((did, "const")),
             hir::ImplItemKind::Type(..) => {
-                fe.item_comments.push(format!("PLACEHOLDER: associated type `{}` is not supported", ii.ident));
-                fe.note_placeholder("associated type", ii.span);
+                let m = fe.placeholder("associated type", Some(tcx.def_span(did)));
+                fe.item_comments.push(m);
             }
         }
     }
@@ -234,12 +231,12 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         let ti = tcx.hir_trait_item(id);
         match ti.kind {
             hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)) => {
-                fe.item_comments.push(format!("PLACEHOLDER: default method `{}` of a trait is not translated", ti.ident));
-                fe.note_placeholder("trait default method", ti.span);
+                let m = fe.placeholder("trait default method", Some(tcx.def_span(ti.owner_id.to_def_id())));
+                fe.item_comments.push(m);
             }
             hir::TraitItemKind::Type(..) => {
-                fe.item_comments.push(format!("PLACEHOLDER: associated type `{}` of a trait is not supported", ti.ident));
-                fe.note_placeholder("associated type", ti.span);
+                let m = fe.placeholder("associated type", Some(tcx.def_span(ti.owner_id.to_def_id())));
+                fe.item_comments.push(m);
             }
             _ => {}
         }
@@ -281,14 +278,11 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
     };
     let sp = tcx.def_span(did);
     let fn_placeholder = |fe: &mut Frontend<'tcx>, fd: &mut FunDef, msg: &str| {
-        fe.note_placeholder(msg, sp);
+        let m = fe.placeholder(msg, Some(sp));
         fd.params = (0..fd.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
-        fd.body = format!(
-            "unimplemented!(\"{}\")",
-            names::string_token(&format!("UNSUPPORTED {}: {}", msg, fd.rust_path))
-        );
+        fd.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
         fd.calls.clear();
-        fd.comments.push(format!("PLACEHOLDER: {}", msg));
+        fd.comments.push(m);
     };
     if kind == "fn" && tcx.asyncness(did).is_async() {
         fn_placeholder(fe, &mut fd, "async fn");
@@ -373,17 +367,17 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             let head = if tparams.is_empty() { tn.clone() } else { format!("({}) {}", tparams.join(", "), tn) };
             writeln!(out, "(* Rust: {} *)", cmt(&tcx.def_path_str(d))).unwrap();
             if has_const {
-                writeln!(out, "(* PLACEHOLDER: const generic parameters are not supported *)").unwrap();
-                fe.note_placeholder("const generic parameter", tcx.def_span(d));
+                let m = fe.placeholder("const generic parameter", Some(tcx.def_span(d)));
+                writeln!(out, "(* {} *)", cmt(&m)).unwrap();
             }
             if def.is_enum() && def.variants().is_empty() {
-                writeln!(out, "(* PLACEHOLDER: empty enum *)\ntypedecl {}\n", head).unwrap();
-                fe.note_placeholder("empty enum", tcx.def_span(d));
+                let m = fe.placeholder("empty enum (declared as an abstract type)", Some(tcx.def_span(d)));
+                writeln!(out, "(* {} *)\ntypedecl {}\n", cmt(&m), head).unwrap();
                 continue;
             }
             if def.is_enum() && def.variants().iter().any(|v| matches!(v.discr, ty::VariantDiscr::Explicit(_))) {
-                writeln!(out, "(* PLACEHOLDER: explicit discriminant values are dropped *)").unwrap();
-                fe.note_placeholder("enum with explicit discriminants", tcx.def_span(d));
+                let m = fe.placeholder("explicit enum discriminants (dropped)", Some(tcx.def_span(d)));
+                writeln!(out, "(* {} *)", cmt(&m)).unwrap();
             }
             if def.is_struct() {
                 let v = def.non_enum_variant();

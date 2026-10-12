@@ -94,12 +94,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn placeholder(&mut self, msg: &str, sp: Span) -> Tr {
-        self.fe.note_placeholder(msg, sp);
-        let snip = crate::frontend::one_line(&self.fe.snippet(sp));
-        Tr::new(
-            format!("unimplemented!(\"{}\")", names::string_token(&format!("UNSUPPORTED {}: {}", msg, snip))),
-            999,
-        )
+        let marker = self.fe.placeholder(msg, Some(sp));
+        Tr::new(format!("unimplemented!(\"{}\")", names::string_token(&marker)), 999)
     }
 
     /// Give a placeholder the HOL type of the Rust expression it replaces, so that the

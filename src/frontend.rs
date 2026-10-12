@@ -136,9 +136,16 @@ impl<'tcx> Frontend<'tcx> {
         format!("line {}", loc.line)
     }
 
-    pub fn note_placeholder(&mut self, what: &str, sp: Span) {
-        let line = format!("{}: {} -- `{}`", self.line_of(sp), what, one_line(&self.snippet(sp)));
-        self.placeholders.push(line);
+    /// Record a placeholder for the unsupported feature `what` at `sp` (if known). Returns the
+    /// text that marks it in the generated theories, in a term or in a comment.
+    pub fn placeholder(&mut self, what: &str, sp: Option<Span>) -> String {
+        let marker = match sp {
+            Some(sp) => format!("PLACEHOLDER {}: {}", what, one_line(&self.snippet(sp))),
+            None => format!("PLACEHOLDER {}", what),
+        };
+        let loc = sp.map(|sp| format!("{}: ", self.line_of(sp))).unwrap_or_default();
+        self.placeholders.push(format!("{}{}", loc, marker));
+        marker
     }
 
     pub fn marker(&mut self, did: DefId) -> usize {
@@ -301,10 +308,10 @@ impl<'tcx> Frontend<'tcx> {
 
     pub fn placeholder_type(&mut self, desc: &str, arity: usize) -> String {
         let name = format!("unsupported_{}", names::ident_chars(desc));
-        self.ext_types.entry(name.clone()).or_insert(ExtType {
-            arity,
-            comment: format!("PLACEHOLDER: unsupported Rust type `{}`", desc),
-        });
+        if !self.ext_types.contains_key(&name) {
+            let comment = self.placeholder(&format!("type {}", desc), None);
+            self.ext_types.insert(name.clone(), ExtType { arity, comment });
+        }
         name
     }
 
@@ -372,7 +379,7 @@ impl<'tcx> Frontend<'tcx> {
                             let path = self.tcx.def_path_str(did);
                             self.ext_types.entry(n.clone()).or_insert(ExtType {
                                 arity: targs.len(),
-                                comment: format!("PLACEHOLDER: external type `{}` (no uRust model)", path),
+                                comment: format!("Rust: {}", path),
                             });
                             n
                         };
