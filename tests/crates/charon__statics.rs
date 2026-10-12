@@ -1,4 +1,5 @@
 #![feature(raw_ref_op)]
+#![allow(static_mut_refs)]
 
 fn constant() {
     const CONST: usize = 0;

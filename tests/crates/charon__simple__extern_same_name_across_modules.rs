@@ -1,4 +1,4 @@
-extern "C" {
+unsafe extern "C" {
     fn same_name(x: i32) -> i32;
 }
 

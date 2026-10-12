@@ -1,4 +1,4 @@
 //@ ignore
-extern "C" {
+unsafe extern "C" {
     pub static FOREIGN: i32;
 }

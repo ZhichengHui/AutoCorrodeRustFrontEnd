@@ -34,12 +34,13 @@ fn isabelle() -> String {
 
 /// Every crate, in `tests/crates` or in a test below, is compiled as a library with these
 /// rustc arguments.
-const RUSTC_ARGS: &[&str] = &["--edition=2021"];
+const RUSTC_ARGS: &[&str] = &["--edition=2024"];
 
 /// `tests/crates`: one library crate per `.rs` file, each compiled by plain rustc with
-/// `RUSTC_ARGS`. Taken unchanged from github.com/AeneasVerif/aeneas (tests/src, Apache-2.0),
+/// `RUSTC_ARGS`. Taken from github.com/AeneasVerif/aeneas (tests/src, Apache-2.0),
 /// github.com/AeneasVerif/charon (charon/tests/ui, Apache-2.0) and
-/// github.com/TheAlgorithms/Rust (src, MIT).
+/// github.com/TheAlgorithms/Rust (src, MIT); unchanged except for the edition-2024 edits
+/// listed in `tests/crates/EDITION_2024.md`.
 const CRATES_DIR: &str = "tests/crates";
 
 
@@ -793,6 +794,19 @@ fn unsupported_bool_cast() {
 #[test]
 fn unsupported_inline_const() {
     unsupported("unsupported_inline_const", "pub fn f() -> u32 { const { 1 + 2 } }");
+}
+
+#[test]
+fn unsupported_let_chain() {
+    unsupported("unsupported_let_chain", "pub fn f(a: Option<u32>, b: bool) -> u32 { if let Some(x) = a && b { x } else { 0 } }");
+}
+
+#[test]
+fn foreign_function_template() {
+    supported(
+        "foreign_function_template",
+        "unsafe extern \"C\" { fn c_abs(x: i32) -> i32; } pub fn f(x: i32) -> i32 { unsafe { c_abs(x) } }",
+    );
 }
 
 #[test]

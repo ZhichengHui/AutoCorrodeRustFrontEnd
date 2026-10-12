@@ -6,7 +6,7 @@ pub unsafe extern "C" fn sum(mut ap: ...) -> i32 {
     a + b
 }
 
-extern "C" {
+unsafe extern "C" {
     fn foo(x: u32, y: u64, rest: ...);
 }
 

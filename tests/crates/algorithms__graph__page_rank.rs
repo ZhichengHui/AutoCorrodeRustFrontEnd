@@ -77,7 +77,7 @@ pub fn page_rank<Node: Hash + Eq + Clone>(
     // Dangling nodes are those with zero out-degree
     let dangling_nodes: Vec<Node> = out_degrees
         .iter()
-        .filter(|(_, &degree)| degree == 0)
+        .filter(|&(_, &degree)| degree == 0)
         .map(|(node, _)| node.clone())
         .collect();
 

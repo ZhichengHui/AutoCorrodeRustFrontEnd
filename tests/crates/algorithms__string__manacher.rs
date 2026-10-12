@@ -64,7 +64,7 @@ pub fn manacher(s: String) -> String {
     let center_of_max = length_of_palindrome
         .iter()
         .enumerate()
-        .max_by_key(|(_, &value)| value)
+        .max_by_key(|&(_, &value)| value)
         .map(|(idx, _)| idx)
         .unwrap();
     let radius_of_max = (length_of_palindrome[center_of_max] - 1) / 2;

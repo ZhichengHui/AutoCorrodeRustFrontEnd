@@ -233,13 +233,13 @@ mod tests {
     fn test_field_elements() {
         fn test<const P: u64>() {
             let expected: HashSet<PrimeField<P>> = (0..P as i64).map(Into::into).collect();
-            for gen in 1..P - 1 {
+            for r#gen in 1..P - 1 {
                 // every field element != 0 generates the whole field additively
-                let gen = PrimeField::from(gen as i64);
-                let mut generated: HashSet<PrimeField<P>> = std::iter::once(gen).collect();
-                let mut x = gen;
+                let r#gen = PrimeField::from(r#gen as i64);
+                let mut generated: HashSet<PrimeField<P>> = std::iter::once(r#gen).collect();
+                let mut x = r#gen;
                 for _ in 0..P {
-                    x = x + gen;
+                    x = x + r#gen;
                     generated.insert(x);
                 }
                 assert_eq!(generated, expected);
