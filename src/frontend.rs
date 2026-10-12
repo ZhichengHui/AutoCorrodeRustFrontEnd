@@ -1,9 +1,9 @@
 //! Crate-level state of the translation: names, type mapping, collected items.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rustc_hir::def::DefKind;
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::Span;
@@ -55,6 +55,7 @@ pub struct FunDef {
 
 pub struct Frontend<'tcx> {
     pub tcx: TyCtxt<'tcx>,
+    #[allow(dead_code)]
     pub crate_name: String,
     names: HashMap<DefId, String>,
     used_names: HashSet<String>,
@@ -438,10 +439,6 @@ impl<'tcx> Frontend<'tcx> {
 
     pub fn is_trait_item(&self, did: DefId) -> bool {
         matches!(self.tcx.def_kind(self.tcx.parent(did)), DefKind::Trait)
-    }
-
-    pub fn ld(&self, did: DefId) -> LocalDefId {
-        did.expect_local()
     }
 }
 

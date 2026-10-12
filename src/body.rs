@@ -7,7 +7,7 @@
 //! * a value of type `&T` is represented by the value of type `T` (shared
 //!   borrows of data without interior mutability are observationally values).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use rustc_ast::ast::{LitIntType, LitKind};
 use rustc_hir as hir;
@@ -384,7 +384,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn to_val(&self, pv: PV) -> Tr {
         match pv {
             PV::Val(t) => t,
-            PV::Ref(r) => Tr::new(format!("*{}", r.at(200)), 100),
+            PV::Ref(r) => Tr::new(format!("*{}", r.at(200)), 98),
         }
     }
 
@@ -1019,10 +1019,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return Ok(None);
         }
         let path = self.tcx.def_path_str(did);
-        if path.contains("fmt::format") || path.contains("fmt::Arguments") {
+        let item = self.tcx.item_name(did).to_string();
+        let is_panic = path.contains("panicking")
+            || item.contains("panic")
+            || item == "assert_failed"
+            || item.starts_with("unreachable");
+        if !is_panic && (path.contains("fmt::format") || path.contains("fmt::Arguments")) {
             return unsup("string formatting (format!)");
         }
-        if path.contains("panicking") || path.contains("begin_panic") {
+        if is_panic {
             fn find_str(e: &hir::Expr<'_>) -> Option<String> {
                 match e.kind {
                     ExprKind::Lit(l) => match l.node {

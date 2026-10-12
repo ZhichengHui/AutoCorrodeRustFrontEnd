@@ -1,6 +1,6 @@
 //! Crate-level driver: collects items, orders them, and writes the theories.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
