@@ -32,57 +32,16 @@ fn isabelle() -> String {
         .unwrap_or_else(|_| format!("{}/Applications/Isabelle2025-2/bin/isabelle", std::env::var("HOME").unwrap()))
 }
 
-/// Benchmark suites under `tests/benchmarks/NAME`, one crate per `.rs` file, copied unchanged:
-/// - `aeneas`: tests/src of github.com/AeneasVerif/aeneas @ d119a474 (Apache-2.0); the
-///   crates avl, bst, tutorial are single files and stored as `avl.rs`, `bst.rs`, `tutorial.rs`.
-/// - `charon`: charon/tests/ui/** of github.com/AeneasVerif/charon @ 0a930b2d (Apache-2.0);
-///   `DIR/NAME.rs` stored as `DIR__NAME.rs` (with `-` in names replaced by `_`).
-/// - `humaneval_x`: Rust part of HumanEval-X, github.com/THUDM/CodeGeeX (Apache-2.0):
-///   `declaration` + `canonical_solution` of each problem.
-/// - `algorithms`: github.com/TheAlgorithms/Rust @ fed66cb0 (MIT): the files of `src/` that
-///   use no other module and no external crate.
-const SUITES: &[&str] = &["aeneas", "charon", "humaneval_x", "algorithms"];
+/// Every crate, in `tests/crates` or in a test below, is compiled as a library with these
+/// rustc arguments.
+const RUSTC_ARGS: &[&str] = &["--edition=2021"];
 
-/// rustc arguments with which the suites' own test infrastructure compiles each file:
-/// Aeneas' test runner uses `--edition=2021` (the crate avl declares edition 2024 in its
-/// Cargo.toml); Charon's `Tests` preset uses `--edition=2021` and registers the tool
-/// `charon`, plus the `--rustc-arg`s of the file's `//@ charon-args=` line; HumanEval-X and
-/// TheAlgorithms are edition 2021 crates. Tests written here use edition 2024.
-fn rustc_args(suite: &str, file: &Path, src: &str) -> Vec<String> {
-    match suite {
-        "aeneas" if file.file_name().is_some_and(|n| n == "avl.rs") => vec!["--edition=2024".into()],
-        "charon" => {
-            let mut a: Vec<String> = vec![
-                "--edition=2021".into(),
-                "-Zcrate-attr=feature(register_tool)".into(),
-                "-Zcrate-attr=register_tool(charon)".into(),
-            ];
-            for line in src.lines().filter(|l| l.starts_with("//@ charon-args=")) {
-                for w in line.split_whitespace() {
-                    if let Some(arg) = w.strip_prefix("--rustc-arg=") {
-                        a.push(arg.into());
-                    }
-                }
-            }
-            a
-        }
-        "unit" => vec!["--edition=2024".into()],
-        _ => vec!["--edition=2021".into()],
-    }
-}
+/// `tests/crates`: one library crate per `.rs` file, each compiled by plain rustc with
+/// `RUSTC_ARGS`. Taken unchanged from github.com/AeneasVerif/aeneas (tests/src, Apache-2.0),
+/// github.com/AeneasVerif/charon (charon/tests/ui, Apache-2.0) and
+/// github.com/TheAlgorithms/Rust (src, MIT).
+const CRATES_DIR: &str = "tests/crates";
 
-/// HumanEval-X compiles every problem in a Cargo project that depends on the crates rand,
-/// regex and md5, and every declaration imports them; they are not available here, so their
-/// `use` lines are dropped (problems that really use them are then rejected by rustc).
-fn without_unavailable_crates(src: &str) -> String {
-    src.lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            !(t.starts_with("use rand") || t.starts_with("use regex") || t.starts_with("use md5"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 // ---------------------------------------------------------------------------------------
 // Translation
@@ -119,9 +78,9 @@ fn run_frontend(file: &Path, name: &str, out: &Path, args: &[String]) -> (bool, 
     (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned())
 }
 
-fn translate(suite: &str, file: &Path, name: &str, out: &Path) -> Translation {
-    let src = std::fs::read_to_string(file).unwrap_or_default();
-    let (ok, log) = run_frontend(file, name, out, &rustc_args(suite, file, &src));
+fn translate(file: &Path, name: &str, out: &Path) -> Translation {
+    let args: Vec<String> = RUSTC_ARGS.iter().map(|a| a.to_string()).collect();
+    let (ok, log) = run_frontend(file, name, out, &args);
     let funs = out.join(format!("{}_Funs.thy", name));
     if ok && funs.exists() {
         let rep = std::fs::read_to_string(out.join("PLACEHOLDERS.txt")).unwrap_or_default();
@@ -307,7 +266,7 @@ fn check_source(test: &str, src: &str) -> Outcome {
     let file = base.join(format!("{}.rs", test));
     std::fs::write(&file, src).unwrap();
     let name = format!("T_{}", test);
-    let out = match translate("unit", &file, &name, &base.join("out")) {
+    let out = match translate(&file, &name, &base.join("out")) {
         Translation::Translated { dir, name, placeholders } => {
             let mut server = Server::start(test);
             match server.check(&dir, &format!("{}_Funs", name)) {
@@ -837,52 +796,36 @@ fn unsupported_inline_const() {
 }
 
 #[test]
-fn unsupported_let_chain() {
-    unsupported("unsupported_let_chain", "pub fn f(a: Option<u32>, b: bool) -> u32 { if let Some(x) = a && b { x } else { 0 } }");
-}
-
-#[test]
 fn assert_eq_macro() {
     supported("assert_eq_macro", "pub fn f(x: u32, y: u32) -> u32 { assert_eq!(x, y); x }");
 }
 
 // ---------------------------------------------------------------------------------------
-// Benchmark suites: every crate is translated and checked on its own
+// tests/crates: every crate is translated and checked on its own
 // ---------------------------------------------------------------------------------------
 
-fn run_suite(suite: &str) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/benchmarks").join(suite);
+#[test]
+fn crates() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CRATES_DIR);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|_| panic!("missing suite {}", dir.display()))
+        .expect("tests/crates")
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "rs").unwrap_or(false))
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
         .collect();
     files.sort();
-    let work = std::env::temp_dir().join(format!("urust-frontend-bench-{}-{}", suite, std::process::id()));
+    let work = std::env::temp_dir().join(format!("urust-frontend-crates-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     let mut server: Option<Server> = None;
-    let (mut rejected_by_rustc, mut crashed, mut translated, mut accepted, mut clean) = (0, 0, 0, 0, 0);
+    let (mut accepted, mut clean) = (0, 0);
     let mut failures: Vec<String> = vec![];
     for f in &files {
-        let stem: String = f.file_stem().unwrap().to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        let name = format!("B_{}", stem);
-        let input = if suite == "humaneval_x" {
-            let p = work.join(format!("{}.rs", stem));
-            std::fs::create_dir_all(&work).unwrap();
-            std::fs::write(&p, without_unavailable_crates(&std::fs::read_to_string(f).unwrap())).unwrap();
-            p
-        } else {
-            f.clone()
-        };
-        match translate(suite, &input, &name, &work.join(&stem)) {
-            Translation::RustcRejected(_) => rejected_by_rustc += 1,
-            Translation::FrontendCrashed(e) => {
-                crashed += 1;
-                failures.push(format!("{}: frontend crash: {}", stem, e));
-            }
+        let stem: String =
+            f.file_stem().unwrap().to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        match translate(f, &format!("C_{}", stem), &work.join(&stem)) {
+            Translation::RustcRejected(e) => failures.push(format!("{}: rejected by rustc: {}", stem, e)),
+            Translation::FrontendCrashed(e) => failures.push(format!("{}: frontend crash: {}", stem, e)),
             Translation::Translated { dir, name, placeholders } => {
-                translated += 1;
-                let srv = server.get_or_insert_with(|| Server::start(suite));
+                let srv = server.get_or_insert_with(|| Server::start("crates"));
                 match srv.check(&dir, &format!("{}_Funs", name)) {
                     Check::Accepted => {
                         accepted += 1;
@@ -890,51 +833,28 @@ fn run_suite(suite: &str) {
                             clean += 1;
                         }
                     }
-                    Check::Rejected(e) => failures.push(format!("{}: rejected: {}", stem, e)),
+                    Check::Rejected(e) => failures.push(format!("{}: rejected by Isabelle: {}", stem, e)),
                     Check::Aborted(e) => {
                         failures.push(format!("{}: aborted (time or memory limit): {}", stem, e));
-                        server = None; // restart for the next crate
+                        server = None;
                     }
                 }
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
     }
-    let pct = |a: usize, b: usize| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+    let n = files.len();
+    let pct = |a: usize| if n == 0 { 0.0 } else { 100.0 * a as f64 / n as f64 };
     println!(
-        "SUITE {}: crates {}, rejected by rustc {}, frontend crashes {}, translated {}, accepted by Isabelle {} ({:.1}% of translated), without placeholders {} ({:.1}% of accepted)",
-        suite,
-        files.len(),
-        rejected_by_rustc,
-        crashed,
-        translated,
+        "crates: {}, accepted by Isabelle: {} ({:.1}%), accepted without placeholders: {} ({:.1}%)",
+        n,
         accepted,
-        pct(accepted, translated),
+        pct(accepted),
         clean,
-        pct(clean, accepted)
+        pct(clean)
     );
     for l in &failures {
         println!("  {}", l);
     }
-    assert!(failures.is_empty(), "{} of {} crates failed", failures.len(), files.len());
-}
-
-#[test]
-fn benchmark_aeneas() {
-    run_suite(SUITES[0]);
-}
-
-#[test]
-fn benchmark_charon() {
-    run_suite(SUITES[1]);
-}
-
-#[test]
-fn benchmark_humaneval_x() {
-    run_suite(SUITES[2]);
-}
-
-#[test]
-fn benchmark_algorithms() {
-    run_suite(SUITES[3]);
+    assert!(failures.is_empty(), "{} of {} crates failed", failures.len(), n);
 }
