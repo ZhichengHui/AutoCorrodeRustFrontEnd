@@ -1,0 +1,451 @@
+//! Crate-level state of the translation: names, type mapping, collected items.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::definitions::DefPathData;
+use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_span::Span;
+
+use crate::names;
+
+/// A placeholder or external type declared with `typedecl`.
+/// Insertion-ordered set of DefIds (DefId is not `Ord`).
+#[derive(Default, Clone)]
+pub struct DefSet(pub Vec<DefId>);
+impl DefSet {
+    pub fn insert(&mut self, d: DefId) {
+        if !self.0.contains(&d) {
+            self.0.push(d)
+        }
+    }
+    pub fn contains(&self, d: &DefId) -> bool { self.0.contains(d) }
+    pub fn iter(&self) -> std::slice::Iter<'_, DefId> { self.0.iter() }
+    pub fn clear(&mut self) { self.0.clear() }
+}
+
+pub struct ExtType {
+    pub arity: usize,
+    pub comment: String,
+}
+
+/// An external (or foreign) function for which a template definition is emitted.
+pub struct ExtFun {
+    pub hol_name: String,
+    pub rust_path: String,
+    pub hol_type: String,
+    pub arity: usize,
+}
+
+/// A translated local function (or constant thunk).
+pub struct FunDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub rust_path: String,
+    /// HOL types of the parameters and of the result value.
+    pub param_tys: Vec<String>,
+    pub ret_ty: String,
+    pub params: Vec<String>,
+    /// Body (uRust, may contain call markers). `None` = function-level placeholder.
+    pub body: String,
+    pub calls: crate::frontend::DefSet,
+    pub comments: Vec<String>,
+}
+
+pub struct Frontend<'tcx> {
+    pub tcx: TyCtxt<'tcx>,
+    pub crate_name: String,
+    names: HashMap<DefId, String>,
+    used_names: HashSet<String>,
+    type_names: HashMap<DefId, String>,
+    used_type_names: HashSet<String>,
+    pub ext_types: BTreeMap<String, ExtType>,
+    pub ext_funs: BTreeMap<String, ExtFun>,
+    ext_fun_ids: HashMap<DefId, String>,
+    pub foreign_funs: BTreeMap<String, ExtFun>,
+    pub alloc_types: Vec<String>,
+    pub placeholders: Vec<String>,
+    pub fun_defs: Vec<FunDef>,
+    pub item_comments: Vec<String>,
+    /// Table used by call markers (`\u{1}C<n>\u{2}` etc.).
+    pub marker_ids: Vec<DefId>,
+    marker_index: HashMap<DefId, usize>,
+    /// Local ADTs (structs/enums) that are translated.
+    pub adts: Vec<DefId>,
+    /// Structs translated as `datatype_record` (have lenses).
+    pub record_adts: HashSet<DefId>,
+}
+
+pub fn paren_ty(s: &str) -> String {
+    if s.contains(' ') && !(s.starts_with('(') && balanced_outer(s)) { format!("({})", s) } else { s.to_string() }
+}
+
+fn balanced_outer(s: &str) -> bool {
+    // true if s is "( ... )" with the outer parentheses matching each other
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        if c == '(' { depth += 1 }
+        if c == ')' {
+            depth -= 1;
+            if depth == 0 && i != s.len() - 1 { return false }
+        }
+    }
+    true
+}
+
+impl<'tcx> Frontend<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, crate_name: String) -> Self {
+        Frontend {
+            tcx,
+            crate_name,
+            names: HashMap::new(),
+            used_names: HashSet::new(),
+            type_names: HashMap::new(),
+            used_type_names: HashSet::new(),
+            ext_types: BTreeMap::new(),
+            ext_funs: BTreeMap::new(),
+            ext_fun_ids: HashMap::new(),
+            foreign_funs: BTreeMap::new(),
+            alloc_types: Vec::new(),
+            placeholders: Vec::new(),
+            fun_defs: Vec::new(),
+            item_comments: Vec::new(),
+            marker_ids: Vec::new(),
+            marker_index: HashMap::new(),
+            adts: Vec::new(),
+            record_adts: HashSet::new(),
+        }
+    }
+
+    pub fn snippet(&self, sp: Span) -> String {
+        self.tcx.sess.source_map().span_to_snippet(sp).unwrap_or_else(|_| "?".to_string())
+    }
+
+    pub fn line_of(&self, sp: Span) -> String {
+        let sm = self.tcx.sess.source_map();
+        let loc = sm.lookup_char_pos(sp.lo());
+        format!("line {}", loc.line)
+    }
+
+    pub fn note_placeholder(&mut self, what: &str, sp: Span) {
+        let line = format!("{}: {} -- `{}`", self.line_of(sp), what, one_line(&self.snippet(sp)));
+        self.placeholders.push(line);
+    }
+
+    pub fn marker(&mut self, did: DefId) -> usize {
+        if let Some(i) = self.marker_index.get(&did) { return *i }
+        let i = self.marker_ids.len();
+        self.marker_ids.push(did);
+        self.marker_index.insert(did, i);
+        i
+    }
+
+    // ------------------------------------------------------------------
+    // Paths and names
+    // ------------------------------------------------------------------
+
+    /// Crate-relative path segments; `impl` segments are replaced by the
+    /// name of the self type (and the trait, for trait impls).
+    pub fn path_segments(&self, did: DefId) -> Vec<String> {
+        let key = self.tcx.def_key(did);
+        let parent = key.parent.map(|p| DefId { krate: did.krate, index: p });
+        let mut segs = match parent { Some(p) => self.path_segments(p), None => vec![] };
+        match key.disambiguated_data.data {
+            DefPathData::CrateRoot => {}
+            DefPathData::Impl => {
+                segs.extend(self.impl_segments(did));
+            }
+            DefPathData::Ctor => {}
+            DefPathData::Closure => segs.push("closure".to_string()),
+            _ => {
+                // unnamed segments (extern blocks, anonymous consts, ...) are dropped
+                if let Some(sym) = key.disambiguated_data.data.get_opt_name() {
+                    segs.push(sym.to_string());
+                }
+            }
+        }
+        segs
+    }
+
+    fn impl_segments(&self, impl_did: DefId) -> Vec<String> {
+        let self_ty = self.tcx.type_of(impl_did).instantiate_identity().skip_normalization();
+        let mut v = vec![self.short_ty_name(self_ty)];
+        if let Some(tr) = self.tcx.impl_opt_trait_ref(impl_did) {
+            v.push(self.tcx.item_name(tr.skip_binder().def_id).to_string());
+        }
+        v
+    }
+
+    pub fn short_ty_name(&self, t: Ty<'tcx>) -> String {
+        match t.kind() {
+            ty::Adt(def, _) => self.tcx.item_name(def.did()).to_string(),
+            ty::Ref(_, inner, _) => self.short_ty_name(*inner),
+            ty::Slice(_) => "slice".into(),
+            ty::Array(..) => "array".into(),
+            ty::Str => "str".into(),
+            ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => format!("{}", t),
+            ty::Tuple(_) => "tuple".into(),
+            ty::Param(p) => p.name.to_string(),
+            _ => "impl".into(),
+        }
+    }
+
+    /// HOL constant name of a local item (function, const, static).
+    pub fn def_name(&mut self, did: DefId) -> String {
+        if let Some(n) = self.names.get(&did) { return n.clone() }
+        let segs = self.path_segments(did);
+        let base = names::global_name(&segs);
+        let mut n = base.clone();
+        let mut k = 1;
+        while self.used_names.contains(&n) {
+            k += 1;
+            n = format!("{}_{}", base, k);
+        }
+        self.used_names.insert(n.clone());
+        self.names.insert(did, n.clone());
+        n
+    }
+
+    /// HOL type name of a local ADT.
+    pub fn adt_name(&mut self, did: DefId) -> String {
+        if let Some(n) = self.type_names.get(&did) { return n.clone() }
+        let segs = self.path_segments(did);
+        let base = names::type_name(&segs);
+        let mut n = base.clone();
+        let mut k = 1;
+        while self.used_type_names.contains(&n) || self.used_names.contains(&n) {
+            k += 1;
+            n = format!("{}_{}", base, k);
+        }
+        self.used_type_names.insert(n.clone());
+        // constructor function / notation names derive from the type name
+        self.used_names.insert(n.clone());
+        self.type_names.insert(did, n.clone());
+        n
+    }
+
+    pub fn variant_ctor_name(&mut self, adt: DefId, vidx: usize) -> String {
+        let tn = self.adt_name(adt);
+        let def = self.tcx.adt_def(adt);
+        if def.is_enum() {
+            let v = def.variant(vidx.into());
+            format!("{}_{}", tn, names::ident_chars(v.name.as_str()))
+        } else {
+            format!("make_{}", tn)
+        }
+    }
+
+    /// uRust name under which the constructor *function* is registered.
+    pub fn variant_call_name(&mut self, adt: DefId, vidx: usize) -> String {
+        let tn = self.adt_name(adt);
+        let def = self.tcx.adt_def(adt);
+        if def.is_enum() { self.variant_ctor_name(adt, vidx) } else { tn }
+    }
+
+    pub fn field_name(&mut self, adt: DefId, vidx: usize, fidx: usize) -> String {
+        let tn = self.adt_name(adt);
+        let def = self.tcx.adt_def(adt);
+        let v = def.variant(vidx.into());
+        let f: &ty::FieldDef = v.fields.iter().nth(fidx).unwrap();
+        let fname = f.name.as_str();
+        if def.is_enum() {
+            format!("{}_{}_{}", tn, names::ident_chars(v.name.as_str()), names::ident_chars(fname))
+        } else {
+            format!("{}_{}", tn, names::ident_chars(fname))
+        }
+    }
+
+    pub fn crate_of(&self, did: DefId) -> String {
+        self.tcx.crate_name(did.krate).to_string()
+    }
+
+    pub fn is_std(&self, did: DefId) -> bool {
+        matches!(self.crate_of(did).as_str(), "core" | "alloc" | "std")
+    }
+
+    /// Recognise a few standard library ADTs by crate + item name.
+    pub fn std_adt(&self, did: DefId) -> Option<&'static str> {
+        if !self.is_std(did) { return None }
+        let n = self.tcx.item_name(did).to_string();
+        Some(match n.as_str() {
+            "Option" => "Option",
+            "Result" => "Result",
+            "Box" => "Box",
+            "Vec" => "Vec",
+            "String" => "String",
+            "Ordering" => "Ordering",
+            "Range" => "Range",
+            "RangeInclusive" => "RangeInclusive",
+            _ => return None,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Types
+    // ------------------------------------------------------------------
+
+    pub fn placeholder_type(&mut self, desc: &str, arity: usize) -> String {
+        let name = format!("unsupported_{}", names::ident_chars(desc));
+        self.ext_types.entry(name.clone()).or_insert(ExtType {
+            arity,
+            comment: format!("PLACEHOLDER: unsupported Rust type `{}`", desc),
+        });
+        name
+    }
+
+    /// Map a Rust type to a HOL type.
+    pub fn ty(&mut self, t: Ty<'tcx>) -> String {
+        match t.kind() {
+            ty::Bool => "bool".into(),
+            ty::Char => "char".into(),
+            ty::Int(it) => match it {
+                ty::IntTy::I8 => "8 sword".into(),
+                ty::IntTy::I16 => "16 sword".into(),
+                ty::IntTy::I32 => "32 sword".into(),
+                ty::IntTy::I64 | ty::IntTy::Isize => "64 sword".into(),
+                ty::IntTy::I128 => self.placeholder_type("i128", 0),
+            },
+            ty::Uint(ut) => match ut {
+                ty::UintTy::U8 => "8 word".into(),
+                ty::UintTy::U16 => "16 word".into(),
+                ty::UintTy::U32 => "32 word".into(),
+                ty::UintTy::U64 | ty::UintTy::Usize => "64 word".into(),
+                ty::UintTy::U128 => self.placeholder_type("u128", 0),
+            },
+            ty::Float(ft) => self.placeholder_type(&format!("{:?}", ft).to_lowercase(), 0),
+            ty::Str => "String.literal".into(),
+            ty::Ref(_, inner, m) => {
+                let i = self.ty(*inner);
+                if m.is_mut() { format!("('addr, 'gv, {}) Global_Store.ref", i) } else { i }
+            }
+            ty::Slice(inner) => format!("{} list", paren_ty(&self.ty(*inner))),
+            ty::Array(inner, _) => format!("{} list", paren_ty(&self.ty(*inner))),
+            ty::Tuple(ts) => {
+                if ts.is_empty() {
+                    "unit".into()
+                } else {
+                    let parts: Vec<String> = ts.iter().map(|x| paren_ty(&self.ty(x))).collect();
+                    format!("({} \\<times> tnil)", parts.join(" \\<times> "))
+                }
+            }
+            ty::Never => "unit".into(),
+            ty::Param(p) => names::tvar_name(p.name.as_str()),
+            ty::Adt(def, args) => {
+                let did = def.did();
+                let targs: Vec<Ty<'tcx>> = args.types().collect();
+                match self.std_adt(did) {
+                    Some("Option") => format!("{} option", paren_ty(&self.ty(targs[0]))),
+                    Some("Result") => {
+                        let a = self.ty(targs[0]);
+                        let b = self.ty(targs[1]);
+                        format!("({}, {}) result", a, b)
+                    }
+                    Some("Box") => self.ty(targs[0]),
+                    Some("Vec") => format!("{} list", paren_ty(&self.ty(targs[0]))),
+                    Some("String") => "String.literal".into(),
+                    Some("Ordering") => "ordering".into(),
+                    Some("Range") | Some("RangeInclusive") => {
+                        format!("{} range", paren_ty(&self.ty(targs[0])))
+                    }
+                    _ => {
+                        let name = if did.is_local() && !def.is_union() {
+                            self.adt_name(did)
+                        } else if did.is_local() {
+                            self.placeholder_type(&format!("union {}", self.tcx.item_name(did)), targs.len())
+                        } else {
+                            let n = format!("ext_{}", names::ident_chars(self.tcx.item_name(did).as_str()));
+                            let path = self.tcx.def_path_str(did);
+                            self.ext_types.entry(n.clone()).or_insert(ExtType {
+                                arity: targs.len(),
+                                comment: format!("PLACEHOLDER: external type `{}` (no uRust model)", path),
+                            });
+                            n
+                        };
+                        if targs.is_empty() {
+                            name
+                        } else {
+                            let a: Vec<String> = targs.iter().map(|x| self.ty(*x)).collect();
+                            format!("({}) {}", a.join(", "), name)
+                        }
+                    }
+                }
+            }
+            ty::RawPtr(..) => self.placeholder_type("raw_pointer", 0),
+            ty::FnPtr(..) => self.placeholder_type("fn_pointer", 0),
+            ty::Dynamic(..) => self.placeholder_type("dyn_trait", 0),
+            ty::Alias(..) => self.placeholder_type("alias_or_impl_trait", 0),
+            ty::Closure(..) => self.placeholder_type("closure", 0),
+            ty::FnDef(..) => self.placeholder_type("fn_item", 0),
+            _ => self.placeholder_type(&format!("{}", t), 0),
+        }
+    }
+
+    pub fn fun_type(&self, param_tys: &[String], ret: &str) -> String {
+        let mut s = String::new();
+        for p in param_tys {
+            s.push_str(&paren_ty(p));
+            s.push_str(" \\<Rightarrow> ");
+        }
+        s.push_str(&format!("('s, {}, 'abort, 'i prompt, 'o prompt_output) function_body", ret));
+        s
+    }
+
+    pub fn need_alloc(&mut self, hol_ty: &str) {
+        if !self.alloc_types.iter().any(|t| t == hol_ty) {
+            self.alloc_types.push(hol_ty.to_string());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // External functions
+    // ------------------------------------------------------------------
+
+    /// Register (or look up) an external function, returning its HOL name.
+    pub fn ext_fun(&mut self, did: DefId, foreign: bool) -> String {
+        if let Some(n) = self.ext_fun_ids.get(&did) { return n.clone() }
+        let mut segs = vec![];
+        if !did.is_local() { segs.push(self.crate_of(did)); }
+        segs.extend(self.path_segments(did));
+        let base = format!("{}{}", if foreign { "" } else { "ext_" }, names::global_name(&segs));
+        let mut n = base.clone();
+        let mut k = 1;
+        while self.used_names.contains(&n) {
+            k += 1;
+            n = format!("{}_{}", base, k);
+        }
+        self.used_names.insert(n.clone());
+        let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
+        let inputs: Vec<Ty<'tcx>> = sig.inputs().iter().copied().collect();
+        let params: Vec<String> = inputs.iter().map(|t| self.ty(*t)).collect();
+        let ret = self.ty(sig.output());
+        let hol_type = self.fun_type(&params, &ret);
+        let ef = ExtFun { hol_name: n.clone(), rust_path: self.tcx.def_path_str(did), hol_type, arity: params.len() };
+        if foreign { self.foreign_funs.insert(n.clone(), ef); } else { self.ext_funs.insert(n.clone(), ef); }
+        self.ext_fun_ids.insert(did, n.clone());
+        n
+    }
+
+    // ------------------------------------------------------------------
+    // Item collection
+    // ------------------------------------------------------------------
+
+    pub fn local_fn_with_body(&self, did: DefId) -> bool {
+        let Some(ld) = did.as_local() else { return false };
+        matches!(self.tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn)
+            && self.tcx.hir_maybe_body_owned_by(ld).is_some()
+    }
+
+    pub fn is_trait_item(&self, did: DefId) -> bool {
+        matches!(self.tcx.def_kind(self.tcx.parent(did)), DefKind::Trait)
+    }
+
+    pub fn ld(&self, did: DefId) -> LocalDefId {
+        did.expect_local()
+    }
+}
+
+pub fn one_line(s: &str) -> String {
+    let s: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.len() > 120 { format!("{}...", &s[..s.char_indices().nth(117).map(|x| x.0).unwrap_or(s.len())]) } else { s }
+}
