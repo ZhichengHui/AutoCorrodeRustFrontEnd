@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 
-use rustc_ast::ast::{LitIntType, LitKind};
+use rustc_ast::ast::LitKind;
 use rustc_hir as hir;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
@@ -18,7 +19,7 @@ use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, Der
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeckResults};
 use rustc_span::Span;
 
-use crate::frontend::{Frontend, paren_ty};
+use crate::frontend::Frontend;
 use crate::names;
 
 pub struct Unsup(pub String);
@@ -93,19 +94,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         format!("{}_{}", base, self.fresh)
     }
 
-    fn placeholder(&mut self, msg: &str, sp: Span) -> Tr {
-        let marker = self.fe.placeholder(msg, Some(sp));
-        Tr::new(format!("unimplemented!(\"{}\")", names::string_token(&marker)), 999)
-    }
-
-    /// Give a placeholder the HOL type of the Rust expression it replaces, so that the
-    /// overloaded operators applied to it remain resolvable.
-    fn typed_placeholder(&mut self, p: Tr, t: Ty<'tcx>) -> Tr {
+    /// The placeholder term for an expression of type `t`, marked by `marker`. It has the HOL
+    /// type of the Rust expression it replaces, so that the overloaded operators applied to it
+    /// remain resolvable.
+    fn placeholder_term(&mut self, marker: &str, t: Ty<'tcx>) -> Tr {
+        let msg = names::string_token(marker);
         if t.is_never() {
-            return p;
+            return Tr::new(format!("unimplemented!(\"{}\")", msg), 999);
         }
         let h = self.fe.ty(t);
-        let msg = p.s.trim_start_matches("unimplemented!(\"").trim_end_matches("\")").to_string();
         Tr::atom(format!(
             "\\<epsilon>\\<open>(unimplemented (STR ''{}'') :: (_, {}, _, _, _, _) expression)\\<close>",
             msg, h
@@ -139,7 +136,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     params.push(n.clone());
                     if m.is_mut() {
                         let t = self.typeck.node_type(hid);
-                        self.alloc(t, p.pat.span)?;
+                        self.alloc(t)?;
                         prologue.push(format!("let mut {} = {};", n, n));
                         self.locals.insert(hid, Local { name: n, cell: true });
                     } else {
@@ -173,14 +170,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    fn alloc(&mut self, t: Ty<'tcx>, sp: Span) -> R<()> {
-        let h = self.fe.ty(t);
-        if h.contains("'r") {
-            let _ = sp;
-            return unsup("mutable local of a generic type (needs a locale prism for a type parameter)");
-        }
-        if h.contains("unsupported_") {
+    fn alloc(&mut self, t: Ty<'tcx>) -> R<()> {
+        let (h, modelled) = self.fe.ty_modelled(t);
+        if !modelled {
             return unsup(format!("mutable local of the unsupported type `{}`", t));
+        }
+        if t.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(x) if matches!(x.kind(), ty::Param(_)))) {
+            return unsup("mutable local of a generic type (needs a locale prism for a type parameter)");
         }
         self.fe.need_alloc(&h);
         Ok(())
@@ -202,7 +198,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let (pre, post) = self.let_stmt(l)?;
                     let rest = self.block_seq(&stmts[i + 1..], tail)?;
                     parts.push(format!("{}\n{}{}", pre, rest, post));
-                    return Ok(join_seq(parts, true));
+                    return Ok(join_seq(parts));
                 }
                 StmtKind::Expr(e) | StmtKind::Semi(e) => {
                     let t = self.ty_of(e);
@@ -232,7 +228,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !ended_by_divergence && tail.is_none() && parts.last().map(|p| p.starts_with("let ")).unwrap_or(false) {
             parts.push("\u{3}()".to_string());
         }
-        let s = join_seq(parts, false);
+        let s = join_seq(parts);
         Ok(if s.trim().is_empty() { "()".to_string() } else { s })
     }
 
@@ -292,7 +288,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
                     let t = self.typeck.node_type(hid);
-                    self.alloc(t, l.pat.span)?;
+                    self.alloc(t)?;
                     let ht = self.fe.ty(t);
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
                     Ok((format!("let mut {} = \\<llangle>undefined :: {}\\<rrangle>;", n, ht), String::new()))
@@ -314,7 +310,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = names::local_name(ident.as_str());
                 if m.is_mut() {
                     let t = self.typeck.node_type(hid);
-                    self.alloc(t, pat.span)?;
+                    self.alloc(t)?;
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
                     Ok(format!("let mut {} = {};", n, v.at(20)))
                 } else {
@@ -340,7 +336,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = names::local_name(ident.as_str());
                 if m.is_mut() {
                     let t = self.typeck.node_type(hid);
-                    self.alloc(t, pat.span)?;
+                    self.alloc(t)?;
                     out.push(format!("let mut {} = {};", n, v.at(20)));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
                 } else {
@@ -413,8 +409,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Ok(pv) => self.to_val(pv),
             Err(Unsup(m)) => {
                 let t = self.ty_adj(e);
-                let p = self.placeholder(&m, e.span);
-                self.typed_placeholder(p, t)
+                let marker = self.fe.placeholder(&m, Some(e.span));
+                self.placeholder_term(&marker, t)
             }
         }
     }
@@ -495,7 +491,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
             PV::Val(v) => {
-                self.alloc(t, rustc_span::DUMMY_SP)?;
+                self.alloc(t)?;
                 let tmp = self.fresh("tmp");
                 Ok(PV::Val(Tr::atom(format!("{{ let mut {} = {}; {} }}", tmp, v.at(20), tmp))))
             }
@@ -600,7 +596,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn val_unadj(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
-        let tcx = self.tcx;
         match e.kind {
             ExprKind::Lit(lit) => self.lit(&lit.node, self.ty_of(e), false),
             ExprKind::Path(ref qp) => self.path_value(qp, e),
@@ -645,7 +640,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::If(c, t, el) => self.if_expr(c, t, el),
             ExprKind::Loop(b, label, src, _) => self.loop_expr(e, b, label, src),
             ExprKind::Match(scrut, arms, src) => match src {
-                MatchSource::ForLoopDesugar => self.for_loop(e, scrut, arms),
+                MatchSource::ForLoopDesugar => self.for_loop(scrut, arms),
                 MatchSource::TryDesugar(_) => {
                     let ExprKind::Call(_, [inner]) = scrut.kind else { return unsup("`?` desugaring") };
                     let v = self.val(inner)?;
@@ -654,7 +649,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 MatchSource::Normal | MatchSource::Postfix => self.match_expr(scrut, arms),
                 _ => unsup("async/await or format_args"),
             },
-            ExprKind::Closure(c) => self.closure(e, c),
+            ExprKind::Closure(c) => self.closure(c),
             ExprKind::Block(b, label) => {
                 if label.is_some() { return unsup("labeled block") }
                 let s = self.block_seq(b.stmts, b.expr)?;
@@ -715,11 +710,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Use(..) => unsup("ergonomic clone `use`"),
             ExprKind::UnsafeBinderCast(..) => unsup("unsafe binder cast"),
             ExprKind::Err(_) => unsup("error expression"),
-            #[allow(unreachable_patterns)]
-            _ => {
-                let _ = tcx;
-                unsup("expression kind")
-            }
         }
     }
 
@@ -768,10 +758,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn lit(&mut self, l: &LitKind, t: Ty<'tcx>, neg: bool) -> R<Tr> {
         match l {
-            LitKind::Int(v, _) => {
-                let _ = LitIntType::Unsuffixed;
-                Self::int_lit(v.get(), t, neg)
-            }
+            LitKind::Int(v, _) => Self::int_lit(v.get(), t, neg),
             LitKind::Bool(b) => Ok(Tr::atom(if *b { "true" } else { "false" })),
             LitKind::Byte(b) => Ok(Tr::atom(format!("{}_u8", b))),
             LitKind::Char(c) => Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char(*c)?))),
@@ -883,36 +870,34 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::atom(format!("({}) as {}", v.s, tsfx)))
     }
 
-    fn binop_info(op: BinOpKind) -> (&'static str, u32, bool) {
-        // (token, precedence, left-assoc)
+    fn binop_info(op: BinOpKind) -> (&'static str, u32) {
+        // (token, precedence)
         match op {
-            BinOpKind::Mul => ("*", 50, true),
-            BinOpKind::Div => ("/", 50, true),
-            BinOpKind::Rem => ("%", 50, true),
-            BinOpKind::Add => ("+", 49, true),
-            BinOpKind::Sub => ("-", 49, true),
-            BinOpKind::Shl => ("<<", 48, true),
-            BinOpKind::Shr => (">>", 48, true),
-            BinOpKind::BitAnd => ("&", 47, true),
-            BinOpKind::BitXor => ("^", 46, true),
-            BinOpKind::BitOr => ("|", 45, true),
-            BinOpKind::Eq => ("==", 44, false),
-            BinOpKind::Ne => ("!=", 44, false),
-            BinOpKind::Lt => ("<", 44, false),
-            BinOpKind::Le => ("<=", 44, false),
-            BinOpKind::Gt => (">", 44, false),
-            BinOpKind::Ge => (">=", 44, false),
-            BinOpKind::And => ("&&", 43, true),
-            BinOpKind::Or => ("||", 42, true),
+            BinOpKind::Mul => ("*", 50),
+            BinOpKind::Div => ("/", 50),
+            BinOpKind::Rem => ("%", 50),
+            BinOpKind::Add => ("+", 49),
+            BinOpKind::Sub => ("-", 49),
+            BinOpKind::Shl => ("<<", 48),
+            BinOpKind::Shr => (">>", 48),
+            BinOpKind::BitAnd => ("&", 47),
+            BinOpKind::BitXor => ("^", 46),
+            BinOpKind::BitOr => ("|", 45),
+            BinOpKind::Eq => ("==", 44),
+            BinOpKind::Ne => ("!=", 44),
+            BinOpKind::Lt => ("<", 44),
+            BinOpKind::Le => ("<=", 44),
+            BinOpKind::Gt => (">", 44),
+            BinOpKind::Ge => (">=", 44),
+            BinOpKind::And => ("&&", 43),
+            BinOpKind::Or => ("||", 42),
         }
     }
 
-    fn mk_bin(op: &str, prec: u32, left_assoc: bool, l: &Tr, r: &Tr) -> Tr {
+    fn mk_bin(op: &str, prec: u32, l: &Tr, r: &Tr) -> Tr {
         // non-atomic operands are always parenthesised: `|` is also closure and pattern syntax,
         // and explicit grouping avoids ambiguous parses
-        let _ = left_assoc;
-        let (lp, rp) = (999, 999);
-        Tr::new(format!("{} {} {}", l.at(lp), op, r.at(rp)), prec)
+        Tr::new(format!("{} {} {}", l.at(999), op, r.at(999)), prec)
     }
 
     fn binary(&mut self, e: &'tcx hir::Expr<'tcx>, op: BinOpKind, l: &'tcx hir::Expr<'tcx>, r: &'tcx hir::Expr<'tcx>) -> R<Tr> {
@@ -925,8 +910,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             if matches!(op, BinOpKind::Eq | BinOpKind::Ne) && self.structural_eq(e) {
                 let lv = self.val(l)?;
                 let rv = self.val(r)?;
-                let (tok, p, la) = Self::binop_info(op);
-                return Ok(Self::mk_bin(tok, p, la, &lv, &rv));
+                let (tok, p) = Self::binop_info(op);
+                return Ok(Self::mk_bin(tok, p, &lv, &rv));
             }
             if !builtin { return self.overloaded_op(e, &[l, r]) }
             return unsup(format!("binary operator on `{}`", lt));
@@ -940,11 +925,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 BinOpKind::BitXor => "!=",
                 _ => Self::binop_info(op).0,
             };
-            let (p, la) = match tok { "&&" => (43, true), "||" => (42, true), _ => (Self::binop_info(op).1, Self::binop_info(op).2) };
+            let p = match tok { "&&" => 43, "||" => 42, _ => Self::binop_info(op).1 };
             if matches!(op, BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
                 return unsup("ordering comparison on `bool`");
             }
-            return Ok(Self::mk_bin(tok, p, la, &lv, &rv));
+            return Ok(Self::mk_bin(tok, p, &lv, &rv));
         }
         if lt.is_char() && !matches!(op, BinOpKind::Eq | BinOpKind::Ne) {
             return unsup("ordering comparison on `char`");
@@ -958,8 +943,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         } else {
             rv
         };
-        let (tok, p, la) = Self::binop_info(op);
-        Ok(Self::mk_bin(tok, p, la, &lv, &rv))
+        let (tok, p) = Self::binop_info(op);
+        Ok(Self::mk_bin(tok, p, &lv, &rv))
     }
 
     /// Is `==` on this expression structural (derived PartialEq or std impl on structural types)?
@@ -972,7 +957,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let rd = inst.def_id();
                 if let Some(imp) = self.tcx.impl_of_assoc(rd) {
                     if self.tcx.is_automatically_derived(imp) { return true }
-                    if !rd.is_local() {
+                    if self.fe.is_std(rd) {
                         // std impls (Option, tuples, references, str, slices) are structural
                         return true;
                     }
@@ -1027,8 +1012,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             A::DivAssign => {
                 // `x /= e` is not in uRust; desugar to `x = *x / e` (the place is evaluated twice,
-                // which is only done for places without side effects).
-                if p.s.contains('(') && p.s.contains("\u{1}") { return unsup("`/=` on a place with calls") }
+                // which is only done for places without calls).
+                if !self.is_simple(lhs) { return unsup("`/=` on a place with calls") }
                 return Ok(Tr::new(format!("*{} = *{} / {}", p.at(200), p.at(200), v.at(51)), 40));
             }
         };
@@ -1050,7 +1035,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let res = self.typeck.qpath_res(qp, callee.hir_id);
         match res {
             Res::Def(DefKind::Fn | DefKind::AssocFn, did) => {
-                if let Some(t) = self.panic_or_print(did, args)? {
+                if let Some(t) = self.panic_or_print(did, args, e.span)? {
                     return Ok(t);
                 }
                 let gargs = self.typeck.node_args(callee.hir_id);
@@ -1096,22 +1081,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// Panics and printing from the standard library (recognised before their
-    /// `format_args!` arguments are translated).
-    fn panic_or_print(&mut self, did: DefId, args: &'tcx [hir::Expr<'tcx>]) -> R<Option<Tr>> {
+    /// Calls of standard library functions recognised before their (`format_args!`) arguments
+    /// are translated: a function that never returns is a panic, the only diverging construct
+    /// of uRust; a function taking `fmt::Arguments` and returning `()` only produces output,
+    /// which is not modelled, so the call is dropped; any other function involving
+    /// `fmt::Arguments` formats a string.
+    fn panic_or_print(&mut self, did: DefId, args: &'tcx [hir::Expr<'tcx>], sp: Span) -> R<Option<Tr>> {
+        let tcx = self.tcx;
         if !self.fe.is_std(did) {
             return Ok(None);
         }
-        let path = self.tcx.def_path_str(did);
-        let item = self.tcx.item_name(did).to_string();
-        let is_panic = path.contains("panicking")
-            || item.contains("panic")
-            || item == "assert_failed"
-            || item.starts_with("unreachable");
-        if !is_panic && (path.contains("fmt::format") || path.contains("fmt::Arguments")) {
-            return unsup("string formatting (format!)");
-        }
-        if is_panic {
+        let sig = tcx.fn_sig(did).instantiate_identity().skip_binder();
+        if sig.output().is_never() {
             fn find_str(e: &hir::Expr<'_>) -> Option<String> {
                 match e.kind {
                     ExprKind::Lit(l) => match l.node {
@@ -1125,15 +1106,24 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     _ => None,
                 }
             }
-            let lit = args.iter().find_map(|x| find_str(x));
-            let msg = lit.unwrap_or_else(|| {
-                if path.contains("assert_failed") { "assertion failed".into() } else { "panic".into() }
-            });
+            let msg = args.iter().find_map(|x| find_str(x)).unwrap_or_else(|| tcx.item_name(did).to_string());
             return Ok(Some(Tr::new(format!("panic!(\"{}\")", names::string_token(&msg)), 999)));
         }
-        if path.ends_with("io::_print") || path.ends_with("io::_eprint") {
-            self.comments.push("output (print!/println!) is not modelled and was dropped".into());
-            return Ok(Some(Tr::atom("()")));
+        let fmt_arguments = |t: Ty<'tcx>| {
+            t.walk().any(|g| match g.kind() {
+                ty::GenericArgKind::Type(x) => {
+                    matches!(x.kind(), ty::Adt(d, _) if tcx.is_lang_item(d.did(), LangItem::FormatArguments))
+                }
+                _ => false,
+            })
+        };
+        if sig.inputs().iter().any(|t| fmt_arguments(*t)) || fmt_arguments(sig.output()) {
+            if sig.output().is_unit() {
+                let m = self.fe.placeholder("output (print!/println!), dropped", Some(sp));
+                self.comments.push(m);
+                return Ok(Some(Tr::atom("()")));
+            }
+            return unsup("string formatting (format!)");
         }
         Ok(None)
     }
@@ -1229,14 +1219,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut tys: Vec<Ty<'tcx>> = arg_exprs.iter().take(1).map(|a| self.ty_adj(a)).collect();
         tys.push(self.ty_of(e));
         for t in tys {
-            if let ty::Adt(d, _) = Self::peel_refs(t).kind() {
-                let n = self.tcx.item_name(d.did()).to_string();
-                if self.fe.is_std(d.did())
-                    && (matches!(n.as_str(), "Cell" | "RefCell" | "UnsafeCell" | "OnceCell" | "Mutex" | "RwLock")
-                        || n.starts_with("Atomic"))
-                {
-                    return unsup(format!("interior mutability (`{}`)", n));
-                }
+            let t = Self::peel_refs(t);
+            if self.fe.interior_mutable(t) {
+                return unsup(format!("interior mutability (`{}`)", t));
             }
         }
         if let Some(t) = self.std_call(did, target, argv.clone(), arg_exprs, e)? {
@@ -1275,8 +1260,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         arg_exprs: &[&'tcx hir::Expr<'tcx>],
         e: &'tcx hir::Expr<'tcx>,
     ) -> R<Option<Tr>> {
+        // the table covers standard library functions and derived methods
+        if !(self.fe.is_std(target) || self.derived(target)) {
+            return Ok(None);
+        }
         let (tk, tn) = self.std_key(orig);
-        let (ik, iname) = self.std_key(target);
         let a = |i: usize| -> Tr { argv[i].clone() };
         let same_hol = |this: &mut Self| -> bool {
             if arg_exprs.is_empty() { return false }
@@ -1284,29 +1272,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let dst = Self::peel_refs(this.ty_of(e));
             this.fe.ty(src) == this.fe.ty(dst)
         };
-        let crate_ = self.fe.crate_of(target);
-        let path = self.tcx.def_path_str(target);
-        let is_std = matches!(crate_.as_str(), "core" | "alloc" | "std");
-        // panics
-        if is_std && (path.contains("panicking") || path.contains("begin_panic")) {
-            let msg = arg_exprs.first().and_then(|x| match x.kind {
-                ExprKind::Lit(l) => match l.node { LitKind::Str(s, _) => Some(s.to_string()), _ => None },
-                _ => None,
-            });
-            let msg = msg.unwrap_or_else(|| if path.contains("assert_failed") { "assertion failed".into() } else { "panic".into() });
-            return Ok(Some(Tr::new(format!("panic!(\"{}\")", names::string_token(&msg)), 999)));
-        }
-        if is_std && (path.ends_with("io::_print") || path.ends_with("io::_eprint")) {
-            self.comments.push("output (print!/println!) is not modelled and was dropped".into());
-            return Ok(Some(Tr::atom("()")));
-        }
         let r = match (tk.as_str(), tn.as_str()) {
-            ("Clone", "clone") if !target.is_local() || self.derived(target) => Some(self.deref_arg(a(0), arg_exprs, 0)),
+            ("Clone", "clone") if !target.is_local() || self.derived(target) => Some(a(0)),
             ("PartialEq", "eq") if !target.is_local() || self.derived(target) => {
-                Some(Self::mk_bin("==", 44, false, &self.deref_arg(a(0), arg_exprs, 0), &self.deref_arg(a(1), arg_exprs, 1)))
+                Some(Self::mk_bin("==", 44, &a(0), &a(1)))
             }
             ("PartialEq", "ne") if !target.is_local() || self.derived(target) => {
-                Some(Self::mk_bin("!=", 44, false, &self.deref_arg(a(0), arg_exprs, 0), &self.deref_arg(a(1), arg_exprs, 1)))
+                Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
             }
             ("Ord", "cmp") if !target.is_local() => Some(self.named_call("cmp", vec![a(0), a(1)])),
             ("Option", "unwrap") => Some(self.named_call("option_unwrap", vec![a(0)])),
@@ -1335,7 +1307,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Some(a(0))
             }
             (k, "checked_add") | (k, "checked_mul") | (k, "saturating_sub") | (k, "wrapping_add") | (k, "div_ceil")
-                if k.starts_with('u') =>
+                if matches!(k, "u8" | "u16" | "u32" | "u64" | "usize") =>
             {
                 let f = match tn.as_str() {
                     "wrapping_add" => "wrapping_add_unsigned",
@@ -1345,7 +1317,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             _ => None,
         };
-        let _ = (ik, iname);
         Ok(r)
     }
 
@@ -1353,9 +1324,20 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         self.tcx.impl_of_assoc(did).map(|i| self.tcx.is_automatically_derived(i)).unwrap_or(false)
     }
 
-    /// Arguments of `Clone::clone(&x)` / `PartialEq::eq(&a, &b)` are shared references,
-    /// which are already values in our representation.
-    fn deref_arg(&self, t: Tr, _exprs: &[&'tcx hir::Expr<'tcx>], _i: usize) -> Tr { t }
+    /// Is `e` built only from locals and constants, literals, field accesses, indexing and
+    /// built-in operators? Such an expression has no side effects, so evaluating it again or
+    /// in another order gives the same result.
+    fn is_simple(&self, e: &hir::Expr<'tcx>) -> bool {
+        let builtin = self.typeck.type_dependent_def_id(e.hir_id).is_none();
+        match e.kind {
+            ExprKind::Path(_) | ExprKind::Lit(_) => true,
+            ExprKind::Field(b, _) | ExprKind::DropTemps(b) => self.is_simple(b),
+            ExprKind::Unary(_, b) => builtin && self.is_simple(b),
+            ExprKind::Index(b, i, _) => self.is_simple(b) && self.is_simple(i),
+            ExprKind::Binary(_, l, r) => builtin && self.is_simple(l) && self.is_simple(r),
+            _ => false,
+        }
+    }
 
     // ------------------------------------------------------------------
     // Structs
@@ -1364,7 +1346,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn struct_expr(
         &mut self,
         e: &'tcx hir::Expr<'tcx>,
-        _qp: &'tcx hir::QPath<'tcx>,
+        qp: &'tcx hir::QPath<'tcx>,
         fields: &'tcx [hir::ExprField<'tcx>],
         tail: hir::StructTailExpr<'tcx>,
     ) -> R<Tr> {
@@ -1385,14 +1367,20 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup(format!("struct expression of `{}`", t));
         }
         if !adt.is_local() || def.is_union() { return unsup(format!("struct expression of `{}`", t)) }
-        let res = self.typeck.qpath_res(_qp, e.hir_id);
+        let res = self.typeck.qpath_res(qp, e.hir_id);
         let variant = def.variant_of_res(res);
-        let vidx = def.variants().iter().position(|v| v.def_id == variant.def_id).unwrap_or(0);
+        let vidx = def.variants().iter().position(|v| v.def_id == variant.def_id).expect("variant of its ADT");
         let nf = variant.fields.len();
         let mut vals: Vec<Option<Tr>> = vec![None; nf];
         let mut pre = vec![];
-        // evaluate the written fields in source order (bound to temporaries when there are calls)
-        let need_tmp = fields.len() > 1 && fields.iter().any(|f| matches!(f.expr.kind, ExprKind::Call(..) | ExprKind::MethodCall(..)));
+        // Rust evaluates the written fields in source order, then the base; the uRust struct
+        // expression lists the fields in declaration order. When that reorders evaluation and
+        // an expression may have side effects, the written fields are first bound to temporaries.
+        let base = match tail { hir::StructTailExpr::Base(b) => Some(b), _ => None };
+        let idxs: Vec<usize> = fields.iter().map(|f| self.typeck.field_index(f.hir_id).as_usize()).collect();
+        let reordered = base.is_some() || idxs.windows(2).any(|w| w[0] > w[1]);
+        let effects = fields.iter().map(|f| f.expr).chain(base).any(|x| !self.is_simple(x));
+        let need_tmp = reordered && effects;
         for f in fields {
             let idx = self.typeck.field_index(f.hir_id).as_usize();
             let v = self.val(f.expr)?;
@@ -1418,7 +1406,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             hir::StructTailExpr::None => {}
             _ => return unsup("default field values in struct expression"),
         }
-        let vals: Vec<Tr> = vals.into_iter().map(|v| v.unwrap_or(Tr::atom("\\<llangle>undefined\\<rrangle>"))).collect();
+        // rustc requires every field to be given, or a base
+        let vals: Vec<Tr> = vals.into_iter().map(|v| v.expect("every field has a value")).collect();
         let core = if nf == 0 {
             Tr::atom(self.fe.variant_ctor_name(adt, vidx))
         } else if def.is_enum() {
@@ -1521,7 +1510,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    fn for_loop(&mut self, _e: &'tcx hir::Expr<'tcx>, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
+    /// Is `e` a call of the standard library's `<[T]>::iter` (also through `Vec` and arrays)?
+    fn is_slice_iter(&self, e: &hir::Expr<'tcx>) -> bool {
+        let ExprKind::MethodCall(_, _, [], _) = e.kind else { return false };
+        let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return false };
+        self.fe.is_std(did) && self.std_key(did) == ("slice".to_string(), "iter".to_string())
+    }
+
+    fn for_loop(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         // match IntoIterator::into_iter(<head>) { mut iter => loop { match next(&mut iter) { None => break, Some(<pat>) => <body> } } }
         let ExprKind::Call(_, [head]) = head_call.kind else { return unsup("for-loop head") };
         let [arm] = arms else { return unsup("for-loop desugaring") };
@@ -1550,12 +1546,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Range") | Some("RangeInclusive")) => self.val(head)?,
             ty::Adt(def, _) if self.fe.std_adt(def.did()) == Some("Vec") => self.val(head)?,
             ty::Slice(_) | ty::Array(..) => self.val(head)?,
-            ty::Adt(def, _) if self.tcx.item_name(def.did()).as_str() == "Iter" && self.fe.is_std(def.did()) => {
-                // `xs.iter()` over a slice / Vec
-                match head.kind {
-                    ExprKind::MethodCall(seg, recv, [], _) if seg.ident.as_str() == "iter" => self.val(recv)?,
-                    _ => return unsup("for-loop over an iterator adaptor"),
-                }
+            // `xs.iter()` over a slice, array or Vec: iterate over `xs`
+            _ if self.is_slice_iter(head) => {
+                let ExprKind::MethodCall(_, recv, [], _) = head.kind else { unreachable!() };
+                self.val(recv)?
             }
             _ => return unsup(format!("for-loop over `{}`", ht)),
         };
@@ -1566,7 +1560,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = names::local_name(ident.as_str());
                 if m.is_mut() {
                     let t = self.typeck.node_type(hid);
-                    self.alloc(t, pat.span)?;
+                    self.alloc(t)?;
                     pro.push(format!("let mut {} = {};", n, n));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
                 } else {
@@ -1740,7 +1734,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let mut binds = vec![];
                 if m.is_mut() {
                     let t = self.typeck.node_type(hid);
-                    self.alloc(t, pat.span)?;
+                    self.alloc(t)?;
                     binds.push(format!("let mut {} = {};", n, v.at(20)));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
                 } else {
@@ -1849,12 +1843,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn pat(&mut self, pat: &'tcx hir::Pat<'tcx>) -> R<PatTr> {
         let mut conds = vec![];
         let mut prologue = vec![];
-        let s = self.pat_rec(pat, &mut conds, &mut prologue, true)?;
+        let s = self.pat_rec(pat, &mut conds, &mut prologue)?;
         Ok(PatTr { pat: s, conds, prologue })
     }
 
-    fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>, top: bool) -> R<String> {
-        let _ = top;
+    fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>) -> R<String> {
         match pat.kind {
             PatKind::Wild => Ok("_".into()),
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
@@ -1865,10 +1858,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     }
                 }
                 let n = names::local_name(ident.as_str());
-                let n = format!("{}", n);
                 if m.is_mut() {
                     let t = self.typeck.node_type(hid);
-                    self.alloc(t, pat.span)?;
+                    self.alloc(t)?;
                     pro.push(format!("let mut {} = {};", n, n));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
                 } else {
@@ -1887,7 +1879,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         Ok(n)
                     }
                     Some(s) => {
-                        let inner = self.pat_rec(s, conds, pro, false)?;
+                        let inner = self.pat_rec(s, conds, pro)?;
                         Ok(format!("{} @ {}", n, if inner.contains(' ') { format!("({})", inner) } else { inner }))
                     }
                 }
@@ -1899,7 +1891,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if n < 2 { return unsup("tuple pattern with fewer than 2 components") }
                 let mut parts = vec![];
                 for p in expand_dotdot(ps, ddpos, n) {
-                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro, false)?, None => "_".into() });
+                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro)?, None => "_".into() });
                 }
                 Ok(format!("({})", parts.join(", ")))
             }
@@ -1908,7 +1900,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = self.tcx.adt_def(adt).variant(vidx.into()).fields.len();
                 let mut parts = vec![];
                 for p in expand_dotdot(ps, ddpos, n) {
-                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro, false)?, None => "_".into() });
+                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro)?, None => "_".into() });
                 }
                 self.ctor_pat(adt, vidx, parts)
             }
@@ -1918,7 +1910,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let mut parts = vec!["_".to_string(); n];
                 for f in fields.iter() {
                     let idx = self.typeck.field_index(f.hir_id).as_usize();
-                    parts[idx] = self.pat_rec(f.pat, conds, pro, false)?;
+                    parts[idx] = self.pat_rec(f.pat, conds, pro)?;
                 }
                 self.ctor_pat(adt, vidx, parts)
             }
@@ -1960,17 +1952,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 for p in ps.iter() {
                     let mut c2 = vec![];
                     let mut p2 = vec![];
-                    parts.push(self.pat_rec(p, &mut c2, &mut p2, false)?);
+                    parts.push(self.pat_rec(p, &mut c2, &mut p2)?);
                     if !c2.is_empty() || !p2.is_empty() { return unsup("or-pattern with literal sub-patterns or mutable bindings") }
                 }
                 Ok(parts.join(" | "))
             }
-            PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro, false),
+            PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro),
             PatKind::Slice(before, None, after) if after.is_empty() => {
                 let t = Self::peel_refs(self.typeck.pat_ty(pat));
                 if !matches!(t.kind(), ty::Slice(_) | ty::Array(..)) { return unsup("slice pattern") }
                 let mut parts = vec![];
-                for p in before.iter() { parts.push(self.pat_rec(p, conds, pro, false)?); }
+                for p in before.iter() { parts.push(self.pat_rec(p, conds, pro)?); }
                 Ok(format!("[{}]", parts.join(", ")))
             }
             PatKind::Slice(..) => unsup("slice pattern with a rest pattern"),
@@ -1985,7 +1977,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ty::Adt(def, _) = t.kind() else { return unsup("constructor pattern on non-ADT") };
         let res = self.typeck.qpath_res(qp, pat.hir_id);
         let v = def.variant_of_res(res);
-        let vidx = def.variants().iter().position(|x| x.def_id == v.def_id).unwrap_or(0);
+        let vidx = def.variants().iter().position(|x| x.def_id == v.def_id).expect("variant of its ADT");
         Ok((def.did(), vidx))
     }
 
@@ -2004,7 +1996,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     // Closures
     // ------------------------------------------------------------------
 
-    fn closure(&mut self, e: &'tcx hir::Expr<'tcx>, c: &'tcx hir::Closure<'tcx>) -> R<Tr> {
+    fn closure(&mut self, c: &'tcx hir::Closure<'tcx>) -> R<Tr> {
         if !matches!(c.kind, hir::ClosureKind::Closure) { return unsup("async block / coroutine") }
         // a closure mutates a captured variable iff it captures it by a mutable (or unique) borrow
         for cap in self.typeck.closure_min_captures_flattened(c.def_id) {
@@ -2014,7 +2006,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
         }
-        let _ = e;
         let body = self.tcx.hir_body(c.body);
         let mut ps = vec![];
         let mut pro = vec![];
@@ -2023,13 +2014,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                     let n = names::local_name(ident.as_str());
                     // closure formals carry no type in uRust: fix it in the body
-                    let pt = self.fe.ty(self.typeck.node_type(hid));
-                    if !pt.contains("unsupported_") {
+                    let (pt, modelled) = self.fe.ty_modelled(self.typeck.node_type(hid));
+                    if modelled {
                         pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
                     }
                     if m.is_mut() {
                         let t = self.typeck.node_type(hid);
-                        self.alloc(t, p.pat.span)?;
+                        self.alloc(t)?;
                         pro.push(format!("let mut {} = {};", n, n));
                         self.locals.insert(hid, Local { name: n.clone(), cell: true });
                     } else {
@@ -2110,24 +2101,18 @@ fn expand_dotdot<'h>(ps: &'h [hir::Pat<'h>], ddpos: hir::DotDotPos, n: usize) ->
 
 /// Join statement strings. Entries starting with `\u{3}` are tail expressions,
 /// entries starting with `\u{4}` end with their own semicolon (return/break/continue).
-fn join_seq(parts: Vec<String>, last_is_let: bool) -> String {
+fn join_seq(parts: Vec<String>) -> String {
     let mut out = String::new();
     let n = parts.len();
     for (i, p) in parts.into_iter().enumerate() {
         let last = i + 1 == n;
         if let Some(t) = p.strip_prefix('\u{3}') {
             out.push_str(t);
-        } else if let Some(t) = p.strip_prefix('\u{4}') {
-            out.push_str(t);
-            if !last { out.push('\n'); }
-        } else if last && last_is_let {
-            out.push_str(&p);
         } else {
             // statements already carry a trailing ';'
-            out.push_str(&p);
+            out.push_str(p.strip_prefix('\u{4}').unwrap_or(&p));
             if !last { out.push('\n'); }
         }
     }
-    let _ = paren_ty;
     out
 }

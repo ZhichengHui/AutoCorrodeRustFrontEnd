@@ -32,7 +32,6 @@ const RESERVED: &[&str] = &[
     "split", "case_prod", "curry", "uncurry", "comp", "inj", "surj", "bij", "dom", "ran",
     "fresh", "assume", "obtain", "show", "have", "thus", "hence", "from", "using", "unfolding",
     "by", "proof", "qed", "done", "apply", "lemma", "theorem", "definition", "begin", "end",
-    "x", "y", "z", "f", "g", "h", "P", "Q", "R", "s", "t", "e",
     "self_ref", "store_update", "deref", "funcall", "lift_fun", "FunctionBody", "Abort",
     "Success", "Return", "Yield", "Panic", "LoopReturn", "LoopBreak", "LoopContinue",
     "tnil", "TNil", "make", "mk", "map_option", "map_result", "is_some", "is_none", "is_ok",
@@ -64,13 +63,8 @@ const OUTER_KEYWORDS: &[&str] = &[
     "supply", "guess", "let", "write", "back", "defer", "prefer", "subgoal", "unfolding",
 ];
 
-/// Single-letter / short names above are not dangerous as plain lambda binders, but
-/// they are dangerous as case-pattern binders only if they are constants. We keep the
-/// list conservative but do not rename one-letter variables: those are never HOL constants.
-const SAFE_SHORT: &[&str] = &["x", "y", "z", "f", "g", "h", "P", "Q", "R", "s", "t", "e"];
-
 fn is_reserved(s: &str) -> bool {
-    RESERVED.contains(&s) && !SAFE_SHORT.contains(&s)
+    RESERVED.contains(&s)
 }
 
 /// Turn an arbitrary string into an ASCII Isabelle identifier body.

@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use rustc_hir as hir;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -75,7 +76,7 @@ pub fn sccs<N: Copy + Eq + std::hash::Hash>(nodes: &[N], succ: &dyn Fn(N) -> Vec
 }
 
 pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
-    let mut fe = Frontend::new(tcx, opts.name.clone());
+    let mut fe = Frontend::new(tcx);
     let items = tcx.hir_crate_items(());
 
     // ---------------- types ----------------
@@ -188,7 +189,7 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
                     continue;
                 }
                 if let Some(tr) = tcx.impl_opt_trait_ref(did) {
-                    if tcx.item_name(tr.skip_binder().def_id).as_str() == "Drop" {
+                    if tcx.is_lang_item(tr.skip_binder().def_id, LangItem::Drop) {
                         let m = fe.placeholder(
                             "destructor semantics (drop is translated as an ordinary function; destructor calls are not inserted)",
                             Some(tcx.def_span(did)),
@@ -258,13 +259,16 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
     let ld: LocalDefId = did.expect_local();
     let name = fe.def_name(did);
     let rust_path = tcx.def_path_str(did);
-    let (param_tys, ret_ty): (Vec<String>, String) = if kind == "fn" {
+    let (params, ret): (Vec<(String, bool)>, (String, bool)) = if kind == "fn" {
         let sig = tcx.fn_sig(did).instantiate_identity().skip_binder();
         let ins: Vec<Ty<'tcx>> = sig.inputs().iter().copied().collect();
-        (ins.iter().map(|t| fe.ty(*t)).collect(), fe.ty(sig.output()))
+        (ins.iter().map(|t| fe.ty_modelled(*t)).collect(), fe.ty_modelled(sig.output()))
     } else {
-        (vec![], fe.ty(tcx.type_of(did).instantiate_identity().skip_normalization()))
+        (vec![], fe.ty_modelled(tcx.type_of(did).instantiate_identity().skip_normalization()))
     };
+    let unmodelled_param = params.iter().find(|(_, m)| !m).map(|(p, _)| p.clone());
+    let param_tys: Vec<String> = params.into_iter().map(|(p, _)| p).collect();
+    let (ret_ty, ret_modelled) = ret;
     let mut fd = FunDef {
         def_id: did,
         name,
@@ -292,14 +296,14 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
         fn_placeholder(fe, &mut fd, "const generic parameter");
         return fd;
     }
-    if let Some(p) = fd.param_tys.iter().find(|p| p.contains("unsupported_")) {
-        // the body could only use such a parameter through operations with no uRust model
+    // A function whose signature mentions a type without a uRust model is a placeholder as a
+    // whole.
+    if let Some(p) = unmodelled_param {
         let msg = format!("parameter of unsupported type `{}`", p);
         fn_placeholder(fe, &mut fd, &msg);
         return fd;
     }
-    if fd.ret_ty.contains("unsupported_") {
-        // no uRust value of a placeholder type can be produced
+    if !ret_modelled {
         let msg = if kind == "fn" {
             format!("result type `{}`", tcx.fn_sig(did).instantiate_identity().skip_binder().output())
         } else {
@@ -459,7 +463,8 @@ fn subst_markers(fe: &Frontend<'_>, body: &str, caller_scc: Option<&HashSet<DefI
         let kind = &tag[..1];
         let idx: usize = tag[1..].parse().unwrap();
         let did = fe.marker_ids[idx];
-        let name = names.get(&did).cloned().unwrap_or_else(|| format!("MISSING_{}", idx));
+        // every marked callee is a local item with a body, hence translated
+        let name = names.get(&did).cloned().expect("callee of a call marker is translated");
         let rec = caller_scc.map(|s| s.contains(&did)).unwrap_or(false);
         let s = match (kind, rec) {
             ("C", false) | ("H", false) => name.clone(),

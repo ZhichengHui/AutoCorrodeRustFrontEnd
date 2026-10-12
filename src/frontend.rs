@@ -2,15 +2,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
-use rustc_span::Span;
+use rustc_span::{Span, sym};
 
 use crate::names;
 
-/// A placeholder or external type declared with `typedecl`.
 /// Insertion-ordered set of DefIds (DefId is not `Ord`).
 #[derive(Default, Clone)]
 pub struct DefSet(pub Vec<DefId>);
@@ -25,6 +25,7 @@ impl DefSet {
     pub fn clear(&mut self) { self.0.clear() }
 }
 
+/// A placeholder or external type, declared in the types template.
 pub struct ExtType {
     pub arity: usize,
     pub comment: String,
@@ -47,7 +48,7 @@ pub struct FunDef {
     pub param_tys: Vec<String>,
     pub ret_ty: String,
     pub params: Vec<String>,
-    /// Body (uRust, may contain call markers). `None` = function-level placeholder.
+    /// Body (uRust, may contain call markers).
     pub body: String,
     pub calls: crate::frontend::DefSet,
     pub comments: Vec<String>,
@@ -55,8 +56,6 @@ pub struct FunDef {
 
 pub struct Frontend<'tcx> {
     pub tcx: TyCtxt<'tcx>,
-    #[allow(dead_code)]
-    pub crate_name: String,
     names: HashMap<DefId, String>,
     used_names: HashSet<String>,
     type_names: HashMap<DefId, String>,
@@ -67,6 +66,8 @@ pub struct Frontend<'tcx> {
     pub foreign_funs: BTreeMap<String, ExtFun>,
     pub alloc_types: Vec<String>,
     pub placeholders: Vec<String>,
+    /// Number of uses of placeholder types so far (see `ty_modelled`).
+    placeholder_type_uses: usize,
     pub fun_defs: Vec<FunDef>,
     pub item_comments: Vec<String>,
     /// Table used by call markers (`\u{1}C<n>\u{2}` etc.).
@@ -101,10 +102,9 @@ fn balanced_outer(s: &str) -> bool {
 }
 
 impl<'tcx> Frontend<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, crate_name: String) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>) -> Self {
         Frontend {
             tcx,
-            crate_name,
             names: HashMap::new(),
             used_names: HashSet::new(),
             type_names: HashMap::new(),
@@ -115,6 +115,7 @@ impl<'tcx> Frontend<'tcx> {
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
             placeholders: Vec::new(),
+            placeholder_type_uses: 0,
             fun_defs: Vec::new(),
             item_comments: Vec::new(),
             marker_ids: Vec::new(),
@@ -285,21 +286,58 @@ impl<'tcx> Frontend<'tcx> {
         matches!(self.crate_of(did).as_str(), "core" | "alloc" | "std")
     }
 
-    /// Recognise a few standard library ADTs by crate + item name.
+    /// The standard library ADTs with a uRust counterpart, recognised by their lang or
+    /// diagnostic item.
     pub fn std_adt(&self, did: DefId) -> Option<&'static str> {
-        if !self.is_std(did) { return None }
-        let n = self.tcx.item_name(did).to_string();
-        Some(match n.as_str() {
-            "Option" => "Option",
-            "Result" => "Result",
-            "Box" => "Box",
-            "Vec" => "Vec",
-            "String" => "String",
-            "Ordering" => "Ordering",
-            "Range" => "Range",
-            "RangeInclusive" => "RangeInclusive",
-            _ => return None,
+        let tcx = self.tcx;
+        let lang = |item| tcx.is_lang_item(did, item);
+        let diag = |name| tcx.is_diagnostic_item(name, did);
+        Some(if lang(LangItem::Option) {
+            "Option"
+        } else if diag(sym::Result) {
+            "Result"
+        } else if lang(LangItem::OwnedBox) {
+            "Box"
+        } else if diag(sym::Vec) {
+            "Vec"
+        } else if lang(LangItem::String) {
+            "String"
+        } else if lang(LangItem::OrderingEnum) {
+            "Ordering"
+        } else if lang(LangItem::Range) {
+            "Range"
+        } else if lang(LangItem::RangeInclusiveStruct) {
+            "RangeInclusive"
+        } else {
+            return None;
         })
+    }
+
+    /// Does a value of type `t` have interior mutability, i.e. does it contain an `UnsafeCell`
+    /// that is not behind a pointer? Fields are followed with the actual type arguments; type
+    /// parameters and projections count as having none.
+    pub fn interior_mutable(&self, t: Ty<'tcx>) -> bool {
+        self.has_cell(t, &mut vec![])
+    }
+
+    fn has_cell(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+        let tcx = self.tcx;
+        match t.kind() {
+            ty::Adt(def, _) if def.is_box() => false,
+            ty::Adt(def, args) => {
+                if tcx.is_lang_item(def.did(), LangItem::UnsafeCell) {
+                    return true;
+                }
+                if seen.contains(&t) {
+                    return false;
+                }
+                seen.push(t);
+                def.all_fields().any(|f| self.has_cell(f.ty(tcx, args).skip_normalization(), seen))
+            }
+            ty::Tuple(ts) => ts.iter().any(|a| self.has_cell(a, seen)),
+            ty::Array(a, _) | ty::Slice(a) => self.has_cell(*a, seen),
+            _ => false,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -307,12 +345,21 @@ impl<'tcx> Frontend<'tcx> {
     // ------------------------------------------------------------------
 
     pub fn placeholder_type(&mut self, desc: &str, arity: usize) -> String {
+        self.placeholder_type_uses += 1;
         let name = format!("unsupported_{}", names::ident_chars(desc));
         if !self.ext_types.contains_key(&name) {
             let comment = self.placeholder(&format!("type {}", desc), None);
             self.ext_types.insert(name.clone(), ExtType { arity, comment });
         }
         name
+    }
+
+    /// Map a Rust type to a HOL type; also tells whether every part of it has a uRust model
+    /// (no placeholder type was used).
+    pub fn ty_modelled(&mut self, t: Ty<'tcx>) -> (String, bool) {
+        let before = self.placeholder_type_uses;
+        let h = self.ty(t);
+        (h, self.placeholder_type_uses == before)
     }
 
     /// Map a Rust type to a HOL type.
