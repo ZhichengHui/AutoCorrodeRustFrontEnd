@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::fmt::{Debug, Display};
 use std::ops::{Add, AddAssign, Range};
 

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Cross-Entropy Loss Function
 //!
 //! The `cross_entropy_loss` function calculates the cross-entropy loss between the actual and predicted probability distributions.

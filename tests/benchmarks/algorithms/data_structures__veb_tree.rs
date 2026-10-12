@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // This struct implements Van Emde Boas tree (VEB tree). It stores integers in range [0, U), where
 // O is any integer that is a power of 2. It supports operations such as insert, search,
 // predecessor, and successor in O(log(log(U))) time. The structure takes O(U) space.

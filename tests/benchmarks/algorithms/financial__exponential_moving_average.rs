@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Calculate the exponential moving average (EMA) on the series of stock prices.
 //!
 //! Wikipedia Reference: <https://en.wikipedia.org/wiki/Exponential_smoothing>

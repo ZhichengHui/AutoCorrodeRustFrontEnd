@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Iteratively sums the digits of a signed integer
 ///
 /// ## Arguments

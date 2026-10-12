@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn run_length_encoding(target: &str) -> String {
     if target.trim().is_empty() {
         return "".to_string();

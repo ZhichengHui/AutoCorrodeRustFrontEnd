@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Aliquot sum of a number is defined as the sum of the proper divisors of a number.\
 /// i.e. all the divisors of a number apart from the number itself.
 ///

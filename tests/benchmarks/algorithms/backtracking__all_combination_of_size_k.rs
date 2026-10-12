@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a function to generate all possible combinations
 //! of `k` numbers out of `0...n-1` using a backtracking algorithm.
 

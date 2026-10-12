@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp::Ordering::Equal;
 
 fn sort_by_min_angle(pts: &[(f64, f64)], min: &(f64, f64)) -> Vec<(f64, f64)> {

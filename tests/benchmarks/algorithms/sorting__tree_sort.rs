@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Tree Sort Algorithm
 // https://en.wikipedia.org/wiki/Tree_sort

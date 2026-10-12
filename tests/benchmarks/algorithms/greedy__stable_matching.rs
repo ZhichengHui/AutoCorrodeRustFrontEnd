@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::{HashMap, VecDeque};
 
 fn initialize_men(

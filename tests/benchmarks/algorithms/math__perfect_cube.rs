@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Check if a number is a perfect cube using binary search.
 pub fn perfect_cube_binary_search(n: i64) -> bool {
     if n < 0 {

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Vernam Cipher
 //!
 //! The Vernam cipher is a symmetric stream cipher where plaintext is combined

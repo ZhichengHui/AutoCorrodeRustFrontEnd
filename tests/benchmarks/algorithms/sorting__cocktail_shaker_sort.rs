@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn cocktail_shaker_sort<T: Ord>(arr: &mut [T]) {
     let len = arr.len();
 

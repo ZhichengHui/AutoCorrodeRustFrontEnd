@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn simpsons_integration<F>(f: F, a: f64, b: f64, n: usize) -> f64
 where
     F: Fn(f64) -> f64,

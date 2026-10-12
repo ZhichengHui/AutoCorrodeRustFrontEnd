@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Marginal Ranking
 ///
 /// The 'average_margin_ranking_loss' function calculates the Margin Ranking loss, which is a

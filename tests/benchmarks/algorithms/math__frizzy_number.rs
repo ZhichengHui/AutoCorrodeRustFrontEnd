@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// This Rust program calculates the n-th Frizzy number for a given base.
 /// A Frizzy number is defined as the n-th number that is a sum of powers
 /// of the given base, with the powers corresponding to the binary representation

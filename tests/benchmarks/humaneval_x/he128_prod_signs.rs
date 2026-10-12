@@ -1,10 +1,8 @@
-// HumanEval-X Rust/128 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn prod_signs(arr: Vec<i32>) -> i32 {
@@ -26,5 +24,4 @@ fn prod_signs(arr: Vec<i32>) -> i32 {
     }
     sum * prods
 }
-
 

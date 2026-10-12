@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // https://en.wikipedia.org/wiki/Move-to-front_transform
 
 fn blank_char_table() -> Vec<char> {

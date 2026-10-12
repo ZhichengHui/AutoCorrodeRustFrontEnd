@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Macro to implement kmeans for both f64 and f32 without writing everything
 // twice or importing the `num` crate
 macro_rules! impl_kmeans {

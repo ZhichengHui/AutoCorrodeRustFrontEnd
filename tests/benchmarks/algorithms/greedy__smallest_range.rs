@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Smallest Range Covering Elements from K Lists
 //!
 //! Given `k` sorted integer lists, finds the smallest range `[lo, hi]` such

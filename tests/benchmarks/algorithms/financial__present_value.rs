@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// In economics and finance, present value (PV), also known as present discounted value,
 /// is the value of an expected income stream determined as of the date of valuation.
 ///

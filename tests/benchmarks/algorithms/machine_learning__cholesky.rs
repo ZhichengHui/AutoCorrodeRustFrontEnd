@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn cholesky(mat: Vec<f64>, n: usize) -> Vec<f64> {
     if (mat.is_empty()) || (n == 0) {
         return vec![];

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // https://en.wikipedia.org/wiki/Quickselect
 
 fn partition(list: &mut [i32], left: usize, right: usize, pivot_index: usize) -> usize {

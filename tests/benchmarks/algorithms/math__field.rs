@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use core::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Div, Mul, Neg, Sub};

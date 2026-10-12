@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 //Program to encode and decode Baconian or Bacon's Cipher
 //Wikipedia reference : https://en.wikipedia.org/wiki/Bacon%27s_cipher

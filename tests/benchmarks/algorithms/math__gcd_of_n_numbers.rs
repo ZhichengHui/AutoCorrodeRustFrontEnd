@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// returns the greatest common divisor of n numbers
 pub fn gcd(nums: &[usize]) -> usize {
     if nums.len() == 1 {

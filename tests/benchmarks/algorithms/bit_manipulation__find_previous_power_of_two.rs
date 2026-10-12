@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Previous Power of Two
 //!
 //! This module provides a function to find the largest power of two that is less than

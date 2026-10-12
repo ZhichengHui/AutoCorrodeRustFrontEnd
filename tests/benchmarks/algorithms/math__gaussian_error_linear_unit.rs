@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Gaussian Error Linear Unit (GELU) Function
 //!
 //! The `gaussian_error_linear_unit` function computes the Gaussian Error Linear Unit (GELU) values of a given f64 number or a vector of f64 numbers.

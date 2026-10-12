@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Returns the payback period in years
 /// If investment is not paid back, returns None.
 

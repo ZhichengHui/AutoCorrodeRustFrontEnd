@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! A Rust implementation of Sudoku solver using Backtracking.
 //!
 //! This module provides functionality to solve Sudoku puzzles using the backtracking algorithm.

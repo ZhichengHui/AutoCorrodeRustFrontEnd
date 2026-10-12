@@ -1,10 +1,8 @@
-// HumanEval-X Rust/156 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn int_to_mini_romank(number: i32) -> String {
@@ -28,4 +26,3 @@ fn int_to_mini_romank(number: i32) -> String {
     }
     current
 }
-

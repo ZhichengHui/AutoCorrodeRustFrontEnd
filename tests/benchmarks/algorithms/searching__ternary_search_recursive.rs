@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp::Ordering;
 
 pub fn ternary_search_rec<T: Ord>(

@@ -1,10 +1,8 @@
-// HumanEval-X Rust/1 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn separate_paren_groups(paren_string: String) -> Vec<String>{
@@ -33,4 +31,3 @@ fn separate_paren_groups(paren_string: String) -> Vec<String>{
     }
     return result;
 }
-

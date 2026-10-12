@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Strand Sort
 //!
 //! Strand Sort is a comparison-based sorting algorithm that works by repeatedly

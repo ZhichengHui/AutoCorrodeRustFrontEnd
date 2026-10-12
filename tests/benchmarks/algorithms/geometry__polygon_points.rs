@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 type Ll = i64;
 type Pll = (Ll, Ll);
 

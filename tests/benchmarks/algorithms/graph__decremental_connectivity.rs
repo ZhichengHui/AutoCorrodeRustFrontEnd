@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::HashSet;
 
 /// A data-structure that, given a forest, allows dynamic-connectivity queries.

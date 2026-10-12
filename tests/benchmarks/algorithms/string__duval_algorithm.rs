@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Implementation of Duval's Algorithm to compute the standard factorization of a string
 //! into Lyndon words. A Lyndon word is defined as a string that is strictly smaller
 //! (lexicographically) than any of its nontrivial suffixes. This implementation operates

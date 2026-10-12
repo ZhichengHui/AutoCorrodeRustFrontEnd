@@ -1,10 +1,8 @@
-// HumanEval-X Rust/127 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn intersection(interval1: Vec<i32>, interval2: Vec<i32>) -> String {
@@ -23,4 +21,3 @@ fn intersection(interval1: Vec<i32>, interval2: Vec<i32>) -> String {
     }
     return "YES".to_string();
 }
-

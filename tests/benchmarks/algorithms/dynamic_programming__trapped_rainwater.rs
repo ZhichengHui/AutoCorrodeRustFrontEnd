@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Module to calculate trapped rainwater in an elevation map.
 
 /// Computes the total volume of trapped rainwater in a given elevation map.

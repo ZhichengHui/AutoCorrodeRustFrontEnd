@@ -1,10 +1,8 @@
-// HumanEval-X Rust/110 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn exchange(lst1:Vec<i32>, lst2:Vec<i32>) -> String{
@@ -26,4 +24,3 @@ fn exchange(lst1:Vec<i32>, lst2:Vec<i32>) -> String{
     }
     return "NO".to_string();
 }
-

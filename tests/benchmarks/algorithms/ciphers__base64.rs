@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
     A Rust implementation of a base64 encoder and decoder.
     Written from scratch.

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::HashMap;
 
 /// Counts the number of contiguous subarrays that sum to exactly k.

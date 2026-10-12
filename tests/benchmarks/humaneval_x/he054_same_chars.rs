@@ -1,10 +1,8 @@
-// HumanEval-X Rust/54 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn same_chars(str1:&str, str2:&str) -> bool{
@@ -20,4 +18,3 @@ fn same_chars(str1:&str, str2:&str) -> bool{
 
     return v1 == v2;
 }
-

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub struct Graph {
     n: usize,
     adj_list: Vec<Vec<usize>>,

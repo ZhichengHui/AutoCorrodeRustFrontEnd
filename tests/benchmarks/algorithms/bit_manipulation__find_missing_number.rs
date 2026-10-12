@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Finds the missing number in a slice of consecutive integers.
 ///
 /// This function uses XOR bitwise operation to find the missing number.

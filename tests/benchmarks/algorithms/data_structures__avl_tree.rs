@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::{
     cmp::{max, Ordering},
     iter::FromIterator,

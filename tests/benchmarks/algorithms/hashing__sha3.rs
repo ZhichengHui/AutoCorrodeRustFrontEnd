@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Size of the state array in bits
 const B: usize = 1600;
 

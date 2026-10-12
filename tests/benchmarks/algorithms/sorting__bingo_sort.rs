@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp::{max, min};
 
 // Function for finding the maximum and minimum element of the Array

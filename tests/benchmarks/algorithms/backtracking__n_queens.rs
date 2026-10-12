@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality to solve the N-Queens problem.
 //!
 //! The N-Queens problem is a classic chessboard puzzle where the goal is to

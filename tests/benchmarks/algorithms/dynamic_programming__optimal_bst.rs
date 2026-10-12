@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Optimal Binary Search Tree Algorithm in Rust
 // Time Complexity: O(n^3) with prefix sum optimization
 // Space Complexity: O(n^2) for the dp table and prefix sum array

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Lucas Series : Function to get the Nth Lucas Number
 // Wikipedia Reference  :  https://en.wikipedia.org/wiki/Lucas_number

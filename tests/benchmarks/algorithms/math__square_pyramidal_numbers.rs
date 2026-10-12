@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // https://en.wikipedia.org/wiki/Square_pyramidal_number
 // 1² + 2² + ... = ... (total)
 

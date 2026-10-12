@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module implements a dynamic programming solution to find the minimum
 //! number of multiplications needed to multiply a chain of matrices with given dimensions.
 //!

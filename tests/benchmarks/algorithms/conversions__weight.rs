@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Conversion of weight units.
 //!
 //! This module provides conversion between various weight units including:

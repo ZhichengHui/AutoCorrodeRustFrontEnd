@@ -1,10 +1,8 @@
-// HumanEval-X Rust/147 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn get_matrix_triples(n: i32) -> i32 {
@@ -36,4 +34,3 @@ fn get_matrix_triples(n: i32) -> i32 {
 
     return sum[n as usize][0];
 }
-

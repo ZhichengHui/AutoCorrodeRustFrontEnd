@@ -1,10 +1,8 @@
-// HumanEval-X Rust/14 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn all_prefixes(string: String) -> Vec<String>{
@@ -19,5 +17,4 @@ for c in string.chars(){
 }
 return res;
 }
-
 

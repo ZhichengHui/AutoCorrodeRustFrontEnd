@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a solution to the coin change problem using dynamic programming.
 //! The `coin_change` function calculates the fewest number of coins required to make up
 //! a given amount using a specified set of coin denominations.

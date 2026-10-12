@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Finds the longest increasing subsequence and returns it.
 ///
 /// If multiple subsequences with the longest possible subsequence length can be found, the

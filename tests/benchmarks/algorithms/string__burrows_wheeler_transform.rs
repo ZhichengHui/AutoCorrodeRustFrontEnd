@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn burrows_wheeler_transform(input: &str) -> (String, usize) {
     let len = input.len();
 

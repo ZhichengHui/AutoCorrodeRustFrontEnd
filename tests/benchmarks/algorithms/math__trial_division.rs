@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 fn floor(value: f64, scale: u8) -> f64 {
     let multiplier = 10i64.pow(scale as u32) as f64;
     (value * multiplier).floor()

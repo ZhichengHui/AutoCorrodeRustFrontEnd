@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 type Graph<V> = BTreeMap<V, Vec<V>>;

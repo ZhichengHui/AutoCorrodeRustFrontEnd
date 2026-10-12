@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn decimal_to_fraction(decimal: f64) -> (i64, i64) {
     // Calculate the fractional part of the decimal number
     let fractional_part = decimal - decimal.floor();

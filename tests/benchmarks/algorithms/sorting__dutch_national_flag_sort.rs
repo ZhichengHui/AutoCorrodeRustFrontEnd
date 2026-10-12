@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
 A Rust implementation of the Dutch National Flag sorting algorithm.
 

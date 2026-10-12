@@ -1,10 +1,8 @@
-// HumanEval-X Rust/112 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn reverse_delete(s:&str, c:&str) -> Vec<String> {
@@ -25,4 +23,3 @@ fn reverse_delete(s:&str, c:&str) -> Vec<String> {
     }
     return vec![n, "False".to_string()];
 }
-

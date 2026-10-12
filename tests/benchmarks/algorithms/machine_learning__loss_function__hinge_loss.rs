@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Hinge Loss
 //!
 //! The `hng_loss` function calculates the Hinge loss, which is a

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // value of e
 use std::f64::consts::E;
 

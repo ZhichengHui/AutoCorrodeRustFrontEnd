@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! SHA-2 (Secure Hash Algorithm 2) family of cryptographic hash functions.
 //!
 //! Designed by the NSA and published by NIST in 2001 (FIPS PUB 180-4).

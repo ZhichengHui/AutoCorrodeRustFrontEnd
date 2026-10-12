@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module contains the Smith-Waterman algorithm implementation for local sequence alignment.
 //!
 //! The Smith-Waterman algorithm is a dynamic programming algorithm used for determining

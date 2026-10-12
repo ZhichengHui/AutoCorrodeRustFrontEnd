@@ -1,10 +1,8 @@
-// HumanEval-X Rust/125 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn split_words(txt: &str) -> Vec<String> {
@@ -60,4 +58,3 @@ fn split_words(txt: &str) -> Vec<String> {
 
     return out;
 }
-

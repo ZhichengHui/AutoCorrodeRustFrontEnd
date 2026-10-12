@@ -1,10 +1,8 @@
-// HumanEval-X Rust/17 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn parse_music(music_string:String) -> Vec<i32>{
@@ -20,4 +18,3 @@ fn parse_music(music_string:String) -> Vec<i32>{
 };
     return music_string.split(" ").map(|x:&str| map(&x.to_string())).filter(|x:&i32| x != &0).collect();
 }
-

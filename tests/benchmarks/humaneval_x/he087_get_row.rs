@@ -1,10 +1,8 @@
-// HumanEval-X Rust/87 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn get_row(lst:Vec<Vec<i32>>, x:i32) -> Vec<Vec<i32>>{
@@ -20,4 +18,3 @@ fn get_row(lst:Vec<Vec<i32>>, x:i32) -> Vec<Vec<i32>>{
     }
     return out;
 }
-

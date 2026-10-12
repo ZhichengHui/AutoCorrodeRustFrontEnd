@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::ops::{Add, Mul, MulAssign, Sub};
 
 // f64 complex

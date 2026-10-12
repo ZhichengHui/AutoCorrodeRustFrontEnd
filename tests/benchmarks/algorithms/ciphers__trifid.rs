@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! The Trifid cipher uses a table to fractionate each plaintext letter into a trigram,
 //! mixes the constituents of the trigrams, and then applies the table in reverse to turn
 //! these mixed trigrams into ciphertext letters.

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Wikipedia : https://en.wikipedia.org/wiki/Geometric_series
 // Calculate a geometric series.

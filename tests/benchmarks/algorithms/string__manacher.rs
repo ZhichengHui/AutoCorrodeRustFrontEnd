@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn manacher(s: String) -> String {
     let l = s.len();
     if l <= 1 {

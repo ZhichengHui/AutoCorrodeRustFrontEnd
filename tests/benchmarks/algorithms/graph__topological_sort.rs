@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::hash::Hash;

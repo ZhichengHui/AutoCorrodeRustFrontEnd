@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! A module providing a Segment Tree data structure for efficient range queries
 //! and updates. It supports operations like finding the minimum, maximum,
 //! and sum of segments in an array.

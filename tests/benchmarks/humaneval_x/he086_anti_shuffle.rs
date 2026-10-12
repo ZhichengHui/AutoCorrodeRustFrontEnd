@@ -1,10 +1,8 @@
-// HumanEval-X Rust/86 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn anti_shuffle(s:&str) -> String{
@@ -21,4 +19,3 @@ fn anti_shuffle(s:&str) -> String{
     res = res.trim_end().to_string();
     return res;
 }
-

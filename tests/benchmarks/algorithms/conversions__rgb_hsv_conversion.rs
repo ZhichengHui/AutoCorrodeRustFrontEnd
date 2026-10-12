@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Module for converting between RGB and HSV color representations
 //!
 //! The RGB color model is an additive color model in which red, green, and blue light

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Counts the number of trailing zeros in the binary representation of a number
 ///
 /// # Arguments

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functions for solving the rod-cutting problem using dynamic programming.
 use std::cmp::max;
 

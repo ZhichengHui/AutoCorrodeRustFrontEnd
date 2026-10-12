@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Huffman Encoding implementation
 //!
 //! Huffman coding is a lossless data compression algorithm that assigns variable-length codes

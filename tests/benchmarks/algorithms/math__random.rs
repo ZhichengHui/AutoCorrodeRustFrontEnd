@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
 Permuted Congruential Generator
 https://en.wikipedia.org/wiki/Permuted_congruential_generator

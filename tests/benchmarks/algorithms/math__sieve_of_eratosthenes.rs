@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Implements the Sieve of Eratosthenes algorithm to find all prime numbers up to a given limit.
 ///
 /// # Arguments

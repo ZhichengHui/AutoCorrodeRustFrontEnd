@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Binary Shift Operations
 //!
 //! This module provides implementations of various binary shift operations with

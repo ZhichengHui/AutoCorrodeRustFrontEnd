@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! The Ford-Fulkerson algorithm is a widely used algorithm to solve the maximum flow problem in a flow network.
 //!
 //! The maximum flow problem involves determining the maximum amount of flow that can be sent from a source vertex to a sink vertex

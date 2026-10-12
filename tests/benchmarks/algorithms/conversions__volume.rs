@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Convert between different units of volume
 //!
 //! Supports conversions between various volume units using cubic meters as an intermediary:

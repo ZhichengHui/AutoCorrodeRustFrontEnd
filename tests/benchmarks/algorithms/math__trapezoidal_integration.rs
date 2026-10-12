@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn trapezoidal_integral<F>(a: f64, b: f64, f: F, precision: u32) -> f64
 where
     F: Fn(f64) -> f64,

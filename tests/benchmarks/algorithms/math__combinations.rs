@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Function to calculate combinations of k elements from a set of n elements
 pub fn combinations(n: i64, k: i64) -> i64 {
     // Check if either n or k is negative, and panic if so

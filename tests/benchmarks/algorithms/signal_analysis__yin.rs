@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::f64;
 
 #[derive(Clone, Debug)]

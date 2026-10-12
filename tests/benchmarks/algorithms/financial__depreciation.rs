@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Depreciation
 //!
 //! In accounting, depreciation refers to the decreases in the value of a fixed

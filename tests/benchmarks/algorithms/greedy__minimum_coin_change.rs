@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Minimum Coin Change (Greedy Algorithm)
 //!
 //! This module implements a greedy algorithm to find the minimum number of coins

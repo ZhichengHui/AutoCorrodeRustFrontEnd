@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //Rust implementation of the Sigmoid activation function.
 //The formula for Sigmoid: 1 / (1 + e^(-x))
 //More information on the concepts of Sigmoid can be found here:

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Perfect Square : Checks if a number is perfect square number or not
 // https://en.wikipedia.org/wiki/Perfect_square

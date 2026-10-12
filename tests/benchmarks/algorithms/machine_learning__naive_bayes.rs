@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Naive Bayes classifier for classification tasks.
 /// This implementation uses Gaussian Naive Bayes, which assumes that
 /// features follow a normal (Gaussian) distribution.

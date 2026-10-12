@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Negative Log Likelihood Loss Function
 //
 // The `neg_log_likelihood` function calculates the Negative Log Likelyhood loss,

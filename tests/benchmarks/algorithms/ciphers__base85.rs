@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Base85 (Ascii85) encoding and decoding
 //!
 //! Ascii85 is a form of binary-to-text encoding developed by Adobe Systems.

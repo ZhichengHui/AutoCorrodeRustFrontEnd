@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Base16 encoding and decoding implementation.
 //!
 //! Base16, also known as hexadecimal encoding, represents binary data using 16 ASCII characters

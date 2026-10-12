@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn odd_even_sort<T: Ord>(arr: &mut [T]) {
     let len = arr.len();
     if len == 0 {

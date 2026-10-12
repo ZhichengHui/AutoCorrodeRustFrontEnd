@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Calculates the Equated Monthly Installment (EMI) for a loan.
 //!
 //! Formula: A = p * r * (1 + r)^n / ((1 + r)^n - 1)

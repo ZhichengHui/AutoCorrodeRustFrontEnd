@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// In mathematics, linear interpolation is a method of curve fitting
 /// using linear polynomials to construct new data points within the range of a discrete set of known data points.
 /// Formula: y = y0 + (x - x0) * (y1 - y0) / (x1 - x0)

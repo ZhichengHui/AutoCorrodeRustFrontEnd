@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Task Assignment Problem using Bitmasking and DP in Rust
 // Time Complexity: O(2^M * N) where M is number of people and N is number of tasks
 // Space Complexity: O(2^M * N) for the DP table

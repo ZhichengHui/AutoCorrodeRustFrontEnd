@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Job Sequencing
 //!
 //! Given a set of jobs, each with a deadline and profit, schedule jobs to

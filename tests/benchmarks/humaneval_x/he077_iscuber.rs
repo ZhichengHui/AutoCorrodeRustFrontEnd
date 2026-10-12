@@ -1,10 +1,8 @@
-// HumanEval-X Rust/77 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn iscuber(a:i32) -> bool{
@@ -15,5 +13,4 @@ fn iscuber(a:i32) -> bool{
 
     return i32::pow(sqrt_3 as i32, 3) == a1 as i32;
 }
-
 

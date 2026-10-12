@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // The public struct can hide the implementation detail
 pub struct Stack<T> {
     head: Link<T>,

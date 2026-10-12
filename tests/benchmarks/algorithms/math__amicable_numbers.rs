@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Operations based around amicable numbers
 // Suports u32 but should be interchangable with other types
 // Wikipedia reference: https://en.wikipedia.org/wiki/Amicable_numbers

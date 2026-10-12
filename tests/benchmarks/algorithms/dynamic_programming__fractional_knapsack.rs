@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn fractional_knapsack(mut capacity: f64, weights: Vec<f64>, values: Vec<f64>) -> f64 {
     // vector of tuple of weights and their value/weight ratio
     let mut weights: Vec<(f64, f64)> = weights

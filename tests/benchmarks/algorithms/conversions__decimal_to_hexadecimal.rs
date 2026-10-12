@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn decimal_to_hexadecimal(base_num: u64) -> String {
     let mut num = base_num;
     let mut hexadecimal_num = String::new();

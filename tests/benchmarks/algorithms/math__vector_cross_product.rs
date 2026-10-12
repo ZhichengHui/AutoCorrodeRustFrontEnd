@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Cross Product and Magnitude Calculation
 ///
 /// This program defines functions to calculate the cross product of two 3D vectors

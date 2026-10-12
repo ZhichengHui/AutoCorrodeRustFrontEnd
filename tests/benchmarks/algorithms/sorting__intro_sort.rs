@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Intro Sort (Also known as Introspective Sort)
 // Introspective Sort is hybrid sort (Quick Sort + Heap Sort + Insertion Sort)
 // https://en.wikipedia.org/wiki/Introsort

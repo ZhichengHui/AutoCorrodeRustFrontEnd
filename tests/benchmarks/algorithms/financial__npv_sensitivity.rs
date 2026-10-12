@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Computes the Net Present Value (NPV) of a cash flow series
 /// at multiple discount rates to show sensitivity.
 ///

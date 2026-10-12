@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn euler_totient(n: u64) -> u64 {
     let mut result = n;
     let mut num = n;

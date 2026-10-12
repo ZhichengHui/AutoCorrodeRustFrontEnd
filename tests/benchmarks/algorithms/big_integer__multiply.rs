@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Performs long multiplication on string representations of non-negative numbers.
 pub fn multiply(num1: &str, num2: &str) -> String {
     if !is_valid_nonnegative(num1) || !is_valid_nonnegative(num2) {

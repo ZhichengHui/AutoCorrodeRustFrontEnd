@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp;
 
 pub fn gnome_sort<T>(arr: &[T]) -> Vec<T>

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality for generating all possible colorings of a undirected (or directed) graph
 //! given a certain number of colors. It includes the GraphColoring struct and methods
 //! for validating color assignments and finding all valid colorings.

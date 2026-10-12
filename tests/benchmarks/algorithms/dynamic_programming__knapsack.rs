@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality to solve the knapsack problem using dynamic programming.
 //! It includes structures for items and solutions, and functions to compute the optimal solution.
 

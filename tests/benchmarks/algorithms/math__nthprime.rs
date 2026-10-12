@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Generate the nth prime number.
 // Algorithm is inspired by the optimized version of the Sieve of Eratosthenes.
 pub fn nthprime(nth: u64) -> u64 {

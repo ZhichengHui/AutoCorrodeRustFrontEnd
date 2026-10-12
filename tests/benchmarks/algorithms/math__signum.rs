@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Signum function is a mathematical function that extracts
 /// the sign of a real number. It is also known as the sign function,
 /// and it is an odd piecewise function.

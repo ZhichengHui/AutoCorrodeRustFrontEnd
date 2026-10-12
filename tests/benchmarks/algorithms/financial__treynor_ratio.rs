@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Calculates the Treynor Ratio for a portfolio.
 ///
 /// # Inputs

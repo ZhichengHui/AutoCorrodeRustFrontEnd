@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// ## Spiral Sorting
 ///
 /// Given an n x m array, return the array elements arranged from outermost elements

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Introduction to Catalan Numbers:
 // Catalan numbers are a sequence of natural numbers with many applications in combinatorial mathematics.
 // They are named after the Belgian mathematician Eugène Charles Catalan, who contributed to their study.

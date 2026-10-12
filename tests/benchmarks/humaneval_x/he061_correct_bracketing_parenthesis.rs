@@ -1,10 +1,8 @@
-// HumanEval-X Rust/61 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn correct_bracketing_parenthesis(bkts:&str) -> bool{
@@ -23,4 +21,3 @@ fn correct_bracketing_parenthesis(bkts:&str) -> bool{
     if level!=0 {return false;}
     return true;
     }
-

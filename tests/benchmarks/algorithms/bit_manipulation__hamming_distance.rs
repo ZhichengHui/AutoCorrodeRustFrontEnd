@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Hamming Distance
 //!
 //! This module implements the [Hamming distance](https://en.wikipedia.org/wiki/Hamming_distance)

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn comb_sort<T: Ord>(arr: &mut [T]) {
     let mut gap = arr.len();
     let shrink = 1.3;

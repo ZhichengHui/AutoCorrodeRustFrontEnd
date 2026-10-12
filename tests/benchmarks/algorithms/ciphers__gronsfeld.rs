@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Gronsfeld Cipher
 //!
 //! # Algorithm

@@ -1,10 +1,8 @@
-// HumanEval-X Rust/74 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn total_match(lst1:Vec<&str>, lst2:Vec<&str>) -> Vec<String>{
@@ -23,4 +21,3 @@ fn total_match(lst1:Vec<&str>, lst2:Vec<&str>) -> Vec<String>{
         return lst2.into_iter().map(|x| x.to_string()).collect();
     }
 }
-

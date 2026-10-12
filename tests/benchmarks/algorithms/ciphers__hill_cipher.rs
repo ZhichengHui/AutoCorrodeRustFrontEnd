@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Hill Cipher
 //!
 //! The Hill Cipher is a polygraphic substitution cipher based on linear algebra.

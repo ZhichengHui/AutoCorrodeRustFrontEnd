@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Binary to Hex Converter : Converts Binary to Hexadecimal
 // Wikipedia References  : 1. https://en.wikipedia.org/wiki/Hexadecimal

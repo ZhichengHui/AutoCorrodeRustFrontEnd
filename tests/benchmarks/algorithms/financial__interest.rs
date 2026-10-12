@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Calculates simple, compound, and APR interest on a principal amount.
 //!
 //! Formulas:

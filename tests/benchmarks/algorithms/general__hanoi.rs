@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn hanoi(n: i32, from: i32, to: i32, via: i32, moves: &mut Vec<(i32, i32)>) {
     if n > 0 {
         hanoi(n - 1, from, via, to, moves);

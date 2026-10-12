@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// fast_power returns the result of base^power mod modulus
 pub fn fast_power(mut base: usize, mut power: usize, modulus: usize) -> usize {
     assert!(base >= 1);

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Convert speed units
 //!
 //! References:

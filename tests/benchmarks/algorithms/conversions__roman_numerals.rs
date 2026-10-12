@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Roman Numeral Conversion
 //!
 //! This module provides conversion between Roman numerals and integers.

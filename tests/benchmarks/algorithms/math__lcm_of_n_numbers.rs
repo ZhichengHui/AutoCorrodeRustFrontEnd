@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // returns the least common multiple of n numbers
 
 pub fn lcm(nums: &[usize]) -> usize {

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 fn merge<T: Ord + Copy>(arr: &mut [T], mid: usize) {
     // Create temporary vectors to support the merge.
     let left_half = arr[..mid].to_vec();

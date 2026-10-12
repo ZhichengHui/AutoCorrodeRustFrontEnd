@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Principal Component Analysis (PCA) for dimensionality reduction.
 /// PCA transforms data to a new coordinate system where the greatest
 /// variance lies on the first coordinate (first principal component),

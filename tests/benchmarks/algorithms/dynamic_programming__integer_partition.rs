@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Integer partition using dynamic programming
 //!
 //! The number of partitions of a number n into at least k parts equals the number of

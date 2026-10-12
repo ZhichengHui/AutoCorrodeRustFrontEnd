@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // https://en.wikipedia.org/wiki/Run-length_encoding
 
 pub fn run_length_encode(text: &str) -> Vec<(char, i32)> {

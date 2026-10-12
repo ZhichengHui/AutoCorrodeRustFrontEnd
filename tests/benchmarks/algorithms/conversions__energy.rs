@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Convert between different units of energy
 //!
 //! Supports conversions between 70+ energy units using Joule as an intermediary:

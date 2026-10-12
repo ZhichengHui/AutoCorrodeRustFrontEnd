@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::HashMap;
 
 /// Custom error type representing an invalid character found in the input.

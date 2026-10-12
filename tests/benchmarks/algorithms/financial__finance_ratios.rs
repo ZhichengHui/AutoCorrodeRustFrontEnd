@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Calculating simple ratios like Return on Investment (ROI), Debt to Equity, Gross Profit Margin
 // and Earnings per Sale (EPS)
 pub fn return_on_investment(gain: f64, cost: f64) -> f64 {

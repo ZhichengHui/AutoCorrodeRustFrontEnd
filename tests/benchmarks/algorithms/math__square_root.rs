@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// squre_root returns the square root
 /// of a f64 number using Newton's method
 pub fn square_root(num: f64) -> f64 {

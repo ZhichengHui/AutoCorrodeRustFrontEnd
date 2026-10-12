@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn another_rot13(text: &str) -> String {
     let input = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let output = "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm";

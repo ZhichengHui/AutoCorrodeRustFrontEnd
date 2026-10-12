@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Author : https://github.com/ali77gh\
 /// References:\
 /// RGB:  https://en.wikipedia.org/wiki/RGB_color_model\

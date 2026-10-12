@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 fn update_step(a: &mut i32, old_a: &mut i32, quotient: i32) {
     let temp = *a;
     *a = *old_a - quotient * temp;

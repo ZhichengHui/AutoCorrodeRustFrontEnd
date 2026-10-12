@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functions for finding the shortest palindrome
 //! that can be formed by adding characters to the left of a given string.
 //! References

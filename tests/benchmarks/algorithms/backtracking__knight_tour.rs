@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module contains the implementation of the Knight's Tour problem.
 //!
 //! The Knight's Tour is a classic chess problem where the objective is to move a knight to every square on a chessboard exactly once.

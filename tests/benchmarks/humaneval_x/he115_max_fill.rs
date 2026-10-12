@@ -1,10 +1,8 @@
-// HumanEval-X Rust/115 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn max_fill(grid:Vec<Vec<i32>>, capacity:i32) -> i32{
@@ -24,4 +22,3 @@ fn max_fill(grid:Vec<Vec<i32>>, capacity:i32) -> i32{
     }
     return out;
 }
-

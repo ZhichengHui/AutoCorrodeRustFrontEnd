@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::VecDeque;
 
 // All four potential movements from a cell are listed here.

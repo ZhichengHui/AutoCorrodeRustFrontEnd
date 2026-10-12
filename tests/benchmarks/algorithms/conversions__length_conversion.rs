@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Author : https://github.com/ali77gh
 /// Conversion of length units.
 ///

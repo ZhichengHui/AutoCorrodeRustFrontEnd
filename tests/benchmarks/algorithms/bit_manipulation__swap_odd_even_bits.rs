@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Swaps odd and even bits in an integer.
 ///
 /// This function separates the even bits (0, 2, 4, 6, etc.) and odd bits (1, 3, 5, 7, etc.)

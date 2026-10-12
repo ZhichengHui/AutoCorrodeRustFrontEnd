@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Peak Signal-to-Noise Ratio (PSNR)
 //!
 //! Measures the quality of a reconstructed or compressed image relative to the original.

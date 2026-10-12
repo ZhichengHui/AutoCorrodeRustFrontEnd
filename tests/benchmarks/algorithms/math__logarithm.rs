@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::f64::consts::E;
 
 /// Calculates the **log<sub>base</sub>(x)**

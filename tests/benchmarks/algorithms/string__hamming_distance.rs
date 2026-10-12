@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Error type for Hamming distance calculation.
 #[derive(Debug, PartialEq)]
 pub enum HammingDistanceError {

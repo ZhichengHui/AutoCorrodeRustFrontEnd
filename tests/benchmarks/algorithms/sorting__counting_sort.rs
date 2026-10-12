@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// In place counting sort for collections of u32
 /// O(n + maxval) in time, where maxval is the biggest value an input can possibly take
 /// O(maxval) in memory

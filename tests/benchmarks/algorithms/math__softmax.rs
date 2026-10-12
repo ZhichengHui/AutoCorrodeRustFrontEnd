@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Softmax Function
 //!
 //! The `softmax` function computes the softmax values of a given array of f32 numbers.

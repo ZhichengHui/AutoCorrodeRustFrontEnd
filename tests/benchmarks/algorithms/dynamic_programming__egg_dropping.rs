@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module contains the `egg_drop` function, which determines the minimum number of egg droppings
 //! required to find the highest floor from which an egg can be dropped without breaking. It also includes
 //! tests for the function using various test cases, including edge cases.

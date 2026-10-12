@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 const ERROR_MESSAGE: &str = "Rotation must be in the range [0, 25]";
 const ALPHABET_LENGTH: u8 = b'z' - b'a' + 1;
 

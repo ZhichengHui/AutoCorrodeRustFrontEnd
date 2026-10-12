@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Binary exponentiation is an algorithm to compute a power in O(logN) where N is the power.
 //
 // For example, to naively compute n^100, we multiply n 99 times for a O(N) algorithm.

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Base32 encoding and decoding implementation.
 //!
 //! Base32 is a binary-to-text encoding scheme that represents binary data using 32 ASCII characters

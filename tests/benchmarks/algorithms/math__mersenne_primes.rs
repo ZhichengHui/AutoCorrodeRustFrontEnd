@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // mersenne prime : https://en.wikipedia.org/wiki/Mersenne_prime
 pub fn is_mersenne_prime(n: usize) -> bool {
     if n == 2 {

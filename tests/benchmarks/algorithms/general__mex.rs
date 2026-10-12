@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::BTreeSet;
 
 // Find minimum excluded number from a set of given numbers using a set

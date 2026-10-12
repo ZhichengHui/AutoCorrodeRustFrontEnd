@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Module for converting between IPv4 addresses and their decimal representations
 ///
 /// This module provides functions to convert IPv4 addresses to decimal integers

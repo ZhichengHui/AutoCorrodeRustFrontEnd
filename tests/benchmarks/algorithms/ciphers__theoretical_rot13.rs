@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // in theory rot-13 only affects the lowercase characters in a cipher
 pub fn theoretical_rot13(text: &str) -> String {
     let mut pos: u8 = 0;

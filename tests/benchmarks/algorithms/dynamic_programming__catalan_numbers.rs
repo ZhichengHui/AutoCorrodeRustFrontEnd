@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Catalan Numbers using Dynamic Programming
 //!
 //! The Catalan numbers are a sequence of positive integers that appear in many

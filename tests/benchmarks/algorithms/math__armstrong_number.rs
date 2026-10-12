@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn is_armstrong_number(number: u32) -> bool {
     let mut digits: Vec<u32> = Vec::new();
     let mut num: u32 = number;

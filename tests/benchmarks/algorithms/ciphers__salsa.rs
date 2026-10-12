@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 macro_rules! quarter_round {
     ($v1:expr,$v2:expr,$v3:expr,$v4:expr) => {
         $v2 ^= ($v1.wrapping_add($v4).rotate_left(7));

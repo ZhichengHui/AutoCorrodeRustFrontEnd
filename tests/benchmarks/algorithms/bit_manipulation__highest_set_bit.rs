@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a function to find the position of the most significant bit (MSB)
 //! set to 1 in a given positive integer.
 

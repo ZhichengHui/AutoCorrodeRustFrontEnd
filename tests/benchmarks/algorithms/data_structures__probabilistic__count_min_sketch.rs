@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::hash_map::RandomState;
 use std::fmt::{Debug, Formatter};
 use std::hash::{BuildHasher, Hash};

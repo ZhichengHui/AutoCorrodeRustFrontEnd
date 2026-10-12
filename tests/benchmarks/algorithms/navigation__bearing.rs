@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::f64::consts::PI;
 
 pub fn bearing(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {

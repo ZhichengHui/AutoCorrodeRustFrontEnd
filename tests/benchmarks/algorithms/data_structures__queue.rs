@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a generic `Queue` data structure, implemented using
 //! Rust's `LinkedList` from the standard library. The queue follows the FIFO
 //! (First-In-First-Out) principle, where elements are added to the back of

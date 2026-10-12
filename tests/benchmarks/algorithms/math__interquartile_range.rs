@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Interquartile Range  : An implementation of interquartile range (IQR) which is a measure of statistical
 //                        dispersion, which is the spread of the data.

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::VecDeque;
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 

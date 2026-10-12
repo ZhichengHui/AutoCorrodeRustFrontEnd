@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// From Wikipedia:
 /// Tournament sort is a sorting algorithm. It improves upon the naive
 /// selection sort by using a priority queue to find the next element in

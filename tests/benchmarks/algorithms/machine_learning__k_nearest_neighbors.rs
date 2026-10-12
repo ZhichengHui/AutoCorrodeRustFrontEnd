@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// K-Nearest Neighbors (KNN) algorithm for classification.
 /// KNN is a simple, instance-based learning algorithm that classifies
 /// a data point based on the majority class of its k nearest neighbors.

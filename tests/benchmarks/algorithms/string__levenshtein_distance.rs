@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Provides functions to calculate the Levenshtein distance between two strings.
 //!
 //! The Levenshtein distance is a measure of the similarity between two strings by calculating the minimum number of single-character

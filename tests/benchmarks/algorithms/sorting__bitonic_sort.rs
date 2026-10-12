@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 fn _comp_and_swap<T: Ord>(array: &mut [T], left: usize, right: usize, ascending: bool) {
     if (ascending && array[left] > array[right]) || (!ascending && array[left] < array[right]) {
         array.swap(left, right);

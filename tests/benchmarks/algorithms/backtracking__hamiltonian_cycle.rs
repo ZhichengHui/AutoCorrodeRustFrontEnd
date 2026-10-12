@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality to find a Hamiltonian cycle in a directed or undirected graph.
 //! Source: [Wikipedia](https://en.wikipedia.org/wiki/Hamiltonian_path_problem)
 

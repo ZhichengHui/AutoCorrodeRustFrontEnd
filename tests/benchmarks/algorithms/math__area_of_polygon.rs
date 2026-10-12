@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /**
  * @file
  * @brief Calculate the area of a polygon defined by a vector of points.

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module implements the Rabin-Karp string searching algorithm.
 //! It uses a rolling hash technique to find all occurrences of a pattern
 //! within a target string efficiently.

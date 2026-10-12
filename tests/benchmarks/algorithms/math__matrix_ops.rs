@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Basic matrix operations using a Matrix type with internally uses
 // a vector representation to store matrix elements.
 // Generic using the MatrixElement trait, which can be implemented with

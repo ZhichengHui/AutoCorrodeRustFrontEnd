@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality to determine whether two strings are isomorphic.
 //!
 //! Two strings are considered isomorphic if the characters in one string can be replaced

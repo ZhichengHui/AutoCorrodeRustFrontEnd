@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! A module for checking if a given string is a palindrome.
 
 /// Checks if the given string is a palindrome.

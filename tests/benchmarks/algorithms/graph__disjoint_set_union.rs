@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module implements the Disjoint Set Union (DSU), also known as Union-Find,
 //! which is an efficient data structure for keeping track of a set of elements
 //! partitioned into disjoint (non-overlapping) subsets.

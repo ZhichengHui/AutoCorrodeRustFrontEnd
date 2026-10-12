@@ -1,10 +1,8 @@
-// HumanEval-X Rust/118 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn get_closest_vowel(word: &str) -> String {
@@ -24,4 +22,3 @@ fn get_closest_vowel(word: &str) -> String {
     }
     out
 }
-

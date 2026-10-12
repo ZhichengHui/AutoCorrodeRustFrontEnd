@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::num::Wrapping as W;
 
 struct TeaContext {

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::HashMap;
 
 /// Given an array of integers nums and an integer target,

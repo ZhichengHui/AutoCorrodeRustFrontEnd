@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Power of Two Check
 //!
 //! This module provides a function to determine if a given positive integer is a power of two

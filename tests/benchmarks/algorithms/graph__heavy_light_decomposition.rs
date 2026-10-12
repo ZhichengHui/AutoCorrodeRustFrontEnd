@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
 Heavy Light Decomposition:
 It partitions a tree into disjoint paths such that:

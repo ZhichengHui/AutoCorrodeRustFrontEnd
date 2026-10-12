@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module implements a function to count the number of set bits (1s)
 //! in the binary representation of an unsigned integer.
 //! It uses Brian Kernighan's algorithm, which efficiently clears the least significant

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
     It autocomplete by prefix using added words.
 

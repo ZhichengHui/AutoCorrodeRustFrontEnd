@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn rot13(text: &str) -> String {
     let to_enc = text.to_uppercase();
     to_enc

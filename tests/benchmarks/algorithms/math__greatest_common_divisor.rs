@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Greatest Common Divisor.
 ///
 /// greatest_common_divisor(num1, num2) returns the greatest number of num1 and num2.

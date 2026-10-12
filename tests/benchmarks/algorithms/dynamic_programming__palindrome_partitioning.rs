@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Finds the minimum cuts needed for a palindrome partitioning of a string
 ///
 /// Given a string s, partition s such that every substring of the partition is a palindrome.

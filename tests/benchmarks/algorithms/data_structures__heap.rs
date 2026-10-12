@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! A generic heap data structure.
 //!
 //! This module provides a `Heap` implementation that can function as either a

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Fibonacci via Dynamic Programming
 use std::collections::HashMap;
 

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 type Adj = [Vec<usize>];
 
 const IN_DECOMPOSITION: u64 = 1 << 63;

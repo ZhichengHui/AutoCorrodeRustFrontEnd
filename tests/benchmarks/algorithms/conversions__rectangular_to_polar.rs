@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Conversions between rectangular (Cartesian) and polar coordinate systems.
 //!
 //! This module provides utilities for converting rectangular coordinates

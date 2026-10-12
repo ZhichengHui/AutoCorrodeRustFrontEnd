@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Totient function for
 // all numbers smaller than
 // or equal to n.

@@ -1,10 +1,8 @@
-// HumanEval-X Rust/145 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn order_by_points(arr: Vec<i32>) -> Vec<i32> {
@@ -38,4 +36,3 @@ pub fn sum_of_digits(n: i32) -> i32 {
     }
     sum
 }
-

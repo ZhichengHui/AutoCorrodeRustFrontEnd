@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::ops::Sub;
 
 #[derive(Clone, Debug, PartialEq)]

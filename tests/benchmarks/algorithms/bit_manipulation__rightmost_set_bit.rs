@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Finds the index (position) of the rightmost set bit in a number.
 ///
 /// The index is 1-based, where position 1 is the least significant bit (rightmost).

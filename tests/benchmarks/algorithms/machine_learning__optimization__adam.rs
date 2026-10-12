@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Adam (Adaptive Moment Estimation) optimizer
 //!
 //! The `Adam (Adaptive Moment Estimation)` optimizer is an adaptive learning rate algorithm used

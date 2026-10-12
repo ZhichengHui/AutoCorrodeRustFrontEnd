@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Encode an ASCII string into its location in a Polybius square.
 /// Only alphabetical characters are encoded.
 pub fn encode_ascii(string: &str) -> String {

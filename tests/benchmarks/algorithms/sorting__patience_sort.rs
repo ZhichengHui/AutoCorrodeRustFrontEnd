@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::vec;
 
 pub fn patience_sort<T: Ord + Copy>(arr: &mut [T]) {

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Calculates Net Present Value given a vector of cash flows and a discount rate.
 /// cash_flows: Vector of f64 representing cash flows for each period.
 /// rate: Discount rate as an f64 (e.g., 0.05 for 5%)

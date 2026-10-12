@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Performs a linear search on the given array, returning the index of the first occurrence of the item.
 ///
 /// # Arguments

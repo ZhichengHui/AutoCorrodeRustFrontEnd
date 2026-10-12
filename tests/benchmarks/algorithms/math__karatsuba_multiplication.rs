@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
 Finds the product of two numbers using Karatsuba Algorithm
  */

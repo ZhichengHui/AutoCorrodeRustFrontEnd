@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Computes the Huber loss between arrays of true and predicted values.
 ///
 /// # Arguments

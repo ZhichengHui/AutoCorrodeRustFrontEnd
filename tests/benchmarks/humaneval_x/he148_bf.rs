@@ -1,10 +1,8 @@
-// HumanEval-X Rust/148 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn bf(planet1: &str, planet2: &str) -> Vec<String> {
@@ -38,4 +36,3 @@ fn bf(planet1: &str, planet2: &str) -> Vec<String> {
     }
     return out;
 }
-

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::boxed::Box;
 use std::cmp::{Ord, Ordering};
 use std::iter::Iterator;

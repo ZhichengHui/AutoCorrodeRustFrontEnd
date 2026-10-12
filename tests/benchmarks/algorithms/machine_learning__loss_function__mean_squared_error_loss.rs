@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Mean Square Loss Function
 //!
 //! The `mse_loss` function calculates the Mean Square Error loss, which is a

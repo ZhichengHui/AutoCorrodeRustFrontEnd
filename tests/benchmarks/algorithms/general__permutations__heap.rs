@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::fmt::Debug;
 
 /// Computes all permutations of an array using Heap's algorithm

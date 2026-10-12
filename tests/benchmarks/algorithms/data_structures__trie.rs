@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a generic implementation of a Trie (prefix tree).
 //! A Trie is a tree-like data structure that is commonly used to store sequences of keys
 //! (such as strings, integers, or other iterable types) where each node represents one element

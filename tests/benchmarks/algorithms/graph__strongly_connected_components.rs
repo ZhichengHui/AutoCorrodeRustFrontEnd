@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
 Tarjan's algorithm to find Strongly Connected Components (SCCs):
 It runs in O(n + m) (so it is optimal) and as a by-product, it returns the

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author: NithinU2802
 // Binary to Octal Converter: Converts Binary to Octal
 // Wikipedia References:

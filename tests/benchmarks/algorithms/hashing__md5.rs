@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::fmt::Write;
 
 // MD5 hash function implementation

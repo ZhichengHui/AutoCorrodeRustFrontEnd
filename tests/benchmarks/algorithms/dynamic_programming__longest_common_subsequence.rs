@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module implements the Longest Common Subsequence (LCS) algorithm.
 //! The LCS problem is finding the longest subsequence common to two sequences.
 //! It differs from the problem of finding common substrings: unlike substrings, subsequences

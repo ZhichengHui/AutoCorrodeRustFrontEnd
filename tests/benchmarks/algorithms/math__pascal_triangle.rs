@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// ## Pascal's triangle problem
 ///
 /// pascal_triangle(num_rows) returns the first num_rows of Pascal's triangle.\

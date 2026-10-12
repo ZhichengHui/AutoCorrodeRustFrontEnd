@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /**
  * @file
  * @brief Find the maximum subarray sum using Kadane's algorithm.(https://en.wikipedia.org/wiki/Maximum_subarray_problem)

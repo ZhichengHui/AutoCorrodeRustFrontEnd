@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a function to evaluate postfix (Reverse Polish Notation) expressions.
 //! Postfix notation is a mathematical notation in which every operator follows all of its operands.
 //!

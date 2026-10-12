@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! LZ77 Compression Algorithm
 //!
 //! LZ77 is a lossless data compression algorithm published by Abraham Lempel and Jacob Ziv in 1977.

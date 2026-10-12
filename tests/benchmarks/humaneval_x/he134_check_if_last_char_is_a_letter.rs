@@ -1,10 +1,8 @@
-// HumanEval-X Rust/134 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn check_if_last_char_is_a_letter(txt: &str) -> bool {
@@ -26,4 +24,3 @@ fn check_if_last_char_is_a_letter(txt: &str) -> bool {
     }
     true
 }
-

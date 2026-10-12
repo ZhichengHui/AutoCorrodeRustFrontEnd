@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides an implementation of a binary search algorithm that
 //! works for both ascending and descending ordered arrays. The binary search
 //! function returns the index of the target element if it is found, or `None`

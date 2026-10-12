@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // list all subset combinations of n element in given set of r element.
 // This is a recursive function that collects all subsets of the set of size n
 // with the given set of size r.

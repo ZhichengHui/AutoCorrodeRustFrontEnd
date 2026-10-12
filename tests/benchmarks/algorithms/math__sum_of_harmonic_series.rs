@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Sum of Harmonic Series :    Find the sum of n terms in an harmonic progression.  The calculation starts with the
 //                             first_term and loops adding the common difference of Arithmetic Progression by which

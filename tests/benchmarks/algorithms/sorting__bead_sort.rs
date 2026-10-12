@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //Bead sort only works for sequences of non-negative integers.
 //https://en.wikipedia.org/wiki/Bead_sort
 pub fn bead_sort(a: &mut [usize]) {

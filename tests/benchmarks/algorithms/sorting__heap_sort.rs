@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functions for heap sort algorithm.
 
 use std::cmp::Ordering;

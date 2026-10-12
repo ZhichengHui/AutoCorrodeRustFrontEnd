@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Length Unit Conversion
 //!
 //! This module provides conversion between metric length units ranging from

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Transposition Cipher
 //!
 //! The Transposition Cipher is a method of encryption by which a message is shifted

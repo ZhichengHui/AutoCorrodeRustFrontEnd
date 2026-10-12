@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 #[cfg(test)]
 use rand::RngExt;
 #[cfg(test)]

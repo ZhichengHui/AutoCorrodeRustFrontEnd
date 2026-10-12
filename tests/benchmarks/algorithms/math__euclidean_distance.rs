@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Calculate the Euclidean distance between two vectors
 // Wikipedia : https://en.wikipedia.org/wiki/Euclidean_distance

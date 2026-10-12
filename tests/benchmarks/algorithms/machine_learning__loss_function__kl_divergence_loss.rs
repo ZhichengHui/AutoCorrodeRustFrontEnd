@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # KL divergence Loss Function
 //!
 //! For a pair of actual and predicted probability distributions represented as vectors `actual` and `predicted`, the KL divergence loss is calculated as:

@@ -1,10 +1,8 @@
-// HumanEval-X Rust/114 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn min_sub_array_sum(nums: Vec<i64>) -> i64 {
@@ -24,4 +22,3 @@ fn min_sub_array_sum(nums: Vec<i64>) -> i64 {
     }
     min
 }
-

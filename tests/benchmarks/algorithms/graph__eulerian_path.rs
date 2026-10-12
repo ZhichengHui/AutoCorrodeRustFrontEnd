@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality to find an Eulerian path in a directed graph.
 //! An Eulerian path visits every edge exactly once. The algorithm checks if an Eulerian
 //! path exists and, if so, constructs and returns the path.

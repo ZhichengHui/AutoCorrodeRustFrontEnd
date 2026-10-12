@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // sorts with the minimum number of rewrites. Runs through all values in the array, placing them in their correct spots. O(n^2).
 
 pub fn cycle_sort(arr: &mut [i32]) {

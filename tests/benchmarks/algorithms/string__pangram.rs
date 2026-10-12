@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality to check if a given string is a pangram.
 //!
 //! A pangram is a sentence that contains every letter of the alphabet at least once.

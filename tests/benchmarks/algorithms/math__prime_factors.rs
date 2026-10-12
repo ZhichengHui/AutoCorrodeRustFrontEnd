@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Finds the prime factors of a number in increasing order, with repetition.
 
 pub fn prime_factors(n: u64) -> Vec<u64> {

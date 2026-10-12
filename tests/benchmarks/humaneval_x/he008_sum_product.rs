@@ -1,10 +1,8 @@
-// HumanEval-X Rust/8 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn sum_product(numbers:Vec<i32>) -> (i32,i32){
@@ -19,4 +17,3 @@ fn sum_product(numbers:Vec<i32>) -> (i32,i32){
     );
     return (sum(&numbers),product(&numbers));
 }
-

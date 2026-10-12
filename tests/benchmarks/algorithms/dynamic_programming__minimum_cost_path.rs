@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp::min;
 
 /// Represents possible errors that can occur when calculating the minimum cost path in a matrix.

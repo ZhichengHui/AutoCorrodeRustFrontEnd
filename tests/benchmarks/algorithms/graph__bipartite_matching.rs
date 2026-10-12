@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Adjacency List
 use std::collections::VecDeque;
 type Graph = Vec<Vec<usize>>;

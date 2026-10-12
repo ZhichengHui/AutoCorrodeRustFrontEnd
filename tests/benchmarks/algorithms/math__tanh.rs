@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //Rust implementation of the Tanh (hyperbolic tangent) activation function.
 //The formula for Tanh: (e^x - e^(-x))/(e^x + e^(-x)) OR (2/(1+e^(-2x))-1
 //More information on the concepts of Sigmoid can be found here:

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub trait Hasher<const DIGEST_BYTES: usize> {
     /// Return a new instance with default parameters.
     fn new_default() -> Self;

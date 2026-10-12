@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // In computer science and statistics,
 // the Jaro–Winkler distance is a string metric measuring an edit distance
 // between two sequences.

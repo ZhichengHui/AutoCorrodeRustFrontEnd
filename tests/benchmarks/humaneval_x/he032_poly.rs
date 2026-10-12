@@ -1,10 +1,8 @@
-// HumanEval-X Rust/32 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn poly(xs: &Vec<f64>, x: f64) -> f64 {
@@ -30,4 +28,3 @@ fn poly(xs: &Vec<f64>, x: f64) -> f64 {
         }
         ans
     }
-

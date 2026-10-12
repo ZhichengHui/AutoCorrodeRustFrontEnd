@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::HashSet;
 
 /// Represents possible errors that can occur when checking for lipograms.

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn prime_check(num: usize) -> bool {
     if (num > 1) && (num < 4) {
         return true;

@@ -1,10 +1,8 @@
-// HumanEval-X Rust/26 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn remove_duplicates(numbers: Vec<i32>) -> Vec<i32>{
@@ -18,4 +16,3 @@ fn remove_duplicates(numbers: Vec<i32>) -> Vec<i32>{
     let res:Vec<i32> = numbers.into_iter().filter(|x| m.get(x) == Some(&1)).collect();
     return res;
 }
-

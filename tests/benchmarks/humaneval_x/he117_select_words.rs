@@ -1,10 +1,8 @@
-// HumanEval-X Rust/117 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn select_words(s:&str, n:i32) -> Vec<String>{
@@ -36,4 +34,3 @@ fn select_words(s:&str, n:i32) -> Vec<String>{
     }
     out
 }
-

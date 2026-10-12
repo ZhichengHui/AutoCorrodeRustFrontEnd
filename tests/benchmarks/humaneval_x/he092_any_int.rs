@@ -1,10 +1,8 @@
-// HumanEval-X Rust/92 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn any_int(a:f64, b:f64, c:f64) -> bool{
@@ -16,4 +14,3 @@ fn any_int(a:f64, b:f64, c:f64) -> bool{
         return false;
     }
 }
-

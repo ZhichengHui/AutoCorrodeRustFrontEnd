@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a function to find the length of the longest common substring
 //! between two strings using dynamic programming.
 

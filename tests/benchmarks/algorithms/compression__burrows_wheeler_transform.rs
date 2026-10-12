@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Burrows-Wheeler Transform
 //!
 //! The Burrows-Wheeler transform (BWT, also called block-sorting compression)

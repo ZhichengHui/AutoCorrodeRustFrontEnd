@@ -1,10 +1,8 @@
-// HumanEval-X Rust/65 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn circular_shift(x:i32, shift:i32) -> String{
@@ -21,4 +19,3 @@ fn circular_shift(x:i32, shift:i32) -> String{
    return res.into_iter().collect();
 
 }
-

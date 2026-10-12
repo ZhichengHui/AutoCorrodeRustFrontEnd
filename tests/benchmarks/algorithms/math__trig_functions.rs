@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Function that contains the similarities of the sine and cosine implementations
 ///
 /// Both of them are calculated using their MacLaurin Series

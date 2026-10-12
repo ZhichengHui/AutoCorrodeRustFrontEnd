@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // In mathematics and computer science, the ceiling function maps x to the least integer greater than or equal to x
 // Source: https://en.wikipedia.org/wiki/Floor_and_ceiling_functions
 

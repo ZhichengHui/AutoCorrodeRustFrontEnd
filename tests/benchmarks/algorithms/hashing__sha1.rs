@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // SHA-1 (FIPS 180-4) is defined with big-endian word/length encoding.
 // Clippy's `big_endian_bytes` lint would incorrectly flag every intentional
 // `to_be_bytes` / `from_be_bytes` call in this file.

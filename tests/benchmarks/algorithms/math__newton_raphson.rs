@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn find_root(f: fn(f64) -> f64, fd: fn(f64) -> f64, guess: f64, iterations: i32) -> f64 {
     let mut result = guess;
     for _ in 0..iterations {

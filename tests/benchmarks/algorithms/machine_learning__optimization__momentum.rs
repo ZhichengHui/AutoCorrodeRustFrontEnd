@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Momentum Optimization
 ///
 /// Momentum is an extension of gradient descent that accelerates convergence by accumulating

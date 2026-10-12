@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! The Fletcher checksum is an algorithm for computing a position-dependent
 //! checksum devised by John G. Fletcher (1934–2012) at Lawrence Livermore Labs
 //! in the late 1970s. The objective of the Fletcher checksum was to provide

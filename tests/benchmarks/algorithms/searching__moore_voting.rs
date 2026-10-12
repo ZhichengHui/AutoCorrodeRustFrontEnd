@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
 
     Moore's voting algorithm finds out the strictly majority-occurring element

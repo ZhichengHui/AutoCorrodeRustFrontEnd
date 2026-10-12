@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Recursive ternary search algorithm for finding maximum of unimodal function
 pub fn ternary_search_max_rec(
     f: fn(f32) -> f32,

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Generates all combinations of well-formed parentheses given a non-negative integer `n`.
 ///
 /// This function uses backtracking to generate all possible combinations of well-formed

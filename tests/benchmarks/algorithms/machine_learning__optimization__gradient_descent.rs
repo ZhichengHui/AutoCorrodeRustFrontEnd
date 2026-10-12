@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Gradient Descent Optimization
 ///
 /// Gradient descent is an iterative optimization algorithm used to find the minimum of a function.

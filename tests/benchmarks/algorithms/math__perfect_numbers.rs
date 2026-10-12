@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn is_perfect_number(num: usize) -> bool {
     let mut sum = 0;
 

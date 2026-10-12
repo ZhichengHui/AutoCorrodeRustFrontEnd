@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InfixToPostfixError {
     UnknownCharacter(char),

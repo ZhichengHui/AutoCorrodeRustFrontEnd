@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Convert between different units of temperature
 //!
 //! Supports conversions between 8 temperature scales using Kelvin as an intermediary:

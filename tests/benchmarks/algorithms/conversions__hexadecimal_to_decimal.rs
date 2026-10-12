@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn hexadecimal_to_decimal(hexadecimal_str: &str) -> Result<u64, &'static str> {
     if hexadecimal_str.is_empty() {
         return Err("Empty input");

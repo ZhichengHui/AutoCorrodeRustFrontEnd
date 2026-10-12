@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // For specification go to https://www.rfc-editor.org/rfc/rfc7693
 
 use std::cmp::{max, min};

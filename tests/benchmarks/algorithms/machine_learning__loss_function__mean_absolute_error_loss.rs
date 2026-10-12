@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Mean Absolute Error Loss Function
 //!
 //! The `mae_loss` function calculates the Mean Absolute Error loss, which is a

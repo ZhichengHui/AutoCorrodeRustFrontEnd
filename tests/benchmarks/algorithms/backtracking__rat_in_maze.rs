@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module contains the implementation of the Rat in Maze problem.
 //!
 //! The Rat in Maze problem is a classic algorithmic problem where the

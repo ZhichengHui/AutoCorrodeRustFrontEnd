@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 fn _stooge_sort<T: Ord>(arr: &mut [T], start: usize, end: usize) {
     if arr[start] > arr[end] {
         arr.swap(start, end);

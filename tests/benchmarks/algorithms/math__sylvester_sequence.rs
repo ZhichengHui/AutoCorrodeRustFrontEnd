@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Sylvester Series     :  Calculates the nth number in Sylvester's sequence.
 // Wikipedia Reference  :  https://en.wikipedia.org/wiki/Sylvester%27s_sequence

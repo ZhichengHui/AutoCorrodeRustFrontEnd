@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Octal to Binary Converter : Converts Octal to Binary
 // Wikipedia References  : 1. https://en.wikipedia.org/wiki/Octal

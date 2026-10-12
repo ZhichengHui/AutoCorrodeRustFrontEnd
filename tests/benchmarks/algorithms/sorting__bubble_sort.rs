@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn bubble_sort<T: Ord>(arr: &mut [T]) {
     if arr.is_empty() {
         return;

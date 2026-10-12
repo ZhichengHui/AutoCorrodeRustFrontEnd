@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module implements the Boyer-Moore string search algorithm, an efficient method
 //! for finding all occurrences of a pattern within a given text. The algorithm skips
 //! sections of the text by leveraging two key rules: the bad character rule and the

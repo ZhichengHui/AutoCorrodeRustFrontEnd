@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::collections::BTreeMap;
 use std::ops::Add;
 

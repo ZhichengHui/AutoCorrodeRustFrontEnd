@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionality to check if a given string is an isogram.
 //! An isogram is a word or phrase in which no letter occurs more than once.
 

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a solution to the subset sum problem using dynamic programming.
 //!
 //! # Complexity

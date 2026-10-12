@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //Rust implementation of the ReLU (rectified linear unit) activation function.
 //The formula for ReLU is quite simple really: (if x>0 -> x, else -> 0)
 //More information on the concepts of ReLU can be found here:

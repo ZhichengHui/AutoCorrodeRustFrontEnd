@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // wiki: https://en.wikipedia.org/wiki/Rail_fence_cipher
 pub fn rail_fence_encrypt(plain_text: &str, key: usize) -> String {
     let mut cipher = vec![Vec::new(); key];

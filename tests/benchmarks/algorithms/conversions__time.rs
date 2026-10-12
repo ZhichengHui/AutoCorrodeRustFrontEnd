@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Time Unit Conversion
 //!
 //! A unit of time is any particular time interval, used as a standard way of

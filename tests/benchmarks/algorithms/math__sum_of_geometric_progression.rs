@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author : cyrixninja
 // Find the Sum of Geometric Progression
 // Wikipedia: https://en.wikipedia.org/wiki/Geometric_progression

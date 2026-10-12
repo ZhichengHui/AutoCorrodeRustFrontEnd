@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
 
 pub fn doomsday(y: i32, m: i32, d: i32) -> i32 {

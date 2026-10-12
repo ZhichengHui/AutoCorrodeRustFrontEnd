@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a function to reverse the bits of a 32-bit unsigned integer.
 //!
 //! The algorithm works by iterating through each of the 32 bits from least

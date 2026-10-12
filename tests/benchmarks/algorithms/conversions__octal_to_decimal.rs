@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author: cyrixninja
 // Octal to Decimal Converter: Converts Octal to Decimal
 // Wikipedia References:

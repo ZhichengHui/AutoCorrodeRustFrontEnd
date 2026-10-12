@@ -1,10 +1,8 @@
-// HumanEval-X Rust/102 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn choose_num(x:i32, y:i32) -> i32{
@@ -21,4 +19,3 @@ fn choose_num(x:i32, y:i32) -> i32{
     }
     return y;
 }
-

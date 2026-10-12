@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 /// A Fenwick Tree (also known as a Binary Indexed Tree) that supports efficient

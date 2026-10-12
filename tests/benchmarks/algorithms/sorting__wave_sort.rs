@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Wave Sort Algorithm
 ///
 /// Wave Sort is a sorting algorithm that works in O(n log n) time assuming

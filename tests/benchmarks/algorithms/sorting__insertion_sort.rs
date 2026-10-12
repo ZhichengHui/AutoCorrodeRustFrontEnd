@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Sorts a mutable slice using in-place insertion sort algorithm.
 ///
 /// Time complexity is `O(n^2)`, where `n` is the number of elements.

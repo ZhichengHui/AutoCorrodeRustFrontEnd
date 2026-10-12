@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp::Ordering;
 
 /// Recursively performs a binary search for a specified item within a sorted array.

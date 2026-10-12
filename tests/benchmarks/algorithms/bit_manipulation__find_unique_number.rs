@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Finds the unique number in a slice where every other element appears twice.
 ///
 /// This function uses the XOR bitwise operation. Since XOR has the property that

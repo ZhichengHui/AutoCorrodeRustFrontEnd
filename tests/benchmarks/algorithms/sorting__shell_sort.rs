@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn shell_sort<T: Ord + Copy>(values: &mut [T]) {
     // shell sort works by swiping the value at a given gap and decreasing the gap to 1
     fn insertion<T: Ord + Copy>(values: &mut [T], start: usize, gap: usize) {

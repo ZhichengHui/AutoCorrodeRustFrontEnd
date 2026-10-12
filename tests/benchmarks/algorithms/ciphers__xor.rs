@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn xor_bytes(text: &[u8], key: u8) -> Vec<u8> {
     text.iter().map(|c| c ^ key).collect()
 }

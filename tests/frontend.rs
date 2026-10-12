@@ -13,17 +13,18 @@ use std::time::Duration;
 // Common data
 // ---------------------------------------------------------------------------------------
 
-/// Memory cap of the Isabelle server (systemd scope).
-const MEMORY_MAX: &str = "4G";
+/// Memory cap of the Isabelle server (systemd scope); override with `MEMORY_MAX`.
+fn memory_max() -> String {
+    std::env::var("MEMORY_MAX").unwrap_or_else(|_| "4G".into())
+}
+
 /// Time limit for checking one crate.
 const CRATE_TIMEOUT_SECS: u64 = 300;
 
-/// AutoCorrode checkout providing the session `AutoCorrode` (main + signed-integers +
-/// urust-break-continue, merged).
+/// AutoCorrode checkout whose session `AutoCorrode` contains the signed-integer and
+/// break/continue extensions; it must be given explicitly.
 fn autocorrode() -> String {
-    std::env::var("AUTOCORRODE").unwrap_or_else(|_| {
-        format!("{}/Work/AutoCorrode/.claude/worktrees/frontend-base", std::env::var("HOME").unwrap())
-    })
+    std::env::var("AUTOCORRODE").expect("set AUTOCORRODE to the AutoCorrode checkout to test against")
 }
 
 fn isabelle() -> String {
@@ -31,16 +32,57 @@ fn isabelle() -> String {
         .unwrap_or_else(|_| format!("{}/Applications/Isabelle2025-2/bin/isabelle", std::env::var("HOME").unwrap()))
 }
 
-/// Benchmark suites under `tests/benchmarks/NAME`: one crate per `.rs` file.
-/// - `aeneas`: tests/src of github.com/AeneasVerif/aeneas @ d119a474 (Apache-2.0);
-///   the crates avl, bst, tutorial flattened to one file.
+/// Benchmark suites under `tests/benchmarks/NAME`, one crate per `.rs` file, copied unchanged:
+/// - `aeneas`: tests/src of github.com/AeneasVerif/aeneas @ d119a474 (Apache-2.0); the
+///   crates avl, bst, tutorial are single files and stored as `avl.rs`, `bst.rs`, `tutorial.rs`.
 /// - `charon`: charon/tests/ui/** of github.com/AeneasVerif/charon @ 0a930b2d (Apache-2.0);
-///   `DIR/NAME.rs` stored as `DIR__NAME.rs`.
+///   `DIR/NAME.rs` stored as `DIR__NAME.rs` (with `-` in names replaced by `_`).
 /// - `humaneval_x`: Rust part of HumanEval-X, github.com/THUDM/CodeGeeX (Apache-2.0):
-///   declaration + canonical solution, without the `use` lines of the crates rand/regex/md5.
+///   `declaration` + `canonical_solution` of each problem.
 /// - `algorithms`: github.com/TheAlgorithms/Rust @ fed66cb0 (MIT): the files of `src/` that
 ///   use no other module and no external crate.
 const SUITES: &[&str] = &["aeneas", "charon", "humaneval_x", "algorithms"];
+
+/// rustc arguments with which the suites' own test infrastructure compiles each file:
+/// Aeneas' test runner uses `--edition=2021` (the crate avl declares edition 2024 in its
+/// Cargo.toml); Charon's `Tests` preset uses `--edition=2021` and registers the tool
+/// `charon`, plus the `--rustc-arg`s of the file's `//@ charon-args=` line; HumanEval-X and
+/// TheAlgorithms are edition 2021 crates. Tests written here use edition 2024.
+fn rustc_args(suite: &str, file: &Path, src: &str) -> Vec<String> {
+    match suite {
+        "aeneas" if file.file_name().is_some_and(|n| n == "avl.rs") => vec!["--edition=2024".into()],
+        "charon" => {
+            let mut a: Vec<String> = vec![
+                "--edition=2021".into(),
+                "-Zcrate-attr=feature(register_tool)".into(),
+                "-Zcrate-attr=register_tool(charon)".into(),
+            ];
+            for line in src.lines().filter(|l| l.starts_with("//@ charon-args=")) {
+                for w in line.split_whitespace() {
+                    if let Some(arg) = w.strip_prefix("--rustc-arg=") {
+                        a.push(arg.into());
+                    }
+                }
+            }
+            a
+        }
+        "unit" => vec!["--edition=2024".into()],
+        _ => vec!["--edition=2021".into()],
+    }
+}
+
+/// HumanEval-X compiles every problem in a Cargo project that depends on the crates rand,
+/// regex and md5, and every declaration imports them; they are not available here, so their
+/// `use` lines are dropped (problems that really use them are then rejected by rustc).
+fn without_unavailable_crates(src: &str) -> String {
+    src.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("use rand") || t.starts_with("use regex") || t.starts_with("use md5"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 // ---------------------------------------------------------------------------------------
 // Translation
@@ -61,24 +103,6 @@ fn toolchain_lib() -> String {
     format!("{0}/lib:{0}/lib/rustlib/x86_64-unknown-linux-gnu/lib", sysroot)
 }
 
-/// rustc arguments for one source file: the Aeneas and Charon tests use the tool
-/// attributes `#[charon::..]` / `#[aeneas::..]`.
-fn rustc_args(suite: &str, src: &str, edition: &str) -> Vec<String> {
-    let mut a = vec![format!("--edition={}", edition)];
-    if suite == "aeneas" || suite == "charon" {
-        if !src.contains("feature(register_tool") {
-            a.push("-Zcrate-attr=feature(register_tool)".into());
-        }
-        if !src.contains("register_tool(charon") {
-            a.push("-Zcrate-attr=register_tool(charon)".into());
-        }
-        if !src.contains("register_tool(aeneas") {
-            a.push("-Zcrate-attr=register_tool(aeneas)".into());
-        }
-    }
-    a
-}
-
 fn run_frontend(file: &Path, name: &str, out: &Path, args: &[String]) -> (bool, String) {
     let _ = std::fs::remove_dir_all(out);
     let o = Command::new(env!("CARGO_BIN_EXE_urust-frontend"))
@@ -97,10 +121,7 @@ fn run_frontend(file: &Path, name: &str, out: &Path, args: &[String]) -> (bool, 
 
 fn translate(suite: &str, file: &Path, name: &str, out: &Path) -> Translation {
     let src = std::fs::read_to_string(file).unwrap_or_default();
-    let (mut ok, mut log) = run_frontend(file, name, out, &rustc_args(suite, &src, "2021"));
-    if !ok && log.contains("Rust 2024") {
-        (ok, log) = run_frontend(file, name, out, &rustc_args(suite, &src, "2024"));
-    }
+    let (ok, log) = run_frontend(file, name, out, &rustc_args(suite, file, &src));
     let funs = out.join(format!("{}_Funs.thy", name));
     if ok && funs.exists() {
         let rep = std::fs::read_to_string(out.join("PLACEHOLDERS.txt")).unwrap_or_default();
@@ -163,7 +184,7 @@ impl Server {
     fn start(tag: &str) -> Server {
         let name = format!("urust-test-{}-{}", tag, std::process::id());
         let mut child = Command::new("systemd-run")
-            .args(["--user", "--scope", "-q", "-p", &format!("MemoryMax={}", MEMORY_MAX), "-p", "MemorySwapMax=0"])
+            .args(["--user", "--scope", "-q", "-p", &format!("MemoryMax={}", memory_max()), "-p", "MemorySwapMax=0"])
             .arg(isabelle())
             .args(["server", "-n", &name])
             .stdout(Stdio::piped())
@@ -821,8 +842,8 @@ fn unsupported_let_chain() {
 }
 
 #[test]
-fn unsupported_assert_eq_kind() {
-    unsupported("unsupported_assert_eq_kind", "pub fn f(x: u32, y: u32) -> u32 { assert_eq!(x, y); x }");
+fn assert_eq_macro() {
+    supported("assert_eq_macro", "pub fn f(x: u32, y: u32) -> u32 { assert_eq!(x, y); x }");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -845,7 +866,15 @@ fn run_suite(suite: &str) {
     for f in &files {
         let stem: String = f.file_stem().unwrap().to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         let name = format!("B_{}", stem);
-        match translate(suite, f, &name, &work.join(&stem)) {
+        let input = if suite == "humaneval_x" {
+            let p = work.join(format!("{}.rs", stem));
+            std::fs::create_dir_all(&work).unwrap();
+            std::fs::write(&p, without_unavailable_crates(&std::fs::read_to_string(f).unwrap())).unwrap();
+            p
+        } else {
+            f.clone()
+        };
+        match translate(suite, &input, &name, &work.join(&stem)) {
             Translation::RustcRejected(_) => rejected_by_rustc += 1,
             Translation::FrontendCrashed(e) => {
                 crashed += 1;

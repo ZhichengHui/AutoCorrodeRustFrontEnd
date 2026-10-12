@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Sorts the elements of `arr` in-place using radix sort.
 ///
 /// Time complexity is `O((n + b) * logb(k))`, where `n` is the number of elements,

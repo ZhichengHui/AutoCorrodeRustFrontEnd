@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Binary Coded Decimal (BCD) conversion
 //!
 //! This module provides a function to convert decimal integers to Binary Coded Decimal (BCD) format.

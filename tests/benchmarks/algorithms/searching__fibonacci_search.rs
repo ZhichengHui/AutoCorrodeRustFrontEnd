@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp::min;
 use std::cmp::Ordering;
 

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Kth Factor of N
 // The idea is to check for each number in the range [N, 1], and print the Kth number that divides N completely.
 

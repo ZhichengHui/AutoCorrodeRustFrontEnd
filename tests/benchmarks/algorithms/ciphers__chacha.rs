@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 macro_rules! quarter_round {
     ($a:expr,$b:expr,$c:expr,$d:expr) => {
         $a = $a.wrapping_add($b);

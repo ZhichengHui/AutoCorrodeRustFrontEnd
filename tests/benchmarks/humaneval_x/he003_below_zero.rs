@@ -1,10 +1,8 @@
-// HumanEval-X Rust/3 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn below_zero(operations:Vec<i32>) -> bool{
@@ -19,4 +17,3 @@ for op in operations {
     }
     return false;
 }
-

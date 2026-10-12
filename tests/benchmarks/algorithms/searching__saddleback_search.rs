@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Saddleback search is a technique used to find an element in a sorted 2D matrix in O(m + n) time,
 // where m is the number of rows, and n is the number of columns. It works by starting from the
 // top-right corner of the matrix and moving left or down based on the comparison of the current

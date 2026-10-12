@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn generate_suffix_array_manber_myers(input: &str) -> Vec<usize> {
     if input.is_empty() {
         return Vec::new();

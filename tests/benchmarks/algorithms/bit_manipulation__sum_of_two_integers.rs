@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a function to add two integers without using the `+` operator.
 //! It relies on bitwise operations (XOR and AND) to compute the sum, simulating the addition process.
 

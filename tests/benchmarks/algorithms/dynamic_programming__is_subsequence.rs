@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! A module for checking if one string is a subsequence of another string.
 //!
 //! A subsequence is formed by deleting some (can be none) of the characters

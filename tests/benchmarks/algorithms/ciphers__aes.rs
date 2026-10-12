@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 const AES_WORD_SIZE: usize = 4;
 const AES_BLOCK_SIZE: usize = 16;
 const AES_NUM_BLOCK_WORDS: usize = AES_BLOCK_SIZE / AES_WORD_SIZE;

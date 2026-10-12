@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp;
 
 pub fn pancake_sort<T>(arr: &mut [T]) -> Vec<T>

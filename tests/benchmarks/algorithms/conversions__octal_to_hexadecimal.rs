@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Author: NithinU2802
 // Octal to Hexadecimal Converter: Converts Octal to Hexadecimal
 // Wikipedia References:

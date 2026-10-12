@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 // Kosaraju algorithm, a linear-time algorithm to find the strongly connected components (SCCs) of a directed graph, in Rust.
 pub struct Graph {
     vertices: usize,

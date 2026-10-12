@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Conversion of pressure units.
 //!
 //! This module provides conversion between various pressure units including:

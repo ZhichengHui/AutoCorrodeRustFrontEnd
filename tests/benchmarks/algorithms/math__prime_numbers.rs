@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn prime_numbers(max: usize) -> Vec<usize> {
     let mut result: Vec<usize> = Vec::new();
 

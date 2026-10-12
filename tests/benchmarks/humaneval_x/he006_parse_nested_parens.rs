@@ -1,10 +1,8 @@
-// HumanEval-X Rust/6 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn parse_nested_parens(paren_string:String) -> Vec<i32>{
@@ -32,4 +30,3 @@ fn parse_nested_parens(paren_string:String) -> Vec<i32>{
 
     return result;
 }
-

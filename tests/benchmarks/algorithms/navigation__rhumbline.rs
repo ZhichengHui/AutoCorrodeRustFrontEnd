@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::f64::consts::PI;
 
 const EARTH_RADIUS: f64 = 6371000.0;

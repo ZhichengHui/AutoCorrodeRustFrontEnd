@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Decision Tree classifier using the ID3 algorithm with entropy-based splitting.
 /// The tree recursively splits data based on the feature that provides the highest information gain.
 /// Supports both categorical and continuous features through threshold-based splitting.

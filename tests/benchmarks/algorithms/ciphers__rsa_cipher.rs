@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! RSA Cipher Implementation
 //!
 //! This module provides a basic implementation of the RSA (Rivest-Shamir-Adleman) encryption algorithm.

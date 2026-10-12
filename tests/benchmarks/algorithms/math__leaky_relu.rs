@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Leaky ReLU Function
 //!
 //! The `leaky_relu` function computes the Leaky Rectified Linear Unit (ReLU) values of a given vector

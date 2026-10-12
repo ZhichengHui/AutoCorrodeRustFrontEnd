@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Calculate the greatest common divisor (GCD) of two numbers and the
 /// coefficients of Bézout's identity using the Extended Euclidean Algorithm.
 ///

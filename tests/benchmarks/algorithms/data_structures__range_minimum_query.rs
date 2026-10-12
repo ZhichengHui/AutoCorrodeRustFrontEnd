@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Range Minimum Query (RMQ) Implementation
 //!
 //! This module provides an efficient implementation of a Range Minimum Query data structure using a

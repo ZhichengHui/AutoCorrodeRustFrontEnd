@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn partition<T: PartialOrd>(arr: &mut [T], lo: usize, hi: usize) -> usize {
     let pivot = hi;
     let mut i = lo;

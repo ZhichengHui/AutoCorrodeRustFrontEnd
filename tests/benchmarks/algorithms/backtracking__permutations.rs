@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides a function to generate all possible distinct permutations
 //! of a given collection of integers using a backtracking algorithm.
 

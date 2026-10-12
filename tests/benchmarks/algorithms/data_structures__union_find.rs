@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! A Union-Find (Disjoint Set) data structure implementation in Rust.
 //!
 //! The Union-Find data structure keeps track of elements partitioned into

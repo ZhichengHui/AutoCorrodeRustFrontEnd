@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub fn kernighan(n: u32) -> i32 {
     let mut count = 0;
     let mut n = n;

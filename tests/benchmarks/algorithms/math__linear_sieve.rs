@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /*
 Linear Sieve algorithm:
 Time complexity is indeed O(n) with O(n) memory, but the sieve generally

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Exponential Linear Unit (ELU) Function
 //!
 //! The `exponential_linear_unit` function computes the Exponential Linear Unit (ELU) values of a given vector

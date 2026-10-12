@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Knuth-Morris-Pratt string matching algorithm implementation in Rust.
 //!
 //! This module contains the implementation of the KMP algorithm, which is used for finding

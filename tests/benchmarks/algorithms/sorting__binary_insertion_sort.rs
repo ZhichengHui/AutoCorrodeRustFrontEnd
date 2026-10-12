@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 fn _binary_search<T: Ord>(arr: &[T], target: &T) -> usize {
     let mut low = 0;
     let mut high = arr.len();

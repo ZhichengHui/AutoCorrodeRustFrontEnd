@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! # Huber Loss Function
 //!
 //! The `huber_loss` function calculates the Huber loss, which is a robust loss function used in machine learning, particularly in regression problems.

@@ -1,10 +1,8 @@
-// HumanEval-X Rust/19 (declaration + canonical solution)
-#![allow(unused, deprecated)]
 
 use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-
-
-
+use rand::Rng;
+use regex::Regex;
+use md5;
 use std::any::{Any, TypeId};
 
 fn sort_numbers(numbers:String) -> String {
@@ -43,4 +41,3 @@ fn sort_numbers(numbers:String) -> String {
     let res:String = nmbrs.iter().map(|x:&i32| i32_to_str(x) + " ").collect();
     return res.trim_end().to_string();
 }
-

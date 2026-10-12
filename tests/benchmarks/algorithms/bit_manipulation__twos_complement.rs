@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! Two's Complement Representation
 //!
 //! Two's complement is a mathematical operation on binary numbers and a binary signed

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Returns the weights and bias after performing Perceptron algorithm on the input data points.
 /// The Perceptron is a binary classification algorithm that learns a linear separator.
 /// Labels should be either -1.0 or 1.0 for the two classes.

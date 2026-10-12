@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 use std::cmp::min;
 
 pub fn jump_search<T: Ord>(item: &T, arr: &[T]) -> Option<usize> {

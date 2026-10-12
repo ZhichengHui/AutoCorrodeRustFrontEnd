@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 /// Custom error type for Gray code generation.
 #[derive(Debug, PartialEq)]
 pub enum GrayCodeError {

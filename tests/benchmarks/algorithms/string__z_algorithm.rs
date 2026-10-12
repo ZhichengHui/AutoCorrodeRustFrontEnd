@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 //! This module provides functionalities to match patterns in strings
 //! and compute the Z-array for a given input string.
 
