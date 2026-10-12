@@ -14,8 +14,10 @@ const RESERVED: &[&str] = &[
     "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "fuel", "panic",
     "unimplemented", "todo", "fatal", "assert", "assert_eq", "assert_ne", "debug_assert",
     "vec", "matches", "unreachable", "addr_of", "addr_of_mut", "log",
-    // HOL inner syntax keywords
-    "case", "of", "then", "O", "o", "div", "mod", "dvd", "fun", "SOME", "THE", "LEAST",
+    // HOL inner syntax keywords (including infix operators written as words)
+    "case", "of", "then", "O", "o", "div", "mod", "dvd", "fun", "choose", "XOR", "AND", "OR",
+    "NOT", "SUP", "INF", "Sup", "Inf", "Min", "Max", "Bex", "Ball", "Collect", "insert",
+    "Let", "If", "Pair", "Suc", "BIT", "OFCLASS", "SORT_CONSTRAINT", "pred", "in_rel", "SOME", "THE", "LEAST",
     "GREATEST", "op", "ALL", "EX", "UNIV", "WRT", "CONST", "TYPE", "PROP", "undefined",
     "default", "if", "let", "in", "where", "and", "is", "with", "sorry", "oops",
     // Frequently used HOL / AutoCorrode constants
@@ -80,6 +82,10 @@ pub fn ident_chars(s: &str) -> String {
         } else {
             out.push('_');
         }
+    }
+    // Isabelle rejects names ending in an underscore
+    while out.ends_with('_') {
+        out.pop();
     }
     if out.is_empty() {
         out.push('v');

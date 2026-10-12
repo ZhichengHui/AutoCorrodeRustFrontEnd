@@ -1,0 +1,24 @@
+// HumanEval-X Rust/80 (declaration + canonical solution)
+#![allow(unused, deprecated)]
+
+use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
+
+
+
+use std::any::{Any, TypeId};
+
+fn is_happy(s:&str) -> bool{
+
+
+    let str: Vec<char> = s.chars().into_iter().collect();
+    if str.len() < 3 {
+        return false;
+    }
+    for i in 2..str.len() {
+        if str[i] == str[i - 1] || str[i] == str[i - 2] {
+            return false;
+        }
+    }
+    return true;
+}
+

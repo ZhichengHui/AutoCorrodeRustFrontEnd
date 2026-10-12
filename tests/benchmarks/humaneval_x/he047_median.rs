@@ -1,0 +1,21 @@
+// HumanEval-X Rust/47 (declaration + canonical solution)
+#![allow(unused, deprecated)]
+
+use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
+
+
+
+use std::any::{Any, TypeId};
+
+fn median(l:Vec<i32>) -> f64{
+
+
+    let mut res:Vec<i32> = l.clone();
+    res.sort();
+    if res.len() % 2 == 1{
+        return *res.get(res.len() / 2).unwrap() as f64;
+    }else{      
+        return (res.get(res.len() / 2 -1).unwrap() + res.get(res.len() / 2).unwrap()) as f64/ 2.0;
+    }
+}
+

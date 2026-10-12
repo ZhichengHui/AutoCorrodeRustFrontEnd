@@ -1,0 +1,18 @@
+// HumanEval-X Rust/34 (declaration + canonical solution)
+#![allow(unused, deprecated)]
+
+use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
+
+
+
+use std::any::{Any, TypeId};
+
+fn unique(nmbs:Vec<i32>)  -> Vec<i32>{
+
+
+    let mut res:Vec<i32> = nmbs.clone();
+    res.sort();
+    res.dedup();
+    return res;
+ }
+

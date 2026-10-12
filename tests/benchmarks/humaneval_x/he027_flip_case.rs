@@ -1,0 +1,15 @@
+// HumanEval-X Rust/27 (declaration + canonical solution)
+#![allow(unused, deprecated)]
+
+use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
+
+
+
+use std::any::{Any, TypeId};
+
+pub fn flip_case(string: String) -> String{
+
+
+    return string.chars().into_iter().fold(String::new(), |res:String, c:char| {if c.is_ascii_lowercase(){return res + &c.to_uppercase().to_string();}else{return res + &c.to_ascii_lowercase().to_string();}});
+}
+

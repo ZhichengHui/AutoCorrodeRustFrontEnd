@@ -123,6 +123,32 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             }
         }
     }
+    // ADTs containing `&mut` references, directly or through other local ADTs
+    loop {
+        let mut changed = false;
+        for &d in &adts {
+            if fe.ref_adts.contains(&d) {
+                continue;
+            }
+            let needs = tcx.adt_def(d).all_fields().any(|f| {
+                tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().any(|g| match g.kind() {
+                    ty::GenericArgKind::Type(tt) => match tt.kind() {
+                        ty::Ref(_, _, m) => m.is_mut(),
+                        ty::Adt(a, _) => fe.ref_adts.contains(&a.did()),
+                        _ => false,
+                    },
+                    _ => false,
+                })
+            });
+            if needs {
+                fe.ref_adts.insert(d);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     fe.adts = adts.clone();
     for &d in &adts {
         fe.adt_name(d);
@@ -325,6 +351,11 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 .map(|p| names::tvar_name(p.name.as_str()))
                 .collect();
             let has_const = generics.own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
+            let mut tparams = tparams;
+            if fe.ref_adts.contains(&d) {
+                tparams.insert(0, "'gv".into());
+                tparams.insert(0, "'addr".into());
+            }
             let head = if tparams.is_empty() { tn.clone() } else { format!("({}) {}", tparams.join(", "), tn) };
             writeln!(out, "(* Rust: {} *)", tcx.def_path_str(d)).unwrap();
             if has_const {

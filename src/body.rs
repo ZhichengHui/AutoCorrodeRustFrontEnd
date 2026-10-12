@@ -102,6 +102,20 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         )
     }
 
+    /// Give a placeholder the HOL type of the Rust expression it replaces, so that the
+    /// overloaded operators applied to it remain resolvable.
+    fn typed_placeholder(&mut self, p: Tr, t: Ty<'tcx>) -> Tr {
+        if t.is_never() {
+            return p;
+        }
+        let h = self.fe.ty(t);
+        let msg = p.s.trim_start_matches("unimplemented!(\"").trim_end_matches("\")").to_string();
+        Tr::atom(format!(
+            "\\<epsilon>\\<open>(unimplemented (STR ''{}'') :: (_, {}, _, _, _, _) expression)\\<close>",
+            msg, h
+        ))
+    }
+
     fn ty_of(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.typeck.expr_ty(e) }
     fn ty_adj(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.typeck.expr_ty_adjusted(e) }
 
@@ -191,18 +205,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 StmtKind::Let(l) => {
                     let (pre, post) = self.let_stmt(l)?;
                     let rest = self.block_seq(&stmts[i + 1..], tail)?;
-                    let rest = if rest.trim().is_empty() { "()".to_string() } else { rest };
                     parts.push(format!("{}\n{}{}", pre, rest, post));
                     return Ok(join_seq(parts, true));
                 }
                 StmtKind::Expr(e) | StmtKind::Semi(e) => {
                     let t = self.ty_of(e);
                     let s = self.stmt_expr(e);
-                    parts.push(s);
                     if t.is_never() {
+                        self.push_diverging(&mut parts, s);
                         ended_by_divergence = true;
                         break;
                     }
+                    parts.push(s);
                 }
             }
             i += 1;
@@ -210,10 +224,35 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !ended_by_divergence {
             if let Some(t) = tail {
                 let tt = self.expr(t);
-                parts.push(format!("\u{3}{}", tt.s)); // \u{3} marks a tail expression
+                if self.ty_of(t).is_never() {
+                    let s = if tt.s.ends_with(';') { tt.s.clone() } else { format!("{};", tt.at(11)) };
+                    self.push_diverging(&mut parts, s);
+                } else {
+                    parts.push(format!("\u{3}{}", tt.s)); // \u{3} marks a tail expression
+                }
             }
         }
-        Ok(join_seq(parts, false))
+        // a trailing `let _ = e;` (from an expression statement) needs a continuation
+        if !ended_by_divergence && tail.is_none() && parts.last().map(|p| p.starts_with("let ")).unwrap_or(false) {
+            parts.push("\u{3}()".to_string());
+        }
+        let s = join_seq(parts, false);
+        Ok(if s.trim().is_empty() { "()".to_string() } else { s })
+    }
+
+    /// A statement of type `!`. In uRust a loop, `if` or `match` whose branches all leave the
+    /// function still has type `unit`, so the statement is followed by a panic that is reached
+    /// only when the fuel of a loop is exhausted. A placeholder becomes the value of the block.
+    fn push_diverging(&self, parts: &mut Vec<String>, s: String) {
+        let body = s.trim_start_matches('\u{4}');
+        if body.starts_with("unimplemented!") || body.starts_with("panic!") {
+            parts.push(format!("\u{3}{}", body.trim_end_matches(';')));
+        } else if body.starts_with("return") || body.starts_with("break") || body.starts_with("continue") {
+            parts.push(s);
+        } else {
+            parts.push(s);
+            parts.push("\u{3}panic!(\"unreachable: diverging expression completed\")".to_string());
+        }
     }
 
     /// An expression in statement position, rendered as a complete statement.
@@ -239,7 +278,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn let_stmt(&mut self, l: &'tcx hir::LetStmt<'tcx>) -> R<(String, String)> {
         if let Some(els) = l.els {
             let init = l.init.ok_or(Unsup("let-else without initializer".into()))?;
-            let iv = self.expr(init);
+            let iv = self.scrut(init)?;
             let p = self.pat(l.pat)?;
             let els_s = self.block_seq(els.stmts, els.expr)?;
             if p.conds.is_empty() && p.prologue.is_empty() {
@@ -376,8 +415,26 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     pub fn expr(&mut self, e: &'tcx hir::Expr<'tcx>) -> Tr {
         match self.pv_adjusted(e) {
             Ok(pv) => self.to_val(pv),
-            Err(Unsup(m)) => self.placeholder(&m, e.span),
+            Err(Unsup(m)) => {
+                let t = self.ty_adj(e);
+                let p = self.placeholder(&m, e.span);
+                self.typed_placeholder(p, t)
+            }
         }
+    }
+
+    /// The value matched by a pattern: a scrutinee of type `&mut T` (match ergonomics) is
+    /// dereferenced; bindings by mutable reference are rejected by the pattern translation.
+    fn scrut(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        let mut v = self.val(e)?;
+        let mut t = self.ty_adj(e);
+        while let ty::Ref(_, inner, m) = t.kind() {
+            if m.is_mut() {
+                v = Tr::new(format!("*{}", v.at(200)), 98);
+            }
+            t = *inner;
+        }
+        Ok(v)
     }
 
     fn val(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
@@ -408,7 +465,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 Adjust::Deref(_) => return unsup("pinned dereference"),
                 Adjust::Borrow(AutoBorrow::Ref(m)) => match m {
-                    AutoBorrowMutability::Mut { .. } => self.borrow_mut(pv)?,
+                    AutoBorrowMutability::Mut { .. } => self.borrow_mut(pv, cur)?,
                     AutoBorrowMutability::Not => PV::Val(self.to_val(pv)),
                 },
                 Adjust::Borrow(_) => return unsup("raw or pinned auto-borrow"),
@@ -430,10 +487,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    fn borrow_mut(&mut self, pv: PV) -> R<PV> {
+    /// `&mut` of a place is the reference to it; `&mut` of a temporary value allocates a
+    /// fresh mutable local holding the value (Rust's temporary) and yields its reference.
+    fn borrow_mut(&mut self, pv: PV, t: Ty<'tcx>) -> R<PV> {
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
-            PV::Val(_) => unsup("mutable borrow of a temporary value"),
+            PV::Val(v) => {
+                self.alloc(t, rustc_span::DUMMY_SP)?;
+                let tmp = self.fresh("tmp");
+                Ok(PV::Val(Tr::atom(format!("{{ let mut {} = {}; {} }}", tmp, v.at(20), tmp))))
+            }
         }
     }
 
@@ -607,8 +670,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::AddrOf(hir::BorrowKind::Ref, m, x) => {
                 if m.is_mut() {
-                    let p = self.place(x)?;
-                    Ok(p)
+                    let t = self.ty_adj(x);
+                    let pv = self.pv_adjusted(x)?;
+                    match self.borrow_mut(pv, t)? {
+                        PV::Val(v) => Ok(v),
+                        PV::Ref(_) => unreachable!(),
+                    }
                 } else {
                     self.val(x)
                 }
@@ -764,6 +831,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx)))
     }
 
+    /// Evaluate a constant, unless it is generic or a trait's associated constant
+    /// (evaluating those would make rustc abort).
+    fn const_eval(&self, did: DefId) -> Option<rustc_middle::mir::interpret::EvalToConstValueResult<'tcx>> {
+        if self.fe.is_trait_item(did) || self.tcx.generics_of(did).requires_monomorphization(self.tcx) {
+            return None;
+        }
+        Some(self.tcx.const_eval_poly(did))
+    }
+
     fn const_use(&mut self, did: DefId, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         let t = self.ty_of(e);
         if let DefKind::Static { mutability, .. } = self.tcx.def_kind(did) {
@@ -771,7 +847,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         if did.is_local() {
             if self.tcx.hir_maybe_body_owned_by(did.expect_local()).is_some()
-                && !self.tcx.generics_of(did).requires_monomorphization(self.tcx)
+                && !self.fe.is_trait_item(did)
             {
                 self.calls.insert(did);
                 let m = self.fe.marker(did);
@@ -780,7 +856,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         // try to evaluate (e.g. `u32::MAX`)
         if t.is_integral() || t.is_bool() {
-            if let Ok(v) = self.tcx.const_eval_poly(did) {
+            if let Some(Ok(v)) = self.const_eval(did) {
                 if let Some(s) = v.try_to_scalar_int() {
                     if t.is_bool() {
                         return Ok(Tr::atom(if s.to_bits(s.size()) != 0 { "true" } else { "false" }));
@@ -834,7 +910,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn mk_bin(op: &str, prec: u32, left_assoc: bool, l: &Tr, r: &Tr) -> Tr {
-        let (lp, rp) = if left_assoc { (prec, prec + 1) } else { (prec + 1, prec + 1) };
+        // non-atomic operands are always parenthesised: `|` is also closure and pattern syntax,
+        // and explicit grouping avoids ambiguous parses
+        let _ = left_assoc;
+        let (lp, rp) = (999, 999);
         Tr::new(format!("{} {} {}", l.at(lp), op, r.at(rp)), prec)
     }
 
@@ -1165,9 +1244,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if target.is_local() {
             return unsup(format!("call of `{}`", self.tcx.def_path_str(target)));
         }
-        if self.tcx.generics_of(target).has_self && self.tcx.trait_of_assoc(target).is_some() {
-            return unsup(format!("call of trait method `{}`", self.tcx.def_path_str(target)));
-        }
         let n = self.fe.ext_fun(target, false);
         Ok(self.named_call(&n, argv))
     }
@@ -1376,7 +1452,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn if_expr(&mut self, c: &'tcx hir::Expr<'tcx>, t: &'tcx hir::Expr<'tcx>, el: Option<&'tcx hir::Expr<'tcx>>) -> R<Tr> {
         let c = Self::strip_drop_temps(c);
         if let ExprKind::Let(le) = c.kind {
-            let iv = self.val(le.init)?;
+            let iv = self.scrut(le.init)?;
             let p = self.pat(le.pat)?;
             let mut tb = p.prologue.join("\n");
             if !tb.is_empty() { tb.push('\n'); }
@@ -1418,7 +1494,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let ExprKind::If(cond, then, _) = ife.kind else { return unsup("while desugaring") };
                 let cond = Self::strip_drop_temps(cond);
                 if let ExprKind::Let(le) = cond.kind {
-                    let iv = self.val(le.init)?;
+                    let iv = self.scrut(le.init)?;
                     let p = self.pat(le.pat)?;
                     let mut body = p.prologue.join("\n");
                     if !body.is_empty() { body.push('\n'); }
@@ -1522,7 +1598,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn match_expr(&mut self, scrut: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         let st = self.ty_adj(scrut);
-        let sv = self.val(scrut)?;
+        let sv = self.scrut(scrut)?;
         if self.int_like(st) || arms.iter().all(|a| self.chainable(a.pat)) {
             return self.match_chain(sv, arms);
         }
@@ -1749,7 +1825,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 match res {
                     Res::Def(DefKind::Const | DefKind::AssocConst { .. }, did) => {
                         if t.is_integral() || t.is_bool() {
-                            if let Ok(v) = self.tcx.const_eval_poly(did) {
+                            if let Some(Ok(v)) = self.const_eval(did) {
                                 if let Some(s) = v.try_to_scalar_int() {
                                     let bits = s.to_bits(s.size());
                                     if t.is_bool() { return Ok(Tr::atom(if bits != 0 { "true" } else { "false" })) }
@@ -1937,11 +2013,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn closure(&mut self, e: &'tcx hir::Expr<'tcx>, c: &'tcx hir::Closure<'tcx>) -> R<Tr> {
         if !matches!(c.kind, hir::ClosureKind::Closure) { return unsup("async block / coroutine") }
-        if let ty::Closure(_, args) = self.ty_of(e).kind() {
-            if args.as_closure().kind() == ty::ClosureKind::FnMut {
-                return unsup("closure that mutates captured variables");
+        // a closure mutates a captured variable iff it captures it by a mutable (or unique) borrow
+        for cap in self.typeck.closure_min_captures_flattened(c.def_id) {
+            if let ty::UpvarCapture::ByRef(k) = cap.info.capture_kind {
+                if !matches!(k, ty::BorrowKind::Immutable) {
+                    return unsup("closure that mutates captured variables");
+                }
             }
         }
+        let _ = e;
         let body = self.tcx.hir_body(c.body);
         let mut ps = vec![];
         let mut pro = vec![];
@@ -1949,6 +2029,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             match p.pat.kind {
                 PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                     let n = names::local_name(ident.as_str());
+                    // closure formals carry no type in uRust: fix it in the body
+                    let pt = self.fe.ty(self.typeck.node_type(hid));
+                    if !pt.contains("unsupported_") {
+                        pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
+                    }
                     if m.is_mut() {
                         let t = self.typeck.node_type(hid);
                         self.alloc(t, p.pat.span)?;
@@ -1973,6 +2058,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::new(format!("{} {{\n{}\n}}", head, b), 10))
     }
 }
+
 
 fn paren_if(c: &str) -> String {
     if c.contains(' ') { format!("({})", c) } else { c.to_string() }

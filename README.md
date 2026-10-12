@@ -65,6 +65,17 @@ scripts/run_tests.sh            # translate tests/cases/*.rs and build session F
 NO_ISABELLE=1 scripts/run_tests.sh   # translation only
 ```
 
+Benchmark suites (see `tests/benchmarks/README.md` for their sources):
+
+```
+scripts/run_benchmarks.sh aeneas        # Aeneas test suite, 113 crates
+scripts/run_benchmarks.sh humaneval_x   # HumanEval-X Rust, 164 crates
+python3 -I scripts/placeholder_stats.py out/bench/aeneas out/bench/humaneval_x
+```
+
+Each run writes `out/bench/SUITE/SUMMARY.md` (per crate: translation status, number of
+placeholders, Isabelle result, first Isabelle error).
+
 The Isabelle build runs under `systemd-run … MemoryMax=4G` and needs the heap of
 session `AutoCorrode` built from the merged AutoCorrode checkout (`AUTOCORRODE`).
 

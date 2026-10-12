@@ -1,0 +1,39 @@
+// HumanEval-X Rust/94 (declaration + canonical solution)
+#![allow(unused, deprecated)]
+
+use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
+
+
+
+use std::any::{Any, TypeId};
+
+fn skjkasdkd(lst:Vec<i32>) -> i32{
+
+
+    let mut largest = 0;
+    for i in 0..lst.len() {
+        if lst[i] > largest {
+            let mut prime = true;
+            let mut j = 2;
+            while j * j <= lst[i] {
+                if lst[i] % j == 0 {
+                    prime = false;
+                }
+                j += 1;
+            }
+
+            if prime {
+                largest = lst[i];
+            }
+        }
+    }
+    let mut sum: i32 = 0;
+    let mut s: String = String::new();
+    s = largest.to_string();
+
+    for n in s.chars().into_iter() {
+        sum += n.to_digit(10).unwrap() as i32;
+    }
+    return sum;
+}
+

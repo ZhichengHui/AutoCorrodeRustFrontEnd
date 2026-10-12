@@ -76,6 +76,11 @@ pub struct Frontend<'tcx> {
     pub adts: Vec<DefId>,
     /// Structs translated as `datatype_record` (have lenses).
     pub record_adts: HashSet<DefId>,
+    /// Local ADTs that contain `&mut` references (directly or through other ADTs):
+    /// they take the type parameters `'addr, 'gv` first.
+    pub ref_adts: HashSet<DefId>,
+    /// When set, unnormalisable projections and `impl Trait` become fresh type variables.
+    pub alias_tvars: Option<usize>,
 }
 
 pub fn paren_ty(s: &str) -> String {
@@ -116,6 +121,8 @@ impl<'tcx> Frontend<'tcx> {
             marker_index: HashMap::new(),
             adts: Vec::new(),
             record_adts: HashSet::new(),
+            ref_adts: HashSet::new(),
+            alias_tvars: None,
         }
     }
 
@@ -229,12 +236,15 @@ impl<'tcx> Frontend<'tcx> {
     pub fn variant_ctor_name(&mut self, adt: DefId, vidx: usize) -> String {
         let tn = self.adt_name(adt);
         let def = self.tcx.adt_def(adt);
-        if def.is_enum() {
+        let n = if def.is_enum() {
             let v = def.variant(vidx.into());
             format!("{}_{}", tn, names::ident_chars(v.name.as_str()))
         } else {
             format!("make_{}", tn)
-        }
+        };
+        self.used_names.insert(n.clone());
+        self.used_names.insert(format!("{}_mk", n));
+        n
     }
 
     /// uRust name under which the constructor *function* is registered.
@@ -250,11 +260,14 @@ impl<'tcx> Frontend<'tcx> {
         let v = def.variant(vidx.into());
         let f: &ty::FieldDef = v.fields.iter().nth(fidx).unwrap();
         let fname = f.name.as_str();
-        if def.is_enum() {
+        let n = if def.is_enum() {
             format!("{}_{}_{}", tn, names::ident_chars(v.name.as_str()), names::ident_chars(fname))
         } else {
             format!("{}_{}", tn, names::ident_chars(fname))
-        }
+        };
+        // selectors are HOL constants: functions must not reuse their names
+        self.used_names.insert(n.clone());
+        n
     }
 
     pub fn crate_of(&self, did: DefId) -> String {
@@ -363,19 +376,34 @@ impl<'tcx> Frontend<'tcx> {
                             });
                             n
                         };
-                        if targs.is_empty() {
-                            name
-                        } else {
-                            let a: Vec<String> = targs.iter().map(|x| self.ty(*x)).collect();
-                            format!("({}) {}", a.join(", "), name)
+                        let mut a: Vec<String> = vec![];
+                        if self.ref_adts.contains(&did) {
+                            a.push("'addr".into());
+                            a.push("'gv".into());
                         }
+                        a.extend(targs.iter().map(|x| self.ty(*x)));
+                        if a.is_empty() { name } else { format!("({}) {}", a.join(", "), name) }
                     }
                 }
             }
             ty::RawPtr(..) => self.placeholder_type("raw_pointer", 0),
             ty::FnPtr(..) => self.placeholder_type("fn_pointer", 0),
             ty::Dynamic(..) => self.placeholder_type("dyn_trait", 0),
-            ty::Alias(..) => self.placeholder_type("alias_or_impl_trait", 0),
+            ty::Alias(..) => {
+                // associated-type projections that can be resolved (e.g. `<V2 as Add>::Output`)
+                if let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
+                    if !matches!(n.kind(), ty::Alias(..)) {
+                        return self.ty(n);
+                    }
+                }
+                match self.alias_tvars.as_mut() {
+                    Some(k) => {
+                        *k += 1;
+                        format!("'alias{}", k)
+                    }
+                    None => self.placeholder_type("alias_or_impl_trait", 0),
+                }
+            }
             ty::Closure(..) => self.placeholder_type("closure", 0),
             ty::FnDef(..) => self.placeholder_type("fn_item", 0),
             _ => self.placeholder_type(&format!("{}", t), 0),
@@ -418,8 +446,10 @@ impl<'tcx> Frontend<'tcx> {
         self.used_names.insert(n.clone());
         let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
         let inputs: Vec<Ty<'tcx>> = sig.inputs().iter().copied().collect();
+        self.alias_tvars = Some(0);
         let params: Vec<String> = inputs.iter().map(|t| self.ty(*t)).collect();
         let ret = self.ty(sig.output());
+        self.alias_tvars = None;
         let hol_type = self.fun_type(&params, &ret);
         let ef = ExtFun { hol_name: n.clone(), rust_path: self.tcx.def_path_str(did), hol_type, arity: params.len() };
         if foreign { self.foreign_funs.insert(n.clone(), ef); } else { self.ext_funs.insert(n.clone(), ef); }
