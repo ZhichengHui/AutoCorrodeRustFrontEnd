@@ -8,10 +8,11 @@ use rustc_hir as hir;
 use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
-use crate::frontend::{ExtFun, Frontend, FunDef, one_line, paren_ty};
+use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, one_line, paren_ty};
 use crate::names;
 
 pub struct Options {
@@ -228,13 +229,12 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             }
         }
     }
+    // default methods are generic over `Self`: translated at the instances they are called at
+    let mut default_methods: Vec<DefId> = vec![];
     for id in items.trait_items() {
         let ti = tcx.hir_trait_item(id);
         match ti.kind {
-            hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)) => {
-                let m = fe.placeholder("trait default method", Some(tcx.def_span(ti.owner_id.to_def_id())));
-                fe.item_comments.push(m);
-            }
+            hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)) => default_methods.push(ti.owner_id.to_def_id()),
             hir::TraitItemKind::Type(..) => {
                 let m = fe.placeholder("associated type", Some(tcx.def_span(ti.owner_id.to_def_id())));
                 fe.item_comments.push(m);
@@ -242,27 +242,126 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             _ => {}
         }
     }
+    fe.mono_fns = mono_fns(tcx, &bodies, &default_methods);
     for (d, _) in &bodies {
         fe.def_name(*d);
     }
     for (did, kind) in &bodies {
-        let fd = translate_item(&mut fe, *did, kind);
+        let fd = translate_item(&mut fe, (*did, None), kind);
         fe.fun_defs.push(fd);
+    }
+    // instances called from the translated bodies, and from those instances
+    while let Some(key) = fe.pending.pop() {
+        let fd = translate_item(&mut fe, key, "fn");
+        fe.fun_defs.push(fd);
+    }
+    for d in default_methods {
+        if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
+            let m = fe.placeholder("trait default method (not called at a concrete type)", Some(tcx.def_span(d)));
+            fe.item_comments.push(m);
+        }
     }
 
     let funs_text = emit_funs(&mut fe);
     write_all(&mut fe, opts, types_text, funs_text);
 }
 
-fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunDef {
+/// The calls of a body whose callee depends on the body's generic parameters: trait methods and
+/// generic `Fn` values (`dependent`), and local functions at such arguments (`callees`).
+struct GenericCalls<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typeck: &'tcx ty::TypeckResults<'tcx>,
+    dependent: bool,
+    callees: Vec<DefId>,
+}
+
+impl<'tcx> GenericCalls<'tcx> {
+    fn call(&mut self, did: DefId, args: ty::GenericArgsRef<'tcx>) {
+        if !args.has_param() {
+            return;
+        }
+        if self.tcx.trait_of_assoc(did).is_some() {
+            self.dependent = true;
+        } else if did.is_local() {
+            self.callees.push(did);
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
+        if let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) {
+            self.call(did, self.typeck.node_args(e.hir_id));
+        }
+        if let hir::ExprKind::Call(callee, _) = e.kind {
+            let mut t = self.typeck.expr_ty_adjusted(callee);
+            while let ty::Ref(_, inner, _) = t.kind() {
+                t = *inner;
+            }
+            match *t.kind() {
+                ty::FnDef(did, args) => self.call(did, args.skip_binder()),
+                ty::Param(_) => self.dependent = true,
+                _ => {}
+            }
+        }
+        intravisit::walk_expr(self, e);
+    }
+}
+
+/// The generic functions translated per instance: trait default methods, and generic functions
+/// with a call depending on their generic parameters, directly or through other such functions.
+fn mono_fns<'tcx>(tcx: TyCtxt<'tcx>, bodies: &[(DefId, &str)], default_methods: &[DefId]) -> HashSet<DefId> {
+    let mut mono: HashSet<DefId> = default_methods.iter().copied().collect();
+    let mut callees: Vec<(DefId, Vec<DefId>)> = vec![];
+    for &(did, kind) in bodies {
+        let Some(ld) = did.as_local() else { continue };
+        if kind != "fn" || tcx.hir_maybe_body_owned_by(ld).is_none() {
+            continue;
+        }
+        let mut v = GenericCalls { tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
+        v.visit_body(tcx.hir_body_owned_by(ld));
+        if v.dependent {
+            mono.insert(did);
+        }
+        callees.push((did, v.callees));
+    }
+    loop {
+        let before = mono.len();
+        for (did, cs) in &callees {
+            if cs.iter().any(|c| mono.contains(c)) {
+                mono.insert(*did);
+            }
+        }
+        if mono.len() == before {
+            return mono;
+        }
+    }
+}
+
+fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> FunDef<'tcx> {
     let tcx = fe.tcx;
+    let did = key.0;
     let ld: LocalDefId = did.expect_local();
-    let name = fe.def_name(did);
-    let rust_path = tcx.def_path_str(did);
+    let name = fe.fn_name(key);
+    let rust_path = match key.1 {
+        None => tcx.def_path_str(did),
+        Some(args) => tcx.def_path_str_with_args(did, args),
+    };
     let (params, ret): (Vec<(String, bool)>, (String, bool)) = if kind == "fn" {
-        let sig = tcx.fn_sig(did).instantiate_identity().skip_binder();
-        let ins: Vec<Ty<'tcx>> = sig.inputs().iter().copied().collect();
-        (ins.iter().map(|t| fe.ty_modelled(*t)).collect(), fe.ty_modelled(sig.output()))
+        let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(did).instantiate_identity().skip_normalization());
+        let at = |t: Ty<'tcx>| match key.1 {
+            Some(args) => fe.mono(args, t),
+            None => t,
+        };
+        let ins: Vec<Ty<'tcx>> = sig.inputs().iter().map(|t| at(*t)).collect();
+        let out = at(sig.output());
+        (ins.iter().map(|t| fe.ty_modelled(*t)).collect(), fe.ty_modelled(out))
     } else {
         (vec![], fe.ty_modelled(tcx.type_of(did).instantiate_identity().skip_normalization()))
     };
@@ -270,7 +369,7 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
     let param_tys: Vec<String> = params.into_iter().map(|(p, _)| p).collect();
     let (ret_ty, ret_modelled) = ret;
     let mut fd = FunDef {
-        def_id: did,
+        key,
         name,
         rust_path,
         param_tys,
@@ -281,7 +380,7 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
         comments: vec![],
     };
     let sp = tcx.def_span(did);
-    let fn_placeholder = |fe: &mut Frontend<'tcx>, fd: &mut FunDef, msg: &str| {
+    let fn_placeholder = |fe: &mut Frontend<'tcx>, fd: &mut FunDef<'tcx>, msg: &str| {
         let m = fe.placeholder(msg, Some(sp));
         fd.params = (0..fd.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
         fd.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
@@ -317,7 +416,7 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, did: DefId, kind: &str) -> FunD
         return fd;
     }
     let body = tcx.hir_body_owned_by(ld);
-    let mut bt = BodyTr::new(fe, ld);
+    let mut bt = BodyTr::new(fe, ld, key.1);
     let res = bt.fn_body(body);
     let calls = std::mem::take(&mut bt.calls);
     let comments = std::mem::take(&mut bt.comments);
@@ -453,7 +552,7 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str) -> String {
     )
 }
 
-fn subst_markers(fe: &Frontend<'_>, body: &str, caller_scc: Option<&HashSet<DefId>>, names: &HashMap<DefId, String>) -> String {
+fn subst_markers<'tcx>(fe: &Frontend<'tcx>, body: &str, caller_scc: Option<&HashSet<FnKey<'tcx>>>, names: &HashMap<FnKey<'tcx>, String>) -> String {
     let mut out = String::new();
     let mut rest = body;
     while let Some(i) = rest.find('\u{1}') {
@@ -462,10 +561,10 @@ fn subst_markers(fe: &Frontend<'_>, body: &str, caller_scc: Option<&HashSet<DefI
         let tag = &rest[i + 1..j];
         let kind = &tag[..1];
         let idx: usize = tag[1..].parse().unwrap();
-        let did = fe.marker_ids[idx];
+        let key = fe.marker_ids[idx];
         // every marked callee is a local item with a body, hence translated
-        let name = names.get(&did).cloned().expect("callee of a call marker is translated");
-        let rec = caller_scc.map(|s| s.contains(&did)).unwrap_or(false);
+        let name = names.get(&key).cloned().expect("callee of a call marker is translated");
+        let rec = caller_scc.map(|s| s.contains(&key)).unwrap_or(false);
         let s = match (kind, rec) {
             ("C", false) | ("H", false) => name.clone(),
             ("Z", false) => format!("{}()", name),
@@ -503,12 +602,12 @@ fn indent(s: &str, n: usize) -> String {
     out
 }
 
-fn emit_funs(fe: &mut Frontend<'_>) -> String {
+fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> String {
     let defs = std::mem::take(&mut fe.fun_defs);
-    let ids: Vec<DefId> = defs.iter().map(|d| d.def_id).collect();
-    let by_id: HashMap<DefId, usize> = defs.iter().enumerate().map(|(i, d)| (d.def_id, i)).collect();
-    let names: HashMap<DefId, String> = defs.iter().map(|d| (d.def_id, d.name.clone())).collect();
-    let succ = |d: DefId| -> Vec<DefId> { defs[by_id[&d]].calls.iter().copied().collect() };
+    let ids: Vec<FnKey<'tcx>> = defs.iter().map(|d| d.key).collect();
+    let by_id: HashMap<FnKey<'tcx>, usize> = defs.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+    let names: HashMap<FnKey<'tcx>, String> = defs.iter().map(|d| (d.key, d.name.clone())).collect();
+    let succ = |d: FnKey<'tcx>| -> Vec<FnKey<'tcx>> { defs[by_id[&d]].calls.iter().copied().collect() };
     let comps = sccs(&ids, &succ);
     let mut out = String::new();
     for comp in comps {
@@ -521,15 +620,15 @@ fn emit_funs(fe: &mut Frontend<'_>) -> String {
         }
         // A recursive group f1..fk is defined by iterating a non-recursive step functional
         // `urust_fuel` times, starting from functions that panic ("out of fuel").
-        let set: HashSet<DefId> = comp.iter().copied().collect();
-        let members: Vec<&FunDef> = comp.iter().map(|c| &defs[by_id[c]]).collect();
+        let set: HashSet<FnKey<'_>> = comp.iter().copied().collect();
+        let members: Vec<&FunDef<'_>> = comp.iter().map(|c| &defs[by_id[c]]).collect();
         let k = members.len();
         let step = format!("{}_rec_step", members[0].name);
         let tys: Vec<String> = members.iter().map(|d| fe.fun_type(&d.param_tys, &d.ret_ty)).collect();
         let tuple_ty = tys.iter().map(|t| format!("({})", t)).collect::<Vec<_>>().join(" \\<times> ");
         let recs: Vec<String> = members.iter().map(|d| format!("rec_{}", d.name)).collect();
         let binder = if k == 1 { recs[0].clone() } else { format!("({})", recs.join(", ")) };
-        let lam = |d: &FunDef| if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
+        let lam = |d: &FunDef<'_>| if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
         let bodies: Vec<String> = members
             .iter()
             .map(|d| {
@@ -588,7 +687,7 @@ fn emit_funs(fe: &mut Frontend<'_>) -> String {
     out
 }
 
-fn emit_def(fe: &Frontend<'_>, d: &FunDef, body: &str) -> String {
+fn emit_def(fe: &Frontend<'_>, d: &FunDef<'_>, body: &str) -> String {
     let mut out = String::new();
     writeln!(out, "(* Rust: {} *)", cmt(&d.rust_path)).unwrap();
     for c in &d.comments {

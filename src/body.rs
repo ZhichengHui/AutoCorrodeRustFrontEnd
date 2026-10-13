@@ -16,7 +16,7 @@ use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeckResults};
+use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::Span;
 
 use crate::frontend::Frontend;
@@ -74,20 +74,52 @@ pub struct BodyTr<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
     owner: LocalDefId,
+    /// The generic arguments of the instance being translated (`None`: the generic body itself).
+    args: Option<GenericArgsRef<'tcx>>,
     locals: HashMap<HirId, Local>,
     fresh: usize,
-    pub calls: crate::frontend::DefSet,
+    pub calls: crate::frontend::DefSet<'tcx>,
     pub comments: Vec<String>,
 }
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
 
 impl<'a, 'tcx> BodyTr<'a, 'tcx> {
-    pub fn new(fe: &'a mut Frontend<'tcx>, owner: LocalDefId) -> Self {
+    pub fn new(fe: &'a mut Frontend<'tcx>, owner: LocalDefId, args: Option<GenericArgsRef<'tcx>>) -> Self {
         let tcx = fe.tcx;
         let typeck = tcx.typeck(owner);
-        BodyTr { fe, tcx, typeck, owner, locals: HashMap::new(), fresh: 0, calls: crate::frontend::DefSet::default(), comments: vec![] }
+        BodyTr {
+            fe,
+            tcx,
+            typeck,
+            owner,
+            args,
+            locals: HashMap::new(),
+            fresh: 0,
+            calls: crate::frontend::DefSet::default(),
+            comments: vec![],
+        }
     }
+
+    /// A type or generic arguments from the type-checking results, at the instance's arguments.
+    fn mono<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, x: T) -> T {
+        match self.args {
+            Some(a) => self.fe.mono(a, x),
+            None => x,
+        }
+    }
+
+    /// The typing environment of the body: no generic parameters are left in an instance.
+    fn typing_env(&self) -> ty::TypingEnv<'tcx> {
+        match self.args {
+            Some(_) => ty::TypingEnv::fully_monomorphized(),
+            None => ty::TypingEnv::post_analysis(self.tcx, self.owner.to_def_id()),
+        }
+    }
+
+    fn node_ty(&self, hid: HirId) -> Ty<'tcx> { self.mono(self.typeck.node_type(hid)) }
+    fn pat_ty(&self, p: &hir::Pat<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.pat_ty(p)) }
+    fn node_args(&self, hid: HirId) -> GenericArgsRef<'tcx> { self.mono(self.typeck.node_args(hid)) }
 
     fn fresh(&mut self, base: &str) -> String {
         self.fresh += 1;
@@ -109,8 +141,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         ))
     }
 
-    fn ty_of(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.typeck.expr_ty(e) }
-    fn ty_adj(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.typeck.expr_ty_adjusted(e) }
+    fn ty_of(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.expr_ty(e)) }
+    fn ty_adj(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.expr_ty_adjusted(e)) }
 
     fn peel_refs(t: Ty<'tcx>) -> Ty<'tcx> {
         let mut t = t;
@@ -135,7 +167,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
                     if m.is_mut() {
-                        let t = self.typeck.node_type(hid);
+                        let t = self.node_ty(hid);
                         self.alloc(t)?;
                         prologue.push(format!("let mut {} = {};", n, n));
                         self.locals.insert(hid, Local { name: n, cell: true });
@@ -287,7 +319,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // `let x;` -- deferred initialisation: model as a mutable local.
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
-                    let t = self.typeck.node_type(hid);
+                    let t = self.node_ty(hid);
                     self.alloc(t)?;
                     let ht = self.fe.ty(t);
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
@@ -309,7 +341,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                 let n = names::local_name(ident.as_str());
                 if m.is_mut() {
-                    let t = self.typeck.node_type(hid);
+                    let t = self.node_ty(hid);
                     self.alloc(t)?;
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
                     Ok(format!("let mut {} = {};", n, v.at(20)))
@@ -335,7 +367,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
                 let n = names::local_name(ident.as_str());
                 if m.is_mut() {
-                    let t = self.typeck.node_type(hid);
+                    let t = self.node_ty(hid);
                     self.alloc(t)?;
                     out.push(format!("let mut {} = {};", n, v.at(20)));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
@@ -349,7 +381,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             PatKind::Binding(..) => return unsup("`ref` binding"),
             PatKind::Tuple(ps, ddpos) => {
-                let t = Self::peel_refs(self.typeck.pat_ty(pat));
+                let t = Self::peel_refs(self.pat_ty(pat));
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
                     if let Some(p) = p {
@@ -360,7 +392,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             PatKind::Struct(_, fields, _) => {
-                let t = Self::peel_refs(self.typeck.pat_ty(pat));
+                let t = Self::peel_refs(self.pat_ty(pat));
                 let ty::Adt(def, _) = t.kind() else { return unsup("struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable struct pattern in irrefutable position") }
                 let adt = def.did();
@@ -371,7 +403,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             PatKind::TupleStruct(_, ps, ddpos) => {
-                let t = Self::peel_refs(self.typeck.pat_ty(pat));
+                let t = Self::peel_refs(self.pat_ty(pat));
                 let ty::Adt(def, _) = t.kind() else { return unsup("tuple-struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable tuple-struct pattern in irrefutable position") }
                 let adt = def.did();
@@ -445,13 +477,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut pv = self.pv_unadj(e)?;
         let mut cur = self.ty_of(e);
         for adj in self.typeck.expr_adjustments(e) {
+            let target = self.mono(adj.target);
             pv = match &adj.kind {
                 Adjust::NeverToAny => pv,
                 Adjust::Deref(DerefAdjustKind::Builtin) => self.deref_pv(pv, cur)?,
                 Adjust::Deref(DerefAdjustKind::Overloaded(_)) => {
                     // Box<T> ~ T, Vec<T> ~ [T] ~ list, String ~ str ~ String.literal
                     let a = self.fe.ty(Self::peel_refs(cur));
-                    let b = self.fe.ty(Self::peel_refs(adj.target));
+                    let b = self.fe.ty(Self::peel_refs(target));
                     if a != b { return unsup(format!("overloaded dereference of `{}`", cur)) }
                     pv
                 }
@@ -463,7 +496,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Adjust::Borrow(_) => return unsup("raw or pinned auto-borrow"),
                 Adjust::Pointer(PointerCoercion::Unsize) => {
                     // array -> slice is the identity on lists; a coercion to `dyn Trait` is not
-                    if adj.target.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(t) if matches!(t.kind(), ty::Dynamic(..)))) {
+                    if target.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(t) if matches!(t.kind(), ty::Dynamic(..)))) {
                         return unsup("coercion to a trait object");
                     }
                     pv
@@ -471,7 +504,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Adjust::Pointer(_) => return unsup("pointer coercion"),
                 Adjust::GenericReborrow(_) => pv,
             };
-            cur = adj.target;
+            cur = target;
         }
         Ok(pv)
     }
@@ -617,7 +650,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else {
                     return unsup("unresolved method call");
                 };
-                let gargs = self.typeck.node_args(e.hir_id);
+                let gargs = self.node_args(e.hir_id);
                 let mut argv = vec![self.val(recv)?];
                 for a in args.iter() { argv.push(self.val(a)?); }
                 let mut arg_exprs = vec![recv];
@@ -847,8 +880,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             if self.tcx.hir_maybe_body_owned_by(did.expect_local()).is_some()
                 && !self.fe.is_trait_item(did)
             {
-                self.calls.insert(did);
-                let m = self.fe.marker(did);
+                self.calls.insert((did, None));
+                let m = self.fe.marker((did, None));
                 return Ok(Tr::new(format!("\u{1}Z{}\u{2}", m), 999));
             }
         }
@@ -963,9 +996,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// Is `==` on this expression structural (derived PartialEq or std impl on structural types)?
     fn structural_eq(&mut self, e: &'tcx hir::Expr<'tcx>) -> bool {
         let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return true };
-        let args = self.typeck.node_args(e.hir_id);
-        let env = ty::TypingEnv::post_analysis(self.tcx, self.owner.to_def_id());
-        match ty::Instance::try_resolve(self.tcx, env, did, args) {
+        let args = self.node_args(e.hir_id);
+        match ty::Instance::try_resolve(self.tcx, self.typing_env(), did, args) {
             Ok(Some(inst)) => {
                 let rd = inst.def_id();
                 if let Some(imp) = self.tcx.impl_of_assoc(rd) {
@@ -986,7 +1018,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else {
             return unsup("operator on a non-primitive type");
         };
-        let args = self.typeck.node_args(e.hir_id);
+        let args = self.node_args(e.hir_id);
         let mut argv = vec![];
         for o in operands { argv.push(self.val(o)?); }
         self.call_def(did, args, argv, operands, e)
@@ -998,7 +1030,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !(lt.is_integral() || lt.is_bool()) || self.typeck.type_dependent_def_id(e.hir_id).is_some() && !lt.is_integral() {
             // overloaded compound assignment: call `T::add_assign(&mut lhs, rhs)`
             let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return unsup("compound assignment") };
-            let args = self.typeck.node_args(e.hir_id);
+            let args = self.node_args(e.hir_id);
             let p = self.place(lhs)?;
             let v = self.val(rhs)?;
             return self.call_def(did, args, vec![p, v], &[lhs, rhs], e);
@@ -1161,10 +1193,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::new(format!("{}({})", n, a.join(", ")), 999))
     }
 
-    fn local_call(&mut self, did: DefId, argv: Vec<Tr>) -> R<Tr> {
-        if self.fe.is_trait_item(did) { return unsup("call of a trait default method") }
-        self.calls.insert(did);
-        let m = self.fe.marker(did);
+    /// A call of the local function `did` at the generic arguments `args`.
+    fn local_call(&mut self, did: DefId, args: GenericArgsRef<'tcx>, argv: Vec<Tr>) -> R<Tr> {
+        let Some(key) = self.fe.callee(did, args) else {
+            return unsup(format!("more than {} instances of a generic function", crate::frontend::MAX_INSTANCES));
+        };
+        // a default method is generic over `Self`: only its instances are translated
+        if self.fe.is_trait_item(did) && key.1.is_none() { return unsup("call of a trait default method") }
+        self.calls.insert(key);
+        let m = self.fe.marker(key);
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
         Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a))
     }
@@ -1198,31 +1235,30 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("call of a C-variadic function");
         }
         if self.fe.local_fn_with_body(did) && !self.fe.is_trait_item(did) {
-            return self.local_call(did, argv);
+            return self.local_call(did, gargs, argv);
         }
-        // trait methods: resolve to the implementation
+        // trait methods: resolve to the implementation (in an instance, at its concrete types)
         let mut target = did;
         if self.tcx.trait_of_assoc(did).is_some() {
-            let env = ty::TypingEnv::post_analysis(self.tcx, self.owner.to_def_id());
-            match ty::Instance::try_resolve(self.tcx, env, did, gargs) {
-                Ok(Some(inst)) => {
-                    match inst.def {
-                        ty::InstanceKind::Item(rd) => target = rd,
-                        ty::InstanceKind::Virtual(..) => return unsup("dynamic dispatch (trait object)"),
-                        _ => {
-                            // compiler-generated shims, e.g. `Clone` for primitive/tuple types
-                            if let Some(t) = self.std_call(did, did, argv.clone(), arg_exprs, e)? { return Ok(t) }
-                            return unsup(format!("call of `{}`", self.tcx.def_path_str(did)));
-                        }
+            let targs = match ty::Instance::try_resolve(self.tcx, self.typing_env(), did, gargs) {
+                Ok(Some(inst)) => match inst.def {
+                    ty::InstanceKind::Item(rd) => {
+                        target = rd;
+                        inst.args
                     }
-                }
+                    ty::InstanceKind::Virtual(..) => return unsup("dynamic dispatch (trait object)"),
+                    _ => {
+                        // compiler-generated shims, e.g. `Clone` for primitive/tuple types
+                        if let Some(t) = self.std_call(did, did, argv.clone(), arg_exprs, e)? { return Ok(t) }
+                        return unsup(format!("call of `{}`", self.tcx.def_path_str(did)));
+                    }
+                },
                 _ => return unsup("trait method call in generic code (needs monomorphisation)"),
-            }
+            };
             if target.is_local() {
                 let derived = self.tcx.impl_of_assoc(target).map(|i| self.tcx.is_automatically_derived(i)).unwrap_or(false);
                 if !derived {
-                    if self.fe.is_trait_item(target) { return unsup("call of a trait default method") }
-                    return self.local_call(target, argv);
+                    return self.local_call(target, targs, argv);
                 }
             }
         }
@@ -1601,7 +1637,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                 let n = names::local_name(ident.as_str());
                 if m.is_mut() {
-                    let t = self.typeck.node_type(hid);
+                    let t = self.node_ty(hid);
                     self.alloc(t)?;
                     pro.push(format!("let mut {} = {};", n, n));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
@@ -1774,7 +1810,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = names::local_name(ident.as_str());
                 let mut binds = vec![];
                 if m.is_mut() {
-                    let t = self.typeck.node_type(hid);
+                    let t = self.node_ty(hid);
                     self.alloc(t)?;
                     binds.push(format!("let mut {} = {};", n, v.at(20)));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
@@ -1813,7 +1849,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok((Some(cs.join(" || ")), vec![]))
             }
             PatKind::Tuple(ps, ddpos) => {
-                let t = Self::peel_refs(self.typeck.pat_ty(pat));
+                let t = Self::peel_refs(self.pat_ty(pat));
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 if n > 16 { return unsup("tuple with more than 16 components") }
                 let mut cs = vec![];
@@ -1834,13 +1870,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn ty_is_char(&self, pat: &'tcx hir::Pat<'tcx>) -> bool {
-        Self::peel_refs(self.typeck.pat_ty(pat)).is_char()
+        Self::peel_refs(self.pat_ty(pat)).is_char()
     }
 
     /// A literal / constant inside a pattern, as a uRust value.
     fn pat_expr(&mut self, pe: &'tcx hir::PatExpr<'tcx>, pat: &'tcx hir::Pat<'tcx>) -> R<Tr> {
-        let t = Self::peel_refs(self.typeck.node_type(pe.hir_id));
-        let t = if t.is_integral() || t.is_char() || t.is_bool() || t.is_str() { t } else { Self::peel_refs(self.typeck.pat_ty(pat)) };
+        let t = Self::peel_refs(self.node_ty(pe.hir_id));
+        let t = if t.is_integral() || t.is_char() || t.is_bool() || t.is_str() { t } else { Self::peel_refs(self.pat_ty(pat)) };
         match pe.kind {
             hir::PatExprKind::Lit { lit, negated } => {
                 if let LitKind::Str(..) = lit.node {
@@ -1900,7 +1936,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 let n = names::local_name(ident.as_str());
                 if m.is_mut() {
-                    let t = self.typeck.node_type(hid);
+                    let t = self.node_ty(hid);
                     self.alloc(t)?;
                     pro.push(format!("let mut {} = {};", n, n));
                     self.locals.insert(hid, Local { name: n.clone(), cell: true });
@@ -1927,7 +1963,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             PatKind::Binding(..) => unsup("`ref` binding"),
             PatKind::Tuple(ps, ddpos) => {
-                let t = Self::peel_refs(self.typeck.pat_ty(pat));
+                let t = Self::peel_refs(self.pat_ty(pat));
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 if n < 2 { return unsup("tuple pattern with fewer than 2 components") }
                 let mut parts = vec![];
@@ -2000,7 +2036,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro),
             PatKind::Slice(before, None, after) if after.is_empty() => {
-                let t = Self::peel_refs(self.typeck.pat_ty(pat));
+                let t = Self::peel_refs(self.pat_ty(pat));
                 if !matches!(t.kind(), ty::Slice(_) | ty::Array(..)) { return unsup("slice pattern") }
                 let mut parts = vec![];
                 for p in before.iter() { parts.push(self.pat_rec(p, conds, pro)?); }
@@ -2014,7 +2050,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn pat_variant(&mut self, qp: &'tcx hir::QPath<'tcx>, pat: &'tcx hir::Pat<'tcx>) -> R<(DefId, usize)> {
-        let t = Self::peel_refs(self.typeck.pat_ty(pat));
+        let t = Self::peel_refs(self.pat_ty(pat));
         let ty::Adt(def, _) = t.kind() else { return unsup("constructor pattern on non-ADT") };
         let res = self.typeck.qpath_res(qp, pat.hir_id);
         let v = def.variant_of_res(res);
@@ -2055,12 +2091,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                     let n = names::local_name(ident.as_str());
                     // closure formals carry no type in uRust: fix it in the body
-                    let (pt, modelled) = self.fe.ty_modelled(self.typeck.node_type(hid));
+                    let (pt, modelled) = self.fe.ty_modelled(self.node_ty(hid));
                     if modelled {
                         pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
                     }
                     if m.is_mut() {
-                        let t = self.typeck.node_type(hid);
+                        let t = self.node_ty(hid);
                         self.alloc(t)?;
                         pro.push(format!("let mut {} = {};", n, n));
                         self.locals.insert(hid, Local { name: n.clone(), cell: true });
