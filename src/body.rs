@@ -553,14 +553,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                                     .chain(["fst\\<^sub>L"])
                                     .collect::<Vec<_>>()
                                     .join(" \\<circ>\\<^sub>L ");
-                                let tmp = self.fresh("tup");
-                                Ok(PV::Ref(Tr::atom(format!(
-                                    "{{ let {} = {}; \\<epsilon>\\<open>focus_reference_via_lens ({}) {}\\<close> }}",
-                                    tmp,
-                                    r.at(20),
-                                    lens,
-                                    tmp
-                                ))))
+                                Ok(PV::Ref(Tr::new(
+                                    format!("\\<llangle>focus_reference_via_lens ({})\\<rrangle>\\<^sub>1({})", lens, r.s),
+                                    999,
+                                )))
                             }
                         }
                     }
@@ -657,13 +653,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::If(c, t, el) => self.if_expr(c, t, el),
             ExprKind::Loop(b, label, src, _) => self.loop_expr(e, b, label, src),
             ExprKind::Match(scrut, arms, src) => match src {
-                MatchSource::ForLoopDesugar => match self.for_loop(scrut, arms)? {
-                    Some(t) => Ok(t),
-                    // any other iterator: Rust's own desugaring, `match IntoIterator::into_iter(e)
-                    // { mut iter => loop { match Iterator::next(&mut iter) { None => break,
-                    // Some(p) => body } } }`, translated by the ordinary rules
-                    None => self.match_expr(scrut, arms),
-                },
+                MatchSource::ForLoopDesugar => self.for_loop(scrut, arms),
                 MatchSource::TryDesugar(_) => {
                     let ExprKind::Call(_, [inner]) = scrut.kind else { return unsup("`?` desugaring") };
                     let v = self.val(inner)?;
@@ -1528,10 +1518,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let body = self.branch(then)?;
                 Ok(Tr::new(format!("{} {}while {} {{\n{}\n}}", FUEL, lp, cv.at(20), body), 11))
             }
-            LoopSource::Loop | LoopSource::ForLoop => {
+            LoopSource::Loop => {
                 let body = self.block_seq(b.stmts, b.expr)?;
                 Ok(Tr::new(format!("{} {}loop {{\n{}\n}}", FUEL, lp, body), 11))
             }
+            LoopSource::ForLoop => unsup("for-loop desugaring"),
         }
     }
 
@@ -1542,32 +1533,31 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         self.fe.is_std(did) && self.std_key(did) == ("slice".to_string(), "iter".to_string())
     }
 
-    /// A `for` loop over a range, slice, array or `Vec` as a uRust `for` loop; `None` if `head_call`
-    /// and `arms` are not the desugaring of such a loop.
-    fn for_loop(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Option<Tr>> {
+    fn for_loop(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         // match IntoIterator::into_iter(<head>) { mut iter => loop { match next(&mut iter) { None => break, Some(<pat>) => <body> } } }
-        let ExprKind::Call(_, [head]) = head_call.kind else { return Ok(None) };
-        let [arm] = arms else { return Ok(None) };
-        let ExprKind::Loop(lb, label, LoopSource::ForLoop, _) = arm.body.kind else { return Ok(None) };
+        let ExprKind::Call(_, [head]) = head_call.kind else { return unsup("for-loop head") };
+        let [arm] = arms else { return unsup("for-loop desugaring") };
+        let ExprKind::Loop(lb, label, LoopSource::ForLoop, _) = arm.body.kind else { return unsup("for-loop desugaring") };
         let inner_match = lb.stmts.iter().find_map(|s| match s.kind {
             StmtKind::Expr(x) | StmtKind::Semi(x) => match x.kind {
-                ExprKind::Match(_, arms2, MatchSource::ForLoopDesugar) => Some(arms2),
+                ExprKind::Match(next, arms2, MatchSource::ForLoopDesugar) => Some((next, arms2)),
                 _ => None,
             },
             _ => None,
         }).or_else(|| lb.expr.and_then(|x| match x.kind {
-            ExprKind::Match(_, arms2, MatchSource::ForLoopDesugar) => Some(arms2),
+            ExprKind::Match(next, arms2, MatchSource::ForLoopDesugar) => Some((next, arms2)),
             _ => None,
         }));
-        let Some(arms2) = inner_match else { return Ok(None) };
+        let Some((next, arms2)) = inner_match else { return unsup("for-loop desugaring") };
         // `Some { 0: pat } => body` (a struct pattern in current HIR; a tuple-struct pattern in older ones)
         let some = arms2.iter().find_map(|a| match a.pat.kind {
             PatKind::TupleStruct(_, [p], _) => Some((a, p)),
             PatKind::Struct(_, [f], _) => Some((a, f.pat)),
             _ => None,
         });
-        let Some((some_arm, pat)) = some else { return Ok(None) };
-        // the iterable
+        let Some((some_arm, pat)) = some else { return unsup("for-loop desugaring") };
+        let lp = Self::label_prefix(label);
+        // the iterable: a range, slice, array or Vec is iterated by a uRust `for` loop
         let ht = self.ty_of(head);
         let iter_s = match Self::peel_refs(ht).kind() {
             ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Range") | Some("RangeInclusive")) => self.val(head)?,
@@ -1578,7 +1568,32 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let ExprKind::MethodCall(_, recv, [], _) = head.kind else { unreachable!() };
                 self.val(recv)?
             }
-            _ => return Ok(None),
+            // any other iterator, as Rust defines `for`: `let mut iter = IntoIterator::into_iter(e);
+            // while let Some(p) = Iterator::next(&mut iter) { body }`
+            _ => {
+                // the iterator is stored in a mutable local, whose storage is chosen by its type;
+                // the type is stated, as the iterator comes from polymorphic external functions
+                let iter_v = self.val(head_call)?;
+                let iter_ty = self.fe.ty(self.ty_of(head_call));
+                let tmp = self.fresh("iter");
+                let typed = Tr::atom(format!("\\<llangle>{} :: {}\\<rrangle>", tmp, iter_ty));
+                let init = format!("let {} = {};\n{}", tmp, iter_v.at(20), self.bind_pattern(arm.pat, typed)?);
+                let next_v = self.val(next)?;
+                let p = self.pat(some_arm.pat)?;
+                if !p.conds.is_empty() { return unsup("for-loop pattern with literal or range sub-patterns") }
+                let mut body = p.prologue.join("\n");
+                if !body.is_empty() { body.push('\n'); }
+                body.push_str(&self.branch(some_arm.body)?);
+                return Ok(Tr::atom(format!(
+                    "{{\n{}\n{} {}while let {} = {} {{\n{}\n}}\n}}",
+                    init,
+                    FUEL,
+                    lp,
+                    p.pat,
+                    next_v.at(20),
+                    body
+                )));
+            }
         };
         // the loop pattern
         let mut pro = vec![];
@@ -1605,8 +1620,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut body = pro.join("\n");
         if !body.is_empty() { body.push('\n'); }
         body.push_str(&self.branch(some_arm.body)?);
-        let lp = Self::label_prefix(label);
-        Ok(Some(Tr::new(format!("{}for {} in {} {{\n{}\n}}", lp, ps, iter_s.at(20), body), 11)))
+        Ok(Tr::new(format!("{}for {} in {} {{\n{}\n}}", lp, ps, iter_s.at(20), body), 11))
     }
 
     // ------------------------------------------------------------------
