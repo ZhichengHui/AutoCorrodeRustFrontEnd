@@ -544,7 +544,24 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         if ts.len() > 16 { return unsup("tuple with more than 16 components") }
                         match bpv {
                             PV::Val(v) => Ok(PV::Val(Tr::new(format!("{}.{}", v.at(998), k), 998))),
-                            PV::Ref(_) => unsup("tuple field through a reference / of a mutable local"),
+                            PV::Ref(r) => {
+                                // the reference to component k, focused like a record field: the
+                                // tuple is `t0 × (t1 × (.. × tnil))`, reached by k `snd` lenses and
+                                // one `fst` lens
+                                let lens = vec!["snd\\<^sub>L"; k]
+                                    .into_iter()
+                                    .chain(["fst\\<^sub>L"])
+                                    .collect::<Vec<_>>()
+                                    .join(" \\<circ>\\<^sub>L ");
+                                let tmp = self.fresh("tup");
+                                Ok(PV::Ref(Tr::atom(format!(
+                                    "{{ let {} = {}; \\<epsilon>\\<open>focus_reference_via_lens ({}) {}\\<close> }}",
+                                    tmp,
+                                    r.at(20),
+                                    lens,
+                                    tmp
+                                ))))
+                            }
                         }
                     }
                     _ => unsup(format!("field access on `{}`", bt)),
