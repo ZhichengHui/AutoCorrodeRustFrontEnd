@@ -1306,7 +1306,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let receiver = arg_exprs.first().map(|a| self.ty_adj(a));
         for t in receiver.into_iter().chain([self.ty_of(e)]) {
             let t = t.peel_refs();
-            if self.fe.interior_mutable(t) {
+            if self.fe.interior_mutable(t, self.typing_env()) {
                 return unsup(format!("interior mutability (`{}`)", t));
             }
         }

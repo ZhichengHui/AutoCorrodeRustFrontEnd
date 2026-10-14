@@ -111,6 +111,13 @@ pub struct Frontend<'tcx> {
     pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
 }
 
+/// The type of field `f` of an ADT at its type arguments `args`, without regions and normalised in
+/// `env`. A field is this type wherever the frontend looks at it, as in Rust: a projection is the
+/// type it denotes (`<Foo as Tr>::Out` is `Bar`), and what remains of one depends on type parameters.
+pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, f: &ty::FieldDef, args: GenericArgsRef<'tcx>, env: ty::TypingEnv<'tcx>) -> Ty<'tcx> {
+    tcx.erase_and_anonymize_regions(tcx.normalize_erasing_regions(env, f.ty(tcx, args)))
+}
+
 pub fn paren_ty(s: &str) -> String {
     if s.contains(' ') && !(s.starts_with('(') && balanced_outer(s)) { format!("({})", s) } else { s.to_string() }
 }
@@ -383,11 +390,11 @@ impl<'tcx> Frontend<'tcx> {
     /// Does a value of type `t` have interior mutability, i.e. does it contain an `UnsafeCell`
     /// that is not behind a pointer? Fields are followed with the actual type arguments; type
     /// parameters and projections count as having none.
-    pub fn interior_mutable(&self, t: Ty<'tcx>) -> bool {
-        self.has_cell(t, &mut vec![])
+    pub fn interior_mutable(&self, t: Ty<'tcx>, env: ty::TypingEnv<'tcx>) -> bool {
+        self.has_cell(t, env, &mut vec![])
     }
 
-    fn has_cell(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+    fn has_cell(&self, t: Ty<'tcx>, env: ty::TypingEnv<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
         let tcx = self.tcx;
         match t.kind() {
             ty::Adt(def, _) if def.is_box() => false,
@@ -399,10 +406,10 @@ impl<'tcx> Frontend<'tcx> {
                     return false;
                 }
                 seen.push(t);
-                def.all_fields().any(|f| self.has_cell(f.ty(tcx, args).skip_normalization(), seen))
+                def.all_fields().any(|f| self.has_cell(field_ty(tcx, f, args, env), env, seen))
             }
-            ty::Tuple(ts) => ts.iter().any(|a| self.has_cell(a, seen)),
-            ty::Array(a, _) | ty::Slice(a) => self.has_cell(*a, seen),
+            ty::Tuple(ts) => ts.iter().any(|a| self.has_cell(a, env, seen)),
+            ty::Array(a, _) | ty::Slice(a) => self.has_cell(*a, env, seen),
             _ => false,
         }
     }
@@ -447,10 +454,18 @@ impl<'tcx> Frontend<'tcx> {
     /// references, type variables and abstract types always have one. `stack` holds the local
     /// ADTs being decided: a value of one of them inside itself is not finite (least fixpoint).
     /// `known` holds local ADTs found to have a finite value (which does not depend on `stack`).
-    pub fn finite_ty(&self, t: Ty<'tcx>, local: &HashSet<DefId>, stack: &mut Vec<Ty<'tcx>>, known: &mut HashSet<Ty<'tcx>>) -> bool {
+    /// Fields are normalised in `env`.
+    pub fn finite_ty(
+        &self,
+        t: Ty<'tcx>,
+        env: ty::TypingEnv<'tcx>,
+        local: &HashSet<DefId>,
+        stack: &mut Vec<Ty<'tcx>>,
+        known: &mut HashSet<Ty<'tcx>>,
+    ) -> bool {
         match t.kind() {
-            ty::Ref(_, inner, m) if !m.is_mut() => self.finite_ty(*inner, local, stack, known),
-            ty::Tuple(ts) => ts.iter().all(|x| self.finite_ty(x, local, stack, known)),
+            ty::Ref(_, inner, m) if !m.is_mut() => self.finite_ty(*inner, env, local, stack, known),
+            ty::Tuple(ts) => ts.iter().all(|x| self.finite_ty(x, env, local, stack, known)),
             ty::Adt(def, args) if local.contains(&def.did()) => {
                 if self.opaque_adts.contains_key(&def.did()) || (def.is_enum() && def.variants().is_empty()) {
                     return true;
@@ -463,10 +478,7 @@ impl<'tcx> Frontend<'tcx> {
                 }
                 stack.push(t);
                 let r = def.variants().iter().any(|v| {
-                    v.fields.iter().all(|f| {
-                        let ft = self.tcx.type_of(f.did).instantiate(self.tcx, args).skip_normalization();
-                        self.finite_ty(ft, local, stack, known)
-                    })
+                    v.fields.iter().all(|f| self.finite_ty(field_ty(self.tcx, f, args, env), env, local, stack, known))
                 });
                 stack.pop();
                 if r {
@@ -475,9 +487,10 @@ impl<'tcx> Frontend<'tcx> {
                 r
             }
             ty::Adt(def, args) => match self.std_adt(def.did()) {
-                Some("Box") | Some("Range") | Some("RangeInclusive") => self.finite_ty(args.type_at(0), local, stack, known),
+                Some("Box") | Some("Range") | Some("RangeInclusive") => self.finite_ty(args.type_at(0), env, local, stack, known),
                 Some("Result") => {
-                    self.finite_ty(args.type_at(0), local, stack, known) || self.finite_ty(args.type_at(1), local, stack, known)
+                    self.finite_ty(args.type_at(0), env, local, stack, known)
+                        || self.finite_ty(args.type_at(1), env, local, stack, known)
                 }
                 _ => true,
             },

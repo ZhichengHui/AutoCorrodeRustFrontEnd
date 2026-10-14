@@ -12,7 +12,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
-use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, one_line, paren_ty};
+use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, field_ty, one_line, paren_ty};
 use crate::names;
 
 pub struct Options {
@@ -162,13 +162,6 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     write_all(&mut fe, opts, types_text, funs_text);
 }
 
-/// The types occurring in the fields of the local ADT `d`: the field types and their parts.
-fn field_subtypes<'tcx>(tcx: TyCtxt<'tcx>, d: DefId) -> impl Iterator<Item = Ty<'tcx>> {
-    tcx.adt_def(d)
-        .all_fields()
-        .flat_map(move |f| tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().filter_map(|g| g.as_type()))
-}
-
 /// Collect and classify the local ADTs (see the fields of `Frontend`); returns their groups,
 /// used ones first.
 fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
@@ -183,10 +176,22 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             _ => {}
         }
     }
+    // the field types of the generic ADTs (see `Frontend::field_ty`), on which all of the following
+    // is decided
+    let fields: HashMap<DefId, Vec<Ty<'tcx>>> = adts
+        .iter()
+        .map(|&d| {
+            let env = ty::TypingEnv::post_analysis(tcx, d);
+            let own = ty::GenericArgs::identity_for_item(tcx, d);
+            (d, tcx.adt_def(d).all_fields().map(|f| field_ty(tcx, f, own, env)).collect())
+        })
+        .collect();
+    // the types occurring in the fields of `d`: the field types and their parts
+    let field_subtypes = |d: DefId| fields[&d].iter().flat_map(|t| t.walk().filter_map(|g| g.as_type()));
     // type dependency graph
     let adt_set: HashSet<DefId> = adts.iter().copied().collect();
     let deps = |did: DefId| -> Vec<DefId> {
-        field_subtypes(tcx, did)
+        field_subtypes(did)
             .filter_map(|t| match t.kind() {
                 ty::Adt(d, _) if adt_set.contains(&d.did()) => Some(d.did()),
                 _ => None,
@@ -205,8 +210,7 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     // groups come after the ADTs they use
     for comp in &adt_sccs {
         for &d in comp {
-            let ftys: Vec<Ty<'tcx>> = tcx.adt_def(d).all_fields().map(|f| adt_field_ty(tcx, d, f)).collect();
-            let ps = fe.projections(d, &ftys);
+            let ps = fe.projections(d, &fields[&d]);
             if !ps.is_empty() {
                 fe.adt_projs.insert(d, ps);
             }
@@ -232,7 +236,7 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
         let nonuniform = comp.iter().any(|&d| {
             let own = own_types(d);
             own.len() != arity
-                || field_subtypes(tcx, d)
+                || field_subtypes(d)
                     .any(|t| matches!(t.kind(), ty::Adt(e, args) if comp.contains(&e.did()) && args.types().collect::<Vec<_>>() != own))
         });
         if nonuniform {
@@ -246,7 +250,10 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     let finite: HashSet<DefId> = adts
         .iter()
         .copied()
-        .filter(|&d| fe.finite_ty(tcx.type_of(d).instantiate_identity().skip_normalization(), &adt_set, &mut vec![], &mut known))
+        .filter(|&d| {
+            let t = tcx.type_of(d).instantiate_identity().skip_normalization();
+            fe.finite_ty(t, ty::TypingEnv::post_analysis(tcx, d), &adt_set, &mut vec![], &mut known)
+        })
         .collect();
     for comp in &adt_sccs {
         if !comp.iter().all(|d| finite.contains(d)) {
@@ -274,7 +281,7 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             if fe.ref_adts.contains(&d) {
                 continue;
             }
-            let needs = field_subtypes(tcx, d).any(|t| match t.kind() {
+            let needs = field_subtypes(d).any(|t| match t.kind() {
                 ty::Ref(_, _, m) => m.is_mut(),
                 ty::Adt(a, _) => fe.ref_adts.contains(&a.did()),
                 _ => false,
@@ -546,7 +553,8 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 }
                 _ => tcx.mk_param_from_def(p),
             });
-            let field_ty = |f: &ty::FieldDef| ty::EarlyBinder::bind(tcx, adt_field_ty(tcx, d, f)).instantiate(tcx, to_shared).skip_normalization();
+            let (own, env) = (ty::GenericArgs::identity_for_item(tcx, d), ty::TypingEnv::post_analysis(tcx, d));
+            let shared_field_ty = |f: &ty::FieldDef| ty::EarlyBinder::bind(tcx, field_ty(tcx, f, own, env)).instantiate(tcx, to_shared).skip_normalization();
             // a group with associated types in fields has one member (see `run`)
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
@@ -575,7 +583,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             }
             if def.is_struct() {
                 let v = def.non_enum_variant();
-                let ftys: Vec<String> = v.fields.iter().map(|f| fe.ty(field_ty(f))).collect();
+                let ftys: Vec<String> = v.fields.iter().map(|f| fe.ty(shared_field_ty(f))).collect();
                 let fnames: Vec<String> = (0..v.fields.len()).map(|k| fe.field_name(d, 0, k)).collect();
                 if v.fields.is_empty() {
                     decls.push(format!("{} = make_{}", head, tn));
@@ -598,7 +606,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 let mut ctors = vec![];
                 for (vi, v) in def.variants().iter().enumerate() {
                     let cn = fe.variant_ctor_name(d, vi);
-                    let ftys: Vec<String> = v.fields.iter().map(|f| fe.ty(field_ty(f))).collect();
+                    let ftys: Vec<String> = v.fields.iter().map(|f| fe.ty(shared_field_ty(f))).collect();
                     let args: Vec<String> = ftys.iter().map(|t| cart(t)).collect();
                     ctors.push(if args.is_empty() { cn.clone() } else { format!("{} {}", cn, args.join(" ")) });
                     if !ftys.is_empty() {
@@ -615,13 +623,6 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
         out.push_str(&after);
     }
     out
-}
-
-/// The type of field `f` of the local ADT `d`, without regions, normalised in `d`'s typing
-/// environment: what remains of a projection depends on `d`'s type parameters.
-fn adt_field_ty<'tcx>(tcx: TyCtxt<'tcx>, d: DefId, f: &ty::FieldDef) -> Ty<'tcx> {
-    let t = tcx.erase_and_anonymize_regions(tcx.type_of(f.did).instantiate_identity().skip_normalization());
-    tcx.try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, d), ty::Unnormalized::new_wip(t)).unwrap_or(t)
 }
 
 /// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.
