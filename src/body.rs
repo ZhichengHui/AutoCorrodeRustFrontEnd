@@ -658,7 +658,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 MatchSource::Normal | MatchSource::Postfix => self.match_expr(scrut, arms),
                 _ => unsup("async/await or format_args"),
             },
-            ExprKind::Closure(c) => self.closure(c),
+            ExprKind::Closure(c) => self.closure(e, c),
             ExprKind::Block(b, label) => {
                 if label.is_some() { return unsup("labeled block") }
                 let s = self.block_seq(b.stmts, b.expr)?;
@@ -890,8 +890,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let prim = |t: Ty<'tcx>| Self::int_suffix(t).is_some() || t.is_bool() || t.is_char();
         let builtin = self.typeck.type_dependent_def_id(e.hir_id).is_none();
         if !(prim(lt) && prim(rt)) {
-            // structural equality on types whose PartialEq is derived (or std)
-            if matches!(op, BinOpKind::Eq | BinOpKind::Ne) && self.structural_eq(e) {
+            // structural equality on types whose PartialEq is derived (or std); HOL `=` needs
+            // both operands at the same HOL type (e.g. not `&str == Cow<str>`)
+            if matches!(op, BinOpKind::Eq | BinOpKind::Ne)
+                && self.structural_eq(e)
+                && self.fe.ty_dry(lt).0 == self.fe.ty_dry(rt).0
+            {
                 let lv = self.val(l)?;
                 let rv = self.val(r)?;
                 let (tok, p) = Self::binop_info(op);
@@ -1285,12 +1289,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let dst = Self::peel_refs(this.ty_of(e));
             this.fe.ty(src) == this.fe.ty(dst)
         };
+        // HOL `=` needs both operands at the same HOL type
+        let same_operands = |this: &mut Self| -> bool {
+            if arg_exprs.len() != 2 { return false }
+            let l = Self::peel_refs(this.ty_adj(arg_exprs[0]));
+            let r = Self::peel_refs(this.ty_adj(arg_exprs[1]));
+            this.fe.ty_dry(l).0 == this.fe.ty_dry(r).0
+        };
         let r = match (tk.as_str(), tn.as_str()) {
             ("Clone", "clone") if !target.is_local() || self.derived(target) => Some(a(0)),
-            ("PartialEq", "eq") if !target.is_local() || self.derived(target) => {
+            ("PartialEq", "eq") if (!target.is_local() || self.derived(target)) && same_operands(self) => {
                 Some(Self::mk_bin("==", 44, &a(0), &a(1)))
             }
-            ("PartialEq", "ne") if !target.is_local() || self.derived(target) => {
+            ("PartialEq", "ne") if (!target.is_local() || self.derived(target)) && same_operands(self) => {
                 Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
             }
             ("Ord", "cmp") if !target.is_local() => Some(self.named_call("cmp", vec![a(0), a(1)])),
@@ -2016,7 +2027,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     // Closures
     // ------------------------------------------------------------------
 
-    fn closure(&mut self, c: &'tcx hir::Closure<'tcx>) -> R<Tr> {
+    fn closure(&mut self, e: &'tcx hir::Expr<'tcx>, c: &'tcx hir::Closure<'tcx>) -> R<Tr> {
         if !matches!(c.kind, hir::ClosureKind::Closure) { return unsup("async block / coroutine") }
         // a closure mutates a captured variable iff it captures it by a mutable (or unique) borrow
         for cap in self.typeck.closure_min_captures_flattened(c.def_id) {
@@ -2059,7 +2070,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !b.is_empty() { b.push('\n'); }
         b.push_str(&self.block_expr_inner(body.value)?);
         let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
-        Ok(Tr::new(format!("{} {{\n{}\n}}", head, b), 10))
+        let closure = Tr::new(format!("{} {{\n{}\n}}", head, b), 10);
+        // the closure runs in the monad of the enclosing function: its type is stated, as nothing
+        // else fixes it when it is only passed to a polymorphic external function
+        let t = self.ty_of(e);
+        if !self.fe.has_model(t) {
+            return Ok(closure);
+        }
+        let h = self.fe.ty(t);
+        let tmp = self.fresh("closure");
+        Ok(Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, closure.at(20), tmp, h)))
     }
 }
 

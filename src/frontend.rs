@@ -367,14 +367,19 @@ impl<'tcx> Frontend<'tcx> {
 
     /// Does every part of `t` have a uRust model? Nothing is recorded (no placeholder type).
     pub fn has_model(&mut self, t: Ty<'tcx>) -> bool {
+        self.ty_dry(t).1
+    }
+
+    /// `ty_modelled` without recording anything (placeholder or external types).
+    pub fn ty_dry(&mut self, t: Ty<'tcx>) -> (String, bool) {
         let placeholders = self.placeholders.len();
         let ext_types = self.ext_types.clone();
         let ext_type_ids = self.ext_type_ids.clone();
-        let (_, modelled) = self.ty_modelled(t);
+        let r = self.ty_modelled(t);
         self.placeholders.truncate(placeholders);
         self.ext_types = ext_types;
         self.ext_type_ids = ext_type_ids;
-        modelled
+        r
     }
 
     /// Map a Rust type to a HOL type.
