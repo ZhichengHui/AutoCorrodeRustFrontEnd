@@ -113,6 +113,65 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         out
     };
     let adt_sccs = sccs(&adts, &deps);
+    // a HOL datatype recurs with its own type parameters, in order: a group of ADTs recurring with
+    // other type arguments is a placeholder
+    for comp in &adt_sccs {
+        let nonuniform = comp.iter().any(|&d| {
+            tcx.adt_def(d).all_fields().any(|f| {
+                tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().any(|g| match g.kind() {
+                    ty::GenericArgKind::Type(tt) => match tt.kind() {
+                        ty::Adt(e, args) if comp.contains(&e.did()) => {
+                            let own = ty::GenericArgs::identity_for_item(tcx, e.did());
+                            args.types().collect::<Vec<_>>() != own.types().collect::<Vec<_>>()
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                })
+            })
+        });
+        if nonuniform {
+            for &d in comp {
+                fe.opaque_adts.insert(d, "non-uniformly recursive");
+                let m = fe.placeholder("non-uniformly recursive type (declared as an abstract type)", Some(tcx.def_span(d)));
+                fe.item_comments.push(m);
+            }
+        }
+    }
+    // a shared reference `&T` is a value of `T`, so a type whose every value contains a value of
+    // the same type through shared references (e.g. `struct Node(&'static Node)`, whose values are
+    // cycles of statics) has no finite values, and its HOL datatype (a least fixpoint) is empty.
+    // Least fixpoint of the ADTs with finite values; abstract types (`typedecl`) are not empty.
+    let mut finite: HashSet<DefId> = adts
+        .iter()
+        .copied()
+        .filter(|d| fe.opaque_adts.contains_key(d) || (tcx.adt_def(*d).is_enum() && tcx.adt_def(*d).variants().is_empty()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for &d in &adts {
+            if finite.contains(&d) { continue }
+            let has_finite_value = tcx.adt_def(d).variants().iter().any(|v| {
+                v.fields.iter().all(|f| fe.finite_ty(tcx.type_of(f.did).instantiate_identity().skip_normalization(), &adt_set, &finite))
+            });
+            if has_finite_value {
+                finite.insert(d);
+                changed = true;
+            }
+        }
+        if !changed { break }
+    }
+    for comp in &adt_sccs {
+        if comp.iter().all(|d| finite.contains(d)) { continue }
+        for &d in comp {
+            fe.opaque_adts.insert(d, "without finite values");
+            let m = fe.placeholder(
+                "type without finite values when shared references are values, or recursive with one (declared as an abstract type)",
+                Some(tcx.def_span(d)),
+            );
+            fe.item_comments.push(m);
+        }
+    }
     for comp in &adt_sccs {
         let recursive = comp.len() > 1 || deps(comp[0]).contains(&comp[0]);
         for &d in comp {
@@ -160,7 +219,7 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         let item = tcx.hir_item(id);
         let did = item.owner_id.to_def_id();
         match item.kind {
-            hir::ItemKind::Fn { .. } => bodies.push((did, "fn")),
+            hir::ItemKind::Fn { .. } if !fe.bodiless_intrinsic(did) => bodies.push((did, "fn")),
             hir::ItemKind::Const(..) => bodies.push((did, "const")),
             hir::ItemKind::Static(m, ..) => {
                 if m.is_mut() {
@@ -355,9 +414,13 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -
     };
     let (params, ret): (Vec<(String, bool)>, (String, bool)) = if kind == "fn" {
         let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(did).instantiate_identity().skip_normalization());
+        // an instance's types at its arguments; a generic item's projections normalised in its own
+        // typing environment (e.g. `<Iter<T> as Iterator>::Item` through the impl)
         let at = |t: Ty<'tcx>| match key.1 {
             Some(args) => fe.mono(args, t),
-            None => t,
+            None => tcx
+                .try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, did), ty::Unnormalized::new_wip(t))
+                .unwrap_or(t),
         };
         let ins: Vec<Ty<'tcx>> = sig.inputs().iter().map(|t| at(*t)).collect();
         let out = at(sig.output());
@@ -449,6 +512,9 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
     let tcx = fe.tcx;
     let mut out = String::new();
     for comp in adt_sccs {
+        if comp.iter().any(|d| fe.opaque_adts.contains_key(d)) {
+            continue;
+        }
         let mut decls = vec![];
         let mut after = String::new();
         for &d in comp {
@@ -751,8 +817,10 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
         if t.arity == 0 {
             writeln!(te, "(* {} *)\ntypedecl {}\n", cmt(&t.comment), n).unwrap();
         } else {
-            // a one-constructor datatype (a BNF): recursive types may be nested through it
-            let vs: Vec<String> = (0..t.arity).map(|i| format!("'t{}", i)).collect();
+            // a one-constructor datatype (a BNF): recursive types may be nested through it. It holds
+            // a list of values of each type argument, as an external container may hold none
+            // (otherwise a type recursive through it, e.g. a tree of `HashMap`s, would be empty).
+            let vs: Vec<String> = (0..t.arity).map(|i| format!("\\<open>'t{} list\\<close>", i)).collect();
             writeln!(te, "(* {} *)\ndatatype {}{} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
         }
     }

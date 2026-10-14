@@ -194,11 +194,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// Translate an expression used as a whole body (no braces).
     fn block_expr_inner(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<String> {
         match e.kind {
-            ExprKind::Block(b, None) if self.typeck.expr_adjustments(e).is_empty() => self.block_seq(b.stmts, b.expr),
-            _ => {
-                let t = self.expr(e);
-                Ok(t.s)
+            // `NeverToAny` (of a block of type `!`) does not change the value; `block_seq` handles
+            // the divergence inside the block
+            ExprKind::Block(b, None) if self.typeck.expr_adjustments(e).iter().all(|a| matches!(a.kind, Adjust::NeverToAny)) => {
+                self.block_seq(b.stmts, b.expr)
             }
+            // as a block with only this tail (a diverging expression is followed by a panic)
+            _ => self.block_seq(&[], Some(e)),
         }
     }
 
@@ -233,13 +235,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     return Ok(join_seq(parts));
                 }
                 StmtKind::Expr(e) | StmtKind::Semi(e) => {
-                    let t = self.ty_of(e);
-                    let s = self.stmt_expr(e);
-                    if t.is_never() {
-                        self.push_diverging(&mut parts, s);
+                    if self.ty_of(e).is_never() {
+                        self.diverging(&mut parts, e);
                         ended_by_divergence = true;
                         break;
                     }
+                    let s = self.stmt_expr(e);
                     parts.push(s);
                 }
             }
@@ -247,11 +248,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         if !ended_by_divergence {
             if let Some(t) = tail {
-                let tt = self.expr(t);
                 if self.ty_of(t).is_never() {
-                    let s = if tt.s.ends_with(';') { tt.s.clone() } else { format!("{};", tt.at(11)) };
-                    self.push_diverging(&mut parts, s);
+                    self.diverging(&mut parts, t);
                 } else {
+                    let tt = self.expr(t);
                     parts.push(format!("\u{3}{}", tt.s)); // \u{3} marks a tail expression
                 }
             }
@@ -264,34 +264,40 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(if s.trim().is_empty() { "()".to_string() } else { s })
     }
 
-    /// A statement of type `!`. In uRust a loop, `if` or `match` whose branches all leave the
-    /// function still has type `unit`, so the statement is followed by a panic that is reached
-    /// only when the fuel of a loop is exhausted. A placeholder becomes the value of the block.
-    fn push_diverging(&self, parts: &mut Vec<String>, s: String) {
-        let body = s.trim_start_matches('\u{4}');
-        if body.starts_with("unimplemented!") || body.starts_with("panic!") {
-            parts.push(format!("\u{3}{}", body.trim_end_matches(';')));
-        } else if body.starts_with("return") {
-            parts.push(s);
-        } else {
-            parts.push(s);
-            parts.push("\u{3}panic!(\"unreachable: diverging expression completed\")".to_string());
+    /// A statement (or block tail) `e` of type `!`. In uRust a loop, `if` or `match` whose branches
+    /// all leave the function still has type `unit`, so the statement is followed by a panic that
+    /// is reached only when the fuel of a loop is exhausted. A panic or placeholder becomes the
+    /// value of the block.
+    fn diverging(&mut self, parts: &mut Vec<String>, e: &'tcx hir::Expr<'tcx>) {
+        let tr = self.expr(e);
+        if tr.s.starts_with("unimplemented!") || tr.s.starts_with("panic!") {
+            parts.push(format!("\u{3}{}", tr.s));
+            return;
         }
+        // a `return` that is translated (not a placeholder) leaves the function
+        if matches!(e.kind, ExprKind::Ret(_)) && tr.s.starts_with("return") {
+            // \u{4}: ends with its own semicolon
+            parts.push(if tr.s.ends_with(';') { format!("\u{4}{}", tr.s) } else { format!("{};", tr.s) });
+            return;
+        }
+        // the value is discarded: a panic or `return` inside it has any type, which would be an
+        // extra type variable of the definition (a `TYPE` argument of the constant). `!` is
+        // `unit` (see `Frontend::ty`); a loop has type `unit` already
+        if matches!(e.kind, ExprKind::Loop(..)) {
+            parts.push(format!("{};", tr.at(11)));
+        } else {
+            let d = self.fresh("never");
+            parts.push(format!("{{ let {} = {}; \\<llangle>{} :: unit\\<rrangle> }};", d, tr.at(20), d));
+        }
+        parts.push("\u{3}panic!(\"unreachable: diverging expression completed\")".to_string());
     }
 
     /// An expression in statement position, rendered as a complete statement.
+    /// An expression statement of a type other than `!` (see `diverging`).
     fn stmt_expr(&mut self, e: &'tcx hir::Expr<'tcx>) -> String {
         let t = self.ty_of(e);
-        match e.kind {
-            ExprKind::Ret(_) => {
-                let tr = self.expr(e);
-                if tr.s.ends_with(';') { return format!("\u{4}{}", tr.s) } // \u{4}: ends with own semicolon
-                return format!("{};", tr.s);
-            }
-            _ => {}
-        }
         let tr = self.expr(e);
-        if Self::is_unit_like(t) || tr.s.starts_with("unimplemented!") {
+        if t.is_unit() || tr.s.starts_with("unimplemented!") {
             format!("{};", tr.at(11))
         } else {
             format!("let _ = {};", tr.at(20))
@@ -422,7 +428,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Read field `fidx` of a value of local struct `adt`.
+    /// A local ADT with no HOL datatype (see `Frontend::opaque_adts`): its values are opaque.
+    fn opaque_adt(&self, adt: DefId) -> R<()> {
+        if let Some(why) = self.fe.opaque_adts.get(&adt) {
+            return unsup(format!("value of the type `{}` ({})", self.tcx.item_name(adt), why));
+        }
+        Ok(())
+    }
+
     fn field_read(&mut self, adt: DefId, fidx: usize, v: &Tr) -> R<Tr> {
+        self.opaque_adt(adt)?;
         let f = self.fe.field_name(adt, 0, fidx);
         if self.fe.record_adts.contains(&adt) {
             Ok(Tr::new(format!("{}.{}", v.at(99), f), 100))
@@ -560,6 +575,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     ty::Adt(def, _) if def.is_struct() && def.did().is_local() => {
                         let fidx = self.typeck.field_index(e.hir_id).as_usize();
                         let adt = def.did();
+                        self.opaque_adt(adt)?;
                         let f = self.fe.field_name(adt, 0, fidx);
                         if !self.fe.record_adts.contains(&adt) {
                             return match bpv {
@@ -603,7 +619,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     ty::Adt(def, _) => self.fe.std_adt(def.did()) == Some("Vec"),
                     _ => false,
                 };
-                if !list_like { return unsup(format!("indexing into `{}`", bt)) }
+                if !list_like {
+                    // `base[idx]` on a local type is `*Index::index(&base, idx)`, or
+                    // `*IndexMut::index_mut(&mut base, idx)` in a mutable place; the borrow of the
+                    // base is its adjustment, the method resolves to the local implementation
+                    let local_adt = matches!(bt.kind(), ty::Adt(def, _) if def.did().is_local());
+                    if !local_adt { return unsup(format!("indexing into `{}`", bt)) }
+                    let did = self.typeck.type_dependent_def_id(e.hir_id).expect("overloaded indexing has a method");
+                    let gargs = self.node_args(e.hir_id);
+                    let argv = vec![self.val(base)?, self.val(idx)?];
+                    let r = self.call_def(did, gargs, argv, &[base, idx], e)?;
+                    let is_mut = self.tcx.trait_of_assoc(did) == self.tcx.lang_items().index_mut_trait();
+                    return Ok(if is_mut { PV::Ref(r) } else { PV::Val(r) });
+                }
                 let is_range = matches!(Self::peel_refs(self.ty_adj(idx)).kind(), ty::Adt(..));
                 let mut bpv = self.pv_adjusted(base)?;
                 // overloaded `Index(Mut)` auto-borrows the base: go back to the place
@@ -686,6 +714,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 MatchSource::TryDesugar(_) => {
                     let ExprKind::Call(_, [inner]) = scrut.kind else { return unsup("`?` desugaring") };
                     let v = self.val(inner)?;
+                    if let Some(t) = self.try_error_conversion(inner, arms, &v)? {
+                        return Ok(t);
+                    }
                     Ok(Tr::new(format!("{}?", v.at(400)), 400))
                 }
                 MatchSource::Normal | MatchSource::Postfix => self.match_expr(scrut, arms),
@@ -825,6 +856,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn unit_ctor(&mut self, adt: DefId, vidx: usize) -> R<Tr> {
+        self.opaque_adt(adt)?;
         match self.fe.std_adt(adt) {
             Some("Option") => return Ok(Tr::atom("None")),
             Some("Ordering") => {
@@ -1090,16 +1122,31 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             Res::Local(hid) => {
                 let Some(l) = self.locals.get(&hid).cloned() else { return unsup("call of unknown local") };
-                if l.cell { return unsup("call of a closure stored in a mutable local") }
-                if !matches!(Self::peel_refs(self.ty_of(callee)).kind(), ty::Closure(..)) {
+                let mut t = self.ty_of(callee);
+                if !matches!(Self::peel_refs(t).kind(), ty::Closure(..)) {
                     return unsup("call through a generic `Fn` parameter (trait call in generic code)");
                 }
+                // the closure value is read out of the local's cell and through the references
+                // to it; closures never mutate their captures (see `closure`), so a call does not
+                // change the value
+                let mut pv = if l.cell { PV::Ref(Tr::atom(l.name.clone())) } else { PV::Val(Tr::atom(l.name.clone())) };
+                while let ty::Ref(_, inner, _) = *t.kind() {
+                    pv = self.deref_pv(pv, t)?;
+                    t = inner;
+                }
+                let fv = self.to_val(pv);
                 let mut argv = vec![];
                 for a in args { argv.push(self.val(a)?.at(11)); }
-                if argv.is_empty() { Ok(Tr::new(format!("{}()", l.name), 999)) } else {
-                    if argv.len() > 8 { return unsup("call with more than 8 arguments") }
-                    Ok(Tr::new(format!("{}({})", l.name, argv.join(", ")), 999))
-                }
+                if argv.len() > 8 { return unsup("call with more than 8 arguments") }
+                let (bind, f) = if fv.s == l.name { (None, l.name) } else {
+                    let f = self.fresh("clo");
+                    (Some(format!("let {} = {}; ", f, fv.at(20))), f)
+                };
+                let call = format!("{}({})", f, argv.join(", "));
+                Ok(match bind {
+                    None => Tr::new(call, 999),
+                    Some(b) => Tr::atom(format!("{{ {}{} }}", b, call)),
+                })
             }
             _ => unsup("call target"),
         }
@@ -1153,6 +1200,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn ctor_call(&mut self, adt: DefId, vidx: usize, argv: Vec<Tr>) -> R<Tr> {
+        self.opaque_adt(adt)?;
         if let Some(k) = self.fe.std_adt(adt) {
             let vname = self.tcx.adt_def(adt).variant(vidx.into()).name.to_string();
             return match (k, vname.as_str()) {
@@ -1255,7 +1303,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if let Some(t) = self.std_call(did, target, argv.clone(), arg_exprs, e)? {
             return Ok(t);
         }
-        if target.is_local() {
+        if target.is_local() && !self.fe.bodiless_intrinsic(target) {
             return unsup(format!("call of `{}`", self.tcx.def_path_str(target)));
         }
         let n = self.fe.ext_fun(target, false);
@@ -1263,7 +1311,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // a type variable of the template's result that occurs in no parameter (e.g. of `into`,
         // `collect`) is not determined by the call: the known type of the result is stated
         let t = self.ty_of(e);
-        if Self::result_undetermined(self.tcx, target) && !t.is_never() && self.fe.has_model(t) {
+        if Self::result_undetermined(self.tcx, target) && !t.is_never() {
             let h = self.fe.ty(t);
             let tmp = self.fresh("res");
             return Ok(Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, call.at(20), tmp, h)));
@@ -1315,6 +1363,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     ) -> R<Option<Tr>> {
         // the table covers standard library functions and derived methods
         if !(self.fe.is_std(target) || self.derived(target)) {
+            return Ok(None);
+        }
+        // its uRust counterparts need the types' models (e.g. `cmp` needs an order); with an
+        // argument or result of a type without one, the external template is called instead
+        let mut tys: Vec<Ty<'tcx>> = arg_exprs.iter().map(|a| Self::peel_refs(self.ty_adj(a))).collect();
+        tys.push(Self::peel_refs(self.ty_of(e)));
+        if !tys.into_iter().all(|t| self.fe.has_model(t)) {
             return Ok(None);
         }
         let (tk, tn) = self.std_key(orig);
@@ -1427,6 +1482,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup(format!("struct expression of `{}`", t));
         }
         if !adt.is_local() || def.is_union() { return unsup(format!("struct expression of `{}`", t)) }
+        self.opaque_adt(adt)?;
         let res = self.typeck.qpath_res(qp, e.hir_id);
         let variant = def.variant_of_res(res);
         let vidx = def.variants().iter().position(|v| v.def_id == variant.def_id).expect("variant of its ADT");
@@ -1528,6 +1584,56 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
+    /// `e?` on a `Result` whose error type differs from the one returned: Rust converts the error
+    /// with `From::from`, which uRust's `?` does not; the conversion is made explicit.
+    fn try_error_conversion(&mut self, inner: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>], v: &Tr) -> R<Option<Tr>> {
+        // the `Break` arm of the desugaring returns the function's result type
+        let Some(ret) = arms.iter().find_map(|a| match a.body.kind {
+            ExprKind::Ret(Some(r)) => Some(r),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let from = Self::peel_refs(self.ty_adj(inner));
+        let to = self.ty_of(ret);
+        let (ty::Adt(fd, fa), ty::Adt(td, ta)) = (from.kind(), to.kind()) else { return Ok(None) };
+        if self.fe.std_adt(fd.did()) != Some("Result") || self.fe.std_adt(td.did()) != Some("Result") {
+            return Ok(None);
+        }
+        let (e1, e2) = (fa.type_at(1), ta.type_at(1));
+        if e1 == e2 {
+            return Ok(None);
+        }
+        let Some(from_fn) = self.tcx.lang_items().get(LangItem::FromFn) else { return unsup("`?` with an error conversion") };
+        let args = self.tcx.mk_args(&[e2.into(), e1.into()]);
+        let err = self.fresh("err");
+        let conv = match ty::Instance::try_resolve(self.tcx, self.typing_env(), from_fn, args) {
+            Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) if self.fe.local_fn_with_body(rd) => {
+                self.local_call(rd, rargs, vec![Tr::atom(err.clone())])?
+            }
+            Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) => {
+                let n = self.fe.ext_fun(rd, false);
+                let call = self.named_call(&n, vec![Tr::atom(err.clone())]);
+                let h = self.fe.ty(e2);
+                let tmp = self.fresh("res");
+                Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, call.at(20), tmp, h))
+            }
+            _ => return unsup("`?` with an unresolved error conversion"),
+        };
+        let ok = self.fresh("ok");
+        Ok(Some(Tr::new(
+            format!(
+                "match {} {{\n  Ok({}) \\<Rightarrow> {},\n  Err({}) \\<Rightarrow> {{ return Err({}); }}\n}}",
+                v.at(20),
+                ok,
+                ok,
+                err,
+                conv.at(11)
+            ),
+            20,
+        )))
+    }
+
     fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, src: LoopSource) -> R<Tr> {
         if !Self::is_unit_like(self.ty_of(e)) {
             return unsup("loop producing a value (`break` with a value)");
@@ -1544,9 +1650,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let mut body = p.prologue.join("\n");
                     if !body.is_empty() { body.push('\n'); }
                     body.push_str(&self.branch(then)?);
-                    // a pattern condition would need `break` to leave the loop
-                    if !p.conds.is_empty() { return unsup("`while let` with literal or range sub-patterns") }
-                    return Ok(Tr::new(format!("{} while let {} = {} {{\n{}\n}}", FUEL, p.pat, iv.at(20), body), 11));
+                    let tuple = matches!(le.pat.kind, PatKind::Tuple(..));
+                    if p.conds.is_empty() && !tuple {
+                        return Ok(Tr::new(format!("{} while let {} = {} {{\n{}\n}}", FUEL, p.pat, iv.at(20), body), 11));
+                    }
+                    // uRust's `while let` takes no pattern conditions and only variables in a tuple
+                    // pattern; without `break`, a flag ends the loop when the pattern fails
+                    self.alloc(self.tcx.types.bool)?;
+                    let go = self.fresh("go");
+                    let guard = if p.conds.is_empty() { String::new() } else { format!(" if {}", p.conds.join(" && ")) };
+                    return Ok(Tr::atom(format!(
+                        "{{\nlet mut {go} = true;\n{FUEL} while *{go} {{\nmatch {} {{\n  {}{} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{ *{go} = false; }}\n}};\n}}\n}}",
+                        iv.at(20),
+                        p.pat,
+                        guard,
+                        body
+                    )));
                 }
                 if contains_let(cond) { return unsup("`let` chain in `while` condition") }
                 let cv = self.val(cond)?;
@@ -1562,10 +1681,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Is `e` a call of the standard library's `<[T]>::iter` (also through `Vec` and arrays)?
-    fn is_slice_iter(&self, e: &hir::Expr<'tcx>) -> bool {
+    /// Is `e` a call of the standard library's slice method `name` (e.g. `iter`), also through
+    /// `Vec` and arrays?
+    fn is_slice_method(&self, e: &hir::Expr<'tcx>, name: &str) -> bool {
         let ExprKind::MethodCall(_, _, [], _) = e.kind else { return false };
         let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return false };
-        self.fe.is_std(did) && self.std_key(did) == ("slice".to_string(), "iter".to_string())
+        self.fe.is_std(did) && self.std_key(did) == ("slice".to_string(), name.to_string())
     }
 
     fn for_loop(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
@@ -1593,12 +1714,28 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some((some_arm, pat)) = some else { return unsup("for-loop desugaring") };
         // the iterable: a range, slice, array or Vec is iterated by a uRust `for` loop
         let ht = self.ty_of(head);
+        let list_like = |this: &Self, t: Ty<'tcx>| match Self::peel_refs(t).kind() {
+            ty::Slice(_) | ty::Array(..) => true,
+            ty::Adt(def, _) => this.fe.std_adt(def.did()) == Some("Vec"),
+            _ => false,
+        };
+        // over `&mut` of a slice, array or Vec (or `xs.iter_mut()`) the items are references to
+        // the elements: AutoCorrode's `iter_mut`
+        let mut_items = match ht.kind() {
+            ty::Ref(_, inner, m) if m.is_mut() && list_like(self, *inner) => Some(self.val(head)?),
+            _ if self.is_slice_method(head, "iter_mut") => {
+                let ExprKind::MethodCall(_, recv, [], _) = head.kind else { unreachable!() };
+                Some(self.val(recv)?)
+            }
+            _ => None,
+        };
         let iter_s = match Self::peel_refs(ht).kind() {
+            _ if let Some(r) = mut_items => Tr::new(format!("iter_mut({})", r.at(11)), 999),
             ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Range") | Some("RangeInclusive")) => self.val(head)?,
             ty::Adt(def, _) if self.fe.std_adt(def.did()) == Some("Vec") => self.val(head)?,
             ty::Slice(_) | ty::Array(..) => self.val(head)?,
             // `xs.iter()` over a slice, array or Vec: iterate over `xs`
-            _ if self.is_slice_iter(head) => {
+            _ if self.is_slice_method(head, "iter") => {
                 let ExprKind::MethodCall(_, recv, [], _) = head.kind else { unreachable!() };
                 self.val(recv)?
             }
@@ -2049,6 +2186,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn ctor_pat(&mut self, adt: DefId, vidx: usize, parts: Vec<String>) -> R<String> {
+        self.opaque_adt(adt)?;
         let name = match self.fe.std_adt(adt) {
             Some("Option") | Some("Result") | Some("Ordering") => self.tcx.adt_def(adt).variant(vidx.into()).name.to_string(),
             Some("Box") => return parts.into_iter().next().ok_or(Unsup("box pattern".into())),
@@ -2108,12 +2246,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
         let closure = Tr::new(format!("{} {{\n{}\n}}", head, b), 10);
         // the closure runs in the monad of the enclosing function: its type is stated, as nothing
-        // else fixes it when it is only passed to a polymorphic external function
-        let t = self.ty_of(e);
-        if !self.fe.has_model(t) {
-            return Ok(closure);
-        }
-        let h = self.fe.ty(t);
+        // else fixes it when it is only passed to a polymorphic external function (placeholder
+        // types are declared HOL types, so they may occur in it)
+        let h = self.fe.ty(self.ty_of(e));
         let tmp = self.fresh("closure");
         Ok(Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, closure.at(20), tmp, h)))
     }

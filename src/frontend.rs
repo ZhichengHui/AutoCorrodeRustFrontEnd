@@ -93,6 +93,11 @@ pub struct Frontend<'tcx> {
     pub pending: Vec<FnKey<'tcx>>,
     /// Local ADTs (structs/enums) that are translated.
     pub adts: Vec<DefId>,
+    /// Local ADTs that no HOL datatype expresses, with the reason: they recur with other type
+    /// arguments than their own parameters (e.g. `enum E<A, B> { V(Box<E<B, A>>) }`), or have no
+    /// finite values once shared references are values (e.g. `struct Node(&'static Node)`), or
+    /// are in a recursive group with such a type. They are placeholders.
+    pub opaque_adts: HashMap<DefId, &'static str>,
     /// Structs translated as `datatype_record` (have lenses).
     pub record_adts: HashSet<DefId>,
     /// Local ADTs that contain `&mut` references (directly or through other ADTs):
@@ -144,6 +149,7 @@ impl<'tcx> Frontend<'tcx> {
             instances_per_fn: HashMap::new(),
             pending: Vec::new(),
             adts: Vec::new(),
+            opaque_adts: HashMap::new(),
             record_adts: HashSet::new(),
             ref_adts: HashSet::new(),
             alias_tvars: None,
@@ -452,6 +458,19 @@ impl<'tcx> Frontend<'tcx> {
         r
     }
 
+    /// Does the HOL type of `t` (see `ty`) have a finite value, given the local ADTs `local` of
+    /// which those in `finite` are known to? `&T` and `Box<T>` are `T`; every other type (lists,
+    /// options, references `&mut`, type variables, abstract types) has one.
+    pub fn finite_ty(&self, t: Ty<'tcx>, local: &HashSet<DefId>, finite: &HashSet<DefId>) -> bool {
+        match t.kind() {
+            ty::Ref(_, inner, m) if !m.is_mut() => self.finite_ty(*inner, local, finite),
+            ty::Tuple(ts) => ts.iter().all(|x| self.finite_ty(x, local, finite)),
+            ty::Adt(def, _) if local.contains(&def.did()) => finite.contains(&def.did()),
+            ty::Adt(def, args) if self.std_adt(def.did()) == Some("Box") => self.finite_ty(args.type_at(0), local, finite),
+            _ => true,
+        }
+    }
+
     /// Map a Rust type to a HOL type.
     pub fn ty(&mut self, t: Ty<'tcx>) -> String {
         match t.kind() {
@@ -502,7 +521,10 @@ impl<'tcx> Frontend<'tcx> {
                         format!("{} range", paren_ty(&self.ty(targs[0])))
                     }
                     _ => {
-                        let name = if did.is_local() && !def.is_union() {
+                        let name = if let Some(&why) = self.opaque_adts.get(&did) {
+                            let n = self.tcx.item_name(did);
+                            self.placeholder_type(&format!("{} {}", why, n), targs.len())
+                        } else if did.is_local() && !def.is_union() {
                             self.adt_name(did)
                         } else if did.is_local() {
                             self.placeholder_type(&format!("union {}", self.tcx.item_name(did)), targs.len())
@@ -510,7 +532,7 @@ impl<'tcx> Frontend<'tcx> {
                             self.ext_type(did, targs.len())
                         };
                         let mut a: Vec<String> = vec![];
-                        if self.ref_adts.contains(&did) {
+                        if self.ref_adts.contains(&did) && !self.opaque_adts.contains_key(&did) {
                             a.push("'addr".into());
                             a.push("'gv".into());
                         }
@@ -523,7 +545,9 @@ impl<'tcx> Frontend<'tcx> {
             ty::FnPtr(..) => self.placeholder_type("fn_pointer", 0),
             ty::Dynamic(..) => self.placeholder_type("dyn_trait", 0),
             ty::Alias(..) => {
-                // associated-type projections that can be resolved (e.g. `<V2 as Add>::Output`)
+                // associated-type projections that can be resolved (e.g. `<V2 as Add>::Output`); lifetime
+                // parameters do not matter (HOL has no regions), so they are erased first
+                let t = self.tcx.erase_and_anonymize_regions(t);
                 if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
                     if !matches!(n.kind(), ty::Alias(..)) {
                         return self.ty(n);
@@ -626,6 +650,13 @@ impl<'tcx> Frontend<'tcx> {
         let Some(ld) = did.as_local() else { return false };
         matches!(self.tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn)
             && self.tcx.hir_maybe_body_owned_by(ld).is_some()
+            && !self.bodiless_intrinsic(did)
+    }
+
+    /// A local intrinsic declared without a body (rustc gives it a placeholder body): it is
+    /// external, like a function of another crate.
+    pub fn bodiless_intrinsic(&self, did: DefId) -> bool {
+        self.tcx.intrinsic(did).is_some_and(|i| i.must_be_overridden)
     }
 
     pub fn is_trait_item(&self, did: DefId) -> bool {
