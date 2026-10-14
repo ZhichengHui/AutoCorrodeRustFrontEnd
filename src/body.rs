@@ -18,7 +18,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeckResults};
-use rustc_span::Span;
+use rustc_span::{Span, Symbol, sym};
 
 use crate::frontend::Frontend;
 use crate::names;
@@ -1344,22 +1344,57 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         params_of(sig.output()).iter().any(|x| matches!(x.kind(), ty::Alias(..)) || !in_inputs.contains(x))
     }
 
-    /// Key used for the standard library table: (type or trait name, item name).
-    fn std_key(&self, did: DefId) -> (String, String) {
-        let name = self.tcx.item_name(did).to_string();
-        let parent = self.tcx.parent(did);
-        let owner = match self.tcx.def_kind(parent) {
-            DefKind::Impl { .. } => {
-                if let Some(tr) = self.tcx.impl_opt_trait_ref(parent) {
-                    self.tcx.item_name(tr.skip_binder().def_id).to_string()
-                } else {
-                    self.fe.short_ty_name(self.tcx.type_of(parent).instantiate_identity().skip_normalization())
-                }
+    /// Which of the standard library functions with a uRust counterpart `did` is: by its own lang or
+    /// diagnostic item, or else as a method of an owner the compiler identifies (a conversion trait
+    /// by its diagnostic item, or the type of an inherent impl: a standard ADT by its lang or
+    /// diagnostic item, a slice, an unsigned integer). Only the standard library has inherent
+    /// impls of primitive types.
+    fn std_fn(&self, did: DefId) -> Option<StdFn> {
+        let tcx = self.tcx;
+        if let Some(&(_, f)) = STD_ITEMS.iter().find(|(i, _)| match *i {
+            Item::Lang(l) => tcx.is_lang_item(did, l),
+            Item::Diag(s) => tcx.is_diagnostic_item(Symbol::intern(s), did),
+        }) {
+            return Some(f);
+        }
+        let parent = tcx.parent(did);
+        let owner = match tcx.def_kind(parent) {
+            // `Into::into`, `AsRef::as_ref`, `Borrow::borrow` are their traits' only methods
+            DefKind::Trait => {
+                return [sym::Into, sym::AsRef, sym::Borrow]
+                    .into_iter()
+                    .any(|t| tcx.is_diagnostic_item(t, parent))
+                    .then_some(StdFn::Conversion);
             }
-            DefKind::Trait => self.tcx.item_name(parent).to_string(),
-            _ => self.tcx.opt_item_name(parent).map(|s| s.to_string()).unwrap_or_default(),
+            DefKind::Impl { of_trait: false } => match tcx.type_of(parent).instantiate_identity().skip_normalization().kind() {
+                ty::Adt(def, _) => self.fe.std_adt(def.did())?,
+                ty::Slice(_) => "slice",
+                ty::Uint(u) if *u != ty::UintTy::U128 => "uint",
+                _ => return None,
+            },
+            _ => return None,
         };
-        (owner, name)
+        use StdFn::*;
+        Some(match (owner, tcx.item_name(did).as_str()) {
+            ("Option", "is_some") => OptionIsSome,
+            ("Option", "is_none") => OptionIsNone,
+            ("Option", "ok_or") => OptionOkOr,
+            ("Option", "take") => OptionTake,
+            ("Result", "unwrap") => ResultUnwrap,
+            ("Result", "expect") => ResultExpect,
+            ("Result", "is_ok") => ResultIsOk,
+            ("Result", "is_err") => ResultIsErr,
+            ("Result", "unwrap_or") => ResultUnwrapOr,
+            ("Vec" | "slice", "len") => Len,
+            ("slice", "iter_mut") => SliceIterMut,
+            ("slice", "into_vec" | "to_vec") => ToVec,
+            ("uint", "checked_add") => Uint("checked_add"),
+            ("uint", "checked_mul") => Uint("checked_mul"),
+            ("uint", "saturating_sub") => Uint("saturating_sub"),
+            ("uint", "wrapping_add") => Uint("wrapping_add_unsigned"),
+            ("uint", "div_ceil") => Uint("div_ceil"),
+            _ => return None,
+        })
     }
 
     fn std_call(
@@ -1374,7 +1409,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !(self.fe.is_std(target) || self.derived(target)) {
             return Ok(None);
         }
-        let (tk, tn) = self.std_key(orig);
+        let Some(f) = self.std_fn(orig) else { return Ok(None) };
         let a = |i: usize| -> Tr { argv[i].clone() };
         let same_hol = |this: &mut Self| -> bool {
             if arg_exprs.is_empty() { return false }
@@ -1389,48 +1424,34 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let r = this.ty_adj(arg_exprs[1]).peel_refs();
             this.fe.ty_dry(l).0 == this.fe.ty_dry(r).0
         };
-        let r = match (tk.as_str(), tn.as_str()) {
-            ("Clone", "clone") => Some(a(0)),
-            ("PartialEq", "eq") if same_operands(self) => Some(Self::mk_bin("==", 44, &a(0), &a(1))),
-            ("PartialEq", "ne") if same_operands(self) => Some(Self::mk_bin("!=", 44, &a(0), &a(1))),
+        use StdFn::*;
+        let r = match f {
+            Clone => Some(a(0)),
+            Eq if same_operands(self) => Some(Self::mk_bin("==", 44, &a(0), &a(1))),
+            Ne if same_operands(self) => Some(Self::mk_bin("!=", 44, &a(0), &a(1))),
             // AutoCorrode's `cmp` needs an `order` on the operands' HOL type
-            ("Ord", "cmp") if !target.is_local() && self.hol_ordered(self.ty_adj(arg_exprs[0]).peel_refs()) => {
+            Cmp if !target.is_local() && self.hol_ordered(self.ty_adj(arg_exprs[0]).peel_refs()) => {
                 Some(self.named_call("cmp", vec![a(0), a(1)]))
             }
-            ("Option", "unwrap") => Some(self.named_call("option_unwrap", vec![a(0)])),
-            ("Option", "expect") => Some(self.named_call("option_expect", vec![a(0), a(1)])),
-            ("Option", "is_some") => Some(self.named_call("urust_func_option_is_some", vec![a(0)])),
-            ("Option", "is_none") => Some(self.named_call("urust_func_option_is_none", vec![a(0)])),
-            ("Option", "ok_or") => Some(self.named_call("ok_or", vec![a(0), a(1)])),
-            ("Option", "take") => Some(self.named_call("take_mut_ref_option", vec![a(0)])),
-            ("Result", "unwrap") => Some(self.named_call("result_unwrap", vec![a(0)])),
-            ("Result", "expect") => Some(self.named_call("result_expect", vec![a(0), a(1)])),
-            ("Result", "is_ok") => Some(self.named_call("urust_func_result_is_ok", vec![a(0)])),
-            ("Result", "is_err") => Some(self.named_call("urust_func_result_is_err", vec![a(0)])),
-            ("Result", "ok") => Some(self.named_call("ok", vec![a(0)])),
-            ("Result", "unwrap_or") => Some(self.named_call("result_unwrap_or", vec![a(0), a(1)])),
-            ("Vec", "len") | ("slice", "len") | ("array", "len") => Some(self.named_call("len", vec![a(0)])),
-            ("Vec", "new") | ("Vec", "with_capacity") if argv.len() <= 1 => Some(Tr::atom("[]")),
-            ("slice", "into_vec") | ("slice", "to_vec") => Some(a(0)),
-            ("Box", "new") => Some(a(0)),
-            ("mem", "drop") => Some(Tr::atom(format!("{{ let _ = {}; () }}", a(0).s))),
-            ("RangeInclusive", "new") => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
-            ("ToString", "to_string") | ("ToOwned", "to_owned") | ("From", "from") | ("Into", "into")
-            | ("String", "from") | ("AsRef", "as_ref") | ("Borrow", "borrow") | ("Vec", "as_slice")
-            | ("String", "as_str") | ("slice", "iter") | ("Vec", "iter")
-                if same_hol(self) =>
-            {
-                Some(a(0))
-            }
-            (k, "checked_add") | (k, "checked_mul") | (k, "saturating_sub") | (k, "wrapping_add") | (k, "div_ceil")
-                if matches!(k, "u8" | "u16" | "u32" | "u64" | "usize") =>
-            {
-                let f = match tn.as_str() {
-                    "wrapping_add" => "wrapping_add_unsigned",
-                    x => x,
-                };
-                Some(self.named_call(f, vec![a(0), a(1)]))
-            }
+            OptionUnwrap => Some(self.named_call("option_unwrap", vec![a(0)])),
+            OptionExpect => Some(self.named_call("option_expect", vec![a(0), a(1)])),
+            OptionIsSome => Some(self.named_call("urust_func_option_is_some", vec![a(0)])),
+            OptionIsNone => Some(self.named_call("urust_func_option_is_none", vec![a(0)])),
+            OptionOkOr => Some(self.named_call("ok_or", vec![a(0), a(1)])),
+            OptionTake => Some(self.named_call("take_mut_ref_option", vec![a(0)])),
+            ResultUnwrap => Some(self.named_call("result_unwrap", vec![a(0)])),
+            ResultExpect => Some(self.named_call("result_expect", vec![a(0), a(1)])),
+            ResultIsOk => Some(self.named_call("urust_func_result_is_ok", vec![a(0)])),
+            ResultIsErr => Some(self.named_call("urust_func_result_is_err", vec![a(0)])),
+            ResultOk => Some(self.named_call("ok", vec![a(0)])),
+            ResultUnwrapOr => Some(self.named_call("result_unwrap_or", vec![a(0), a(1)])),
+            Len => Some(self.named_call("len", vec![a(0)])),
+            VecNew => Some(Tr::atom("[]")),
+            ToVec | BoxNew => Some(a(0)),
+            Drop => Some(Tr::atom(format!("{{ let _ = {}; () }}", a(0).s))),
+            RangeInclusiveNew => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
+            Conversion | SliceIter if same_hol(self) => Some(a(0)),
+            Uint(op) => Some(self.named_call(op, vec![a(0), a(1)])),
             _ => None,
         };
         Ok(r)
@@ -1487,7 +1508,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let mut en = None;
                 for f in fields {
                     let v = self.val(f.expr)?;
-                    if f.ident.as_str() == "start" { st = Some(v) } else { en = Some(v) }
+                    // the fields `a..b` is lowered to (`Range { start: a, end: b }`)
+                    if f.ident.name == sym::start { st = Some(v) } else { en = Some(v) }
                 }
                 let (Some(a), Some(b)) = (st, en) else { return unsup("range") };
                 return Ok(Tr::new(format!("{} .. {}", a.at(42), b.at(42)), 41));
@@ -1687,12 +1709,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// The receiver of `e` if it is a call (without further arguments) of the standard library's
-    /// slice method `name` (e.g. `iter`), also through `Vec` and arrays.
-    fn slice_method_recv(&self, e: &'tcx hir::Expr<'tcx>, name: &str) -> Option<&'tcx hir::Expr<'tcx>> {
+    /// The receiver of `e` if it is a call (without further arguments) of the standard library
+    /// function `f` (e.g. the slice method `iter`, also through `Vec` and arrays).
+    fn std_method_recv(&self, e: &'tcx hir::Expr<'tcx>, f: StdFn) -> Option<&'tcx hir::Expr<'tcx>> {
         let ExprKind::MethodCall(_, recv, [], _) = e.kind else { return None };
         let did = self.typeck.type_dependent_def_id(e.hir_id)?;
-        (self.fe.is_std(did) && self.std_key(did) == ("slice".to_string(), name.to_string())).then_some(recv)
+        (self.std_fn(did) == Some(f)).then_some(recv)
     }
 
     fn for_loop(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
@@ -1722,7 +1744,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // the elements: AutoCorrode's `iter_mut`
         let mut_items = match ht.kind() {
             ty::Ref(_, inner, m) if m.is_mut() && self.list_like(*inner) => Some(self.val(head)?),
-            _ if let Some(recv) = self.slice_method_recv(head, "iter_mut") => Some(self.val(recv)?),
+            _ if let Some(recv) = self.std_method_recv(head, StdFn::SliceIterMut) => Some(self.val(recv)?),
             _ => None,
         };
         let iter_s = match ht.peel_refs().kind() {
@@ -1730,7 +1752,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Range") | Some("RangeInclusive")) => self.val(head)?,
             _ if self.list_like(ht) => self.val(head)?,
             // `xs.iter()` over a slice, array or Vec: iterate over `xs`
-            _ if let Some(recv) = self.slice_method_recv(head, "iter") => self.val(recv)?,
+            _ if let Some(recv) = self.std_method_recv(head, StdFn::SliceIter) => self.val(recv)?,
             // any other iterator, as Rust defines `for`: `let mut iter = IntoIterator::into_iter(e);
             // while let Some(p) = Iterator::next(&mut iter) { body }`
             _ => {
@@ -2286,6 +2308,68 @@ impl<'a, 'tcx> Visitor<'tcx> for CaptureMutation<'a, 'tcx> {
         intravisit::walk_expr(self, e);
     }
 }
+
+/// The standard library functions with a uRust counterpart (see `std_call`).
+#[derive(Clone, Copy, PartialEq)]
+enum StdFn {
+    Clone,
+    Eq,
+    Ne,
+    Cmp,
+    OptionUnwrap,
+    OptionExpect,
+    OptionIsSome,
+    OptionIsNone,
+    OptionOkOr,
+    OptionTake,
+    ResultUnwrap,
+    ResultExpect,
+    ResultIsOk,
+    ResultIsErr,
+    ResultOk,
+    ResultUnwrapOr,
+    Len,
+    VecNew,
+    ToVec,
+    BoxNew,
+    Drop,
+    RangeInclusiveNew,
+    /// `ToString::to_string`, `From::from`, `Into::into`, `as_slice`, ...: the identity when the
+    /// argument and the result have the same HOL type
+    Conversion,
+    SliceIter,
+    SliceIterMut,
+    /// an operation of unsigned integers, by its AutoCorrode name
+    Uint(&'static str),
+}
+
+/// A lang item, or a diagnostic item by its name in the table of the standard library.
+enum Item {
+    Lang(LangItem),
+    Diag(&'static str),
+}
+
+/// The functions of `StdFn` that have their own lang or diagnostic item.
+const STD_ITEMS: &[(Item, StdFn)] = &[
+    (Item::Lang(LangItem::CloneFn), StdFn::Clone),
+    (Item::Diag("cmp_partialeq_eq"), StdFn::Eq),
+    (Item::Diag("cmp_partialeq_ne"), StdFn::Ne),
+    (Item::Diag("ord_cmp_method"), StdFn::Cmp),
+    (Item::Diag("option_unwrap"), StdFn::OptionUnwrap),
+    (Item::Diag("option_expect"), StdFn::OptionExpect),
+    (Item::Diag("result_ok_method"), StdFn::ResultOk),
+    (Item::Diag("vec_new"), StdFn::VecNew),
+    (Item::Diag("vec_with_capacity"), StdFn::VecNew),
+    (Item::Diag("box_new"), StdFn::BoxNew),
+    (Item::Diag("mem_drop"), StdFn::Drop),
+    (Item::Lang(LangItem::RangeInclusiveNew), StdFn::RangeInclusiveNew),
+    (Item::Diag("to_string_method"), StdFn::Conversion),
+    (Item::Diag("to_owned_method"), StdFn::Conversion),
+    (Item::Lang(LangItem::FromFn), StdFn::Conversion),
+    (Item::Diag("vec_as_slice"), StdFn::Conversion),
+    (Item::Diag("string_as_str"), StdFn::Conversion),
+    (Item::Diag("slice_iter"), StdFn::SliceIter),
+];
 
 /// `if c1 { b1 } else { if c2 { b2 } else { .. } }` for (condition, body) branches;
 /// `None` is an unconditional branch.

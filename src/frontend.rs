@@ -356,8 +356,10 @@ impl<'tcx> Frontend<'tcx> {
         self.tcx.crate_name(did.krate).to_string()
     }
 
+    /// Is `did` an item of the standard library? Its crates are those the compiler itself refers to
+    /// by these symbols (the injected `extern crate std` / `core`).
     pub fn is_std(&self, did: DefId) -> bool {
-        matches!(self.crate_of(did).as_str(), "core" | "alloc" | "std")
+        matches!(self.tcx.crate_name(did.krate), sym::core | sym::alloc | sym::std)
     }
 
     /// The standard library ADTs with a uRust counterpart, recognised by their lang or
