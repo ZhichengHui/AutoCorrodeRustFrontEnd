@@ -239,7 +239,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let body = s.trim_start_matches('\u{4}');
         if body.starts_with("unimplemented!") || body.starts_with("panic!") {
             parts.push(format!("\u{3}{}", body.trim_end_matches(';')));
-        } else if body.starts_with("return") || body.starts_with("break") || body.starts_with("continue") {
+        } else if body.starts_with("return") {
             parts.push(s);
         } else {
             parts.push(s);
@@ -251,7 +251,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn stmt_expr(&mut self, e: &'tcx hir::Expr<'tcx>) -> String {
         let t = self.ty_of(e);
         match e.kind {
-            ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_) => {
+            ExprKind::Ret(_) => {
                 let tr = self.expr(e);
                 if tr.s.ends_with(';') { return format!("\u{4}{}", tr.s) } // \u{4}: ends with own semicolon
                 return format!("{};", tr.s);
@@ -610,7 +610,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn val_unadj(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         match e.kind {
-            ExprKind::Lit(lit) => self.lit(&lit.node, self.ty_of(e), false),
+            ExprKind::Lit(lit) => self.lit(&lit.node, self.ty_of(e)),
             ExprKind::Path(ref qp) => self.path_value(qp, e),
             ExprKind::Call(callee, args) => self.call_expr(e, callee, args),
             ExprKind::MethodCall(_, recv, args, _) => {
@@ -633,25 +633,21 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Binary(op, l, r) => self.binary(e, op.node, l, r),
             ExprKind::Unary(UnOp::Not, x) => {
                 let xt = Self::peel_refs(self.ty_adj(x));
-                if !(xt.is_bool() || xt.is_integral()) { return self.overloaded_op(e, &[x]) }
+                if self.typeck.type_dependent_def_id(e.hir_id).is_some() { return self.overloaded_op(e, &[x]) }
+                if !(xt.is_bool() || Self::int_suffix(xt).is_some()) { return unsup(format!("`!` on `{}`", xt)) }
                 let v = self.val(x)?;
                 Ok(Tr::new(format!("!{}", v.at(300)), 300))
             }
             ExprKind::Unary(UnOp::Neg, x) => {
-                let xt = Self::peel_refs(self.ty_adj(x));
-                if !xt.is_signed() { return self.overloaded_op(e, &[x]) }
-                if let ExprKind::Lit(lit) = x.kind {
-                    return self.lit(&lit.node, xt, true);
-                }
-                let v = self.val(x)?;
-                Ok(Tr::new(format!("-{}", v.at(300)), 300))
+                if self.typeck.type_dependent_def_id(e.hir_id).is_some() { return self.overloaded_op(e, &[x]) }
+                unsup(format!("negation of `{}`", Self::peel_refs(self.ty_adj(x))))
             }
             ExprKind::Unary(UnOp::Deref, _) => unreachable!(),
             ExprKind::Cast(x, _) => self.cast(x, self.ty_of(e)),
             ExprKind::Type(x, _) => self.val(x),
             ExprKind::DropTemps(x) => self.val(x),
             ExprKind::If(c, t, el) => self.if_expr(c, t, el),
-            ExprKind::Loop(b, label, src, _) => self.loop_expr(e, b, label, src),
+            ExprKind::Loop(b, _, src, _) => self.loop_expr(e, b, src),
             ExprKind::Match(scrut, arms, src) => match src {
                 MatchSource::ForLoopDesugar => self.for_loop(scrut, arms),
                 MatchSource::TryDesugar(_) => {
@@ -691,15 +687,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             ExprKind::AddrOf(..) => unsup("raw borrow"),
-            ExprKind::Break(dest, val) => {
-                if val.is_some() { return unsup("`break` with a value") }
-                let lbl = self.loop_label(&dest)?;
-                Ok(Tr::atom(match lbl { Some(l) => format!("break {};", l), None => "break;".into() }))
-            }
-            ExprKind::Continue(dest) => {
-                let lbl = self.loop_label(&dest)?;
-                Ok(Tr::atom(match lbl { Some(l) => format!("continue {};", l), None => "continue;".into() }))
-            }
+            // the original uRust has no `break` / `continue`
+            ExprKind::Break(..) => unsup("`break`"),
+            ExprKind::Continue(_) => unsup("`continue`"),
             ExprKind::Ret(v) => match v {
                 Some(v) => {
                     let t = self.val(v)?;
@@ -726,20 +716,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    fn loop_label(&mut self, dest: &hir::Destination) -> R<Option<String>> {
-        let Ok(target) = dest.target_id else { return unsup("invalid loop target") };
-        // the target must be a loop, not a labeled block
-        match self.tcx.hir_node(target) {
-            hir::Node::Expr(hir::Expr { kind: ExprKind::Loop(..), .. }) => {}
-            _ => return unsup("`break`/`continue` targeting a labeled block"),
-        }
-        Ok(dest.label.map(|l| label_name(l.ident.as_str())))
-    }
-
     // ------------------------------------------------------------------
     // Literals, paths, casts, operators
     // ------------------------------------------------------------------
 
+    /// The uRust literal suffix of an integer type with a model (the unsigned ones up to 64 bits).
     fn int_suffix(t: Ty<'tcx>) -> Option<&'static str> {
         Some(match t.kind() {
             ty::Uint(ty::UintTy::U8) => "u8",
@@ -747,31 +728,27 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Uint(ty::UintTy::U32) => "u32",
             ty::Uint(ty::UintTy::U64) => "u64",
             ty::Uint(ty::UintTy::Usize) => "usize",
-            ty::Int(ty::IntTy::I8) => "i8",
-            ty::Int(ty::IntTy::I16) => "i16",
-            ty::Int(ty::IntTy::I32) => "i32",
-            ty::Int(ty::IntTy::I64) => "i64",
-            ty::Int(ty::IntTy::Isize) => "isize",
             _ => return None,
         })
+    }
+
+    /// An integer type without a uRust model: signed, or wider than 64 bits.
+    fn unmodelled_int(t: Ty<'tcx>) -> bool {
+        t.is_integral() && Self::int_suffix(t).is_none()
     }
 
     fn is_u64(t: Ty<'tcx>) -> bool {
         matches!(t.kind(), ty::Uint(ty::UintTy::U64) | ty::Uint(ty::UintTy::Usize))
     }
 
-    fn int_lit(v: u128, t: Ty<'tcx>, neg: bool) -> R<Tr> {
+    fn int_lit(v: u128, t: Ty<'tcx>) -> R<Tr> {
         let Some(sfx) = Self::int_suffix(t) else { return unsup(format!("integer literal of type `{}`", t)) };
-        if neg {
-            Ok(Tr::new(format!("-{}_{}", v, sfx), 300))
-        } else {
-            Ok(Tr::atom(format!("{}_{}", v, sfx)))
-        }
+        Ok(Tr::atom(format!("{}_{}", v, sfx)))
     }
 
-    fn lit(&mut self, l: &LitKind, t: Ty<'tcx>, neg: bool) -> R<Tr> {
+    fn lit(&mut self, l: &LitKind, t: Ty<'tcx>) -> R<Tr> {
         match l {
-            LitKind::Int(v, _) => Self::int_lit(v.get(), t, neg),
+            LitKind::Int(v, _) => Self::int_lit(v.get(), t),
             LitKind::Bool(b) => Ok(Tr::atom(if *b { "true" } else { "false" })),
             LitKind::Byte(b) => Ok(Tr::atom(format!("{}_u8", b))),
             LitKind::Char(c) => Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char(*c)?))),
@@ -859,16 +836,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if t.is_bool() {
                         return Ok(Tr::atom(if s.to_bits(s.size()) != 0 { "true" } else { "false" }));
                     }
-                    let bits = s.to_bits(s.size());
-                    if t.is_signed() {
-                        let size = s.size().bits();
-                        let sv = (bits as i128) << (128 - size) >> (128 - size);
-                        if sv < 0 {
-                            return Self::int_lit(sv.unsigned_abs(), t, true);
-                        }
-                        return Self::int_lit(sv as u128, t, false);
-                    }
-                    return Self::int_lit(bits, t, false);
+                    return Self::int_lit(s.to_bits(s.size()), t);
                 }
             }
         }
@@ -916,7 +884,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn binary(&mut self, e: &'tcx hir::Expr<'tcx>, op: BinOpKind, l: &'tcx hir::Expr<'tcx>, r: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         let lt = Self::peel_refs(self.ty_adj(l));
         let rt = Self::peel_refs(self.ty_adj(r));
-        let prim = |t: Ty<'tcx>| t.is_integral() || t.is_bool() || t.is_char();
+        if Self::unmodelled_int(lt) || Self::unmodelled_int(rt) {
+            return unsup(format!("binary operator on `{}`", if Self::unmodelled_int(lt) { lt } else { rt }));
+        }
+        let prim = |t: Ty<'tcx>| Self::int_suffix(t).is_some() || t.is_bool() || t.is_char();
         let builtin = self.typeck.type_dependent_def_id(e.hir_id).is_none();
         if !(prim(lt) && prim(rt)) {
             // structural equality on types whose PartialEq is derived (or std)
@@ -995,6 +966,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn assign_op(&mut self, e: &'tcx hir::Expr<'tcx>, op: hir::AssignOpKind, lhs: &'tcx hir::Expr<'tcx>, rhs: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         use hir::AssignOpKind as A;
         let lt = Self::peel_refs(self.ty_adj(lhs));
+        if Self::unmodelled_int(lt) { return unsup(format!("compound assignment on `{}`", lt)) }
         if !(lt.is_integral() || lt.is_bool()) || self.typeck.type_dependent_def_id(e.hir_id).is_some() && !lt.is_integral() {
             // overloaded compound assignment: call `T::add_assign(&mut lhs, rhs)`
             let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return unsup("compound assignment") };
@@ -1484,12 +1456,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    fn label_prefix(label: Option<rustc_ast::Label>) -> String {
-        match label { Some(l) => format!("{}: ", label_name(l.ident.as_str())), None => String::new() }
-    }
-
-    fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, label: Option<rustc_ast::Label>, src: LoopSource) -> R<Tr> {
-        let lp = Self::label_prefix(label);
+    fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, src: LoopSource) -> R<Tr> {
         if !Self::is_unit_like(self.ty_of(e)) {
             return unsup("loop producing a value (`break` with a value)");
         }
@@ -1505,22 +1472,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let mut body = p.prologue.join("\n");
                     if !body.is_empty() { body.push('\n'); }
                     body.push_str(&self.branch(then)?);
-                    if p.conds.is_empty() {
-                        return Ok(Tr::new(format!("{} {}while let {} = {} {{\n{}\n}}", FUEL, lp, p.pat, iv.at(20), body), 11));
-                    }
-                    return Ok(Tr::new(format!(
-                        "{} {}loop {{\nmatch {} {{\n  {} if {} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{ break; }}\n}};\n}}",
-                        FUEL, lp, iv.at(20), p.pat, p.conds.join(" && "), body
-                    ), 11));
+                    // a pattern condition would need `break` to leave the loop
+                    if !p.conds.is_empty() { return unsup("`while let` with literal or range sub-patterns") }
+                    return Ok(Tr::new(format!("{} while let {} = {} {{\n{}\n}}", FUEL, p.pat, iv.at(20), body), 11));
                 }
                 if contains_let(cond) { return unsup("`let` chain in `while` condition") }
                 let cv = self.val(cond)?;
                 let body = self.branch(then)?;
-                Ok(Tr::new(format!("{} {}while {} {{\n{}\n}}", FUEL, lp, cv.at(20), body), 11))
+                Ok(Tr::new(format!("{} while {} {{\n{}\n}}", FUEL, cv.at(20), body), 11))
             }
             LoopSource::Loop => {
                 let body = self.block_seq(b.stmts, b.expr)?;
-                Ok(Tr::new(format!("{} {}loop {{\n{}\n}}", FUEL, lp, body), 11))
+                Ok(Tr::new(format!("{} loop {{\n{}\n}}", FUEL, body), 11))
             }
             LoopSource::ForLoop => unsup("for-loop desugaring"),
         }
@@ -1537,7 +1500,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // match IntoIterator::into_iter(<head>) { mut iter => loop { match next(&mut iter) { None => break, Some(<pat>) => <body> } } }
         let ExprKind::Call(_, [head]) = head_call.kind else { return unsup("for-loop head") };
         let [arm] = arms else { return unsup("for-loop desugaring") };
-        let ExprKind::Loop(lb, label, LoopSource::ForLoop, _) = arm.body.kind else { return unsup("for-loop desugaring") };
+        let ExprKind::Loop(lb, _, LoopSource::ForLoop, _) = arm.body.kind else { return unsup("for-loop desugaring") };
         let inner_match = lb.stmts.iter().find_map(|s| match s.kind {
             StmtKind::Expr(x) | StmtKind::Semi(x) => match x.kind {
                 ExprKind::Match(next, arms2, MatchSource::ForLoopDesugar) => Some((next, arms2)),
@@ -1556,7 +1519,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             _ => None,
         });
         let Some((some_arm, pat)) = some else { return unsup("for-loop desugaring") };
-        let lp = Self::label_prefix(label);
         // the iterable: a range, slice, array or Vec is iterated by a uRust `for` loop
         let ht = self.ty_of(head);
         let iter_s = match Self::peel_refs(ht).kind() {
@@ -1585,10 +1547,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if !body.is_empty() { body.push('\n'); }
                 body.push_str(&self.branch(some_arm.body)?);
                 return Ok(Tr::atom(format!(
-                    "{{\n{}\n{} {}while let {} = {} {{\n{}\n}}\n}}",
+                    "{{\n{}\n{} while let {} = {} {{\n{}\n}}\n}}",
                     init,
                     FUEL,
-                    lp,
                     p.pat,
                     next_v.at(20),
                     body
@@ -1620,7 +1581,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut body = pro.join("\n");
         if !body.is_empty() { body.push('\n'); }
         body.push_str(&self.branch(some_arm.body)?);
-        Ok(Tr::new(format!("{}for {} in {} {{\n{}\n}}", lp, ps, iter_s.at(20), body), 11))
+        Ok(Tr::new(format!("for {} in {} {{\n{}\n}}", ps, iter_s.at(20), body), 11))
     }
 
     // ------------------------------------------------------------------
@@ -1843,10 +1804,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let t = if t.is_integral() || t.is_char() || t.is_bool() || t.is_str() { t } else { Self::peel_refs(self.typeck.pat_ty(pat)) };
         match pe.kind {
             hir::PatExprKind::Lit { lit, negated } => {
-                if let LitKind::Str(..) = lit.node {
-                    return self.lit(&lit.node, t, false);
-                }
-                self.lit(&lit.node, t, negated)
+                if negated { return unsup(format!("negative literal pattern of type `{}`", t)) }
+                self.lit(&lit.node, t)
             }
             hir::PatExprKind::Path(ref qp) => {
                 let res = self.typeck.qpath_res(qp, pe.hir_id);
@@ -1857,12 +1816,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                                 if let Some(s) = v.try_to_scalar_int() {
                                     let bits = s.to_bits(s.size());
                                     if t.is_bool() { return Ok(Tr::atom(if bits != 0 { "true" } else { "false" })) }
-                                    if t.is_signed() {
-                                        let size = s.size().bits();
-                                        let sv = (bits as i128) << (128 - size) >> (128 - size);
-                                        return if sv < 0 { Self::int_lit(sv.unsigned_abs(), t, true) } else { Self::int_lit(sv as u128, t, false) };
-                                    }
-                                    return Self::int_lit(bits, t, false);
+                                    return Self::int_lit(bits, t);
                                 }
                             }
                         }
@@ -2111,11 +2065,6 @@ fn contains_let(e: &hir::Expr<'_>) -> bool {
         ExprKind::DropTemps(x) => contains_let(x),
         _ => false,
     }
-}
-
-fn label_name(s: &str) -> String {
-    let s = s.trim_start_matches('\'');
-    format!("'{}", names::ident_chars(s))
 }
 
 fn hol_char(c: char) -> R<String> {

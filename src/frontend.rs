@@ -367,13 +367,8 @@ impl<'tcx> Frontend<'tcx> {
         match t.kind() {
             ty::Bool => "bool".into(),
             ty::Char => "char".into(),
-            ty::Int(it) => match it {
-                ty::IntTy::I8 => "8 sword".into(),
-                ty::IntTy::I16 => "16 sword".into(),
-                ty::IntTy::I32 => "32 sword".into(),
-                ty::IntTy::I64 | ty::IntTy::Isize => "64 sword".into(),
-                ty::IntTy::I128 => self.placeholder_type("i128", 0),
-            },
+            // the original AutoCorrode has no signed integers
+            ty::Int(_) => self.placeholder_type(&format!("{}", t), 0),
             ty::Uint(ut) => match ut {
                 ty::UintTy::U8 => "8 word".into(),
                 ty::UintTy::U16 => "16 word".into(),
