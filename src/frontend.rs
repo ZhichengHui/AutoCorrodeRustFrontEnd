@@ -6,22 +6,30 @@ use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
 use rustc_span::{Span, sym};
 
 use crate::names;
 
-/// Insertion-ordered set of DefIds (DefId is not `Ord`).
+/// A translated function: a local item with a body, either translated once for all its generic
+/// arguments (`None`: type parameters become type variables) or an instance for concrete generic
+/// arguments (`Some`: monomorphisation).
+pub type FnKey<'tcx> = (DefId, Option<GenericArgsRef<'tcx>>);
+
+/// Instances of one generic function at most; more (e.g. polymorphic recursion) are not translated.
+pub const MAX_INSTANCES: usize = 16;
+
+/// Insertion-ordered set of functions (DefId is not `Ord`).
 #[derive(Default, Clone)]
-pub struct DefSet(pub Vec<DefId>);
-impl DefSet {
-    pub fn insert(&mut self, d: DefId) {
+pub struct DefSet<'tcx>(pub Vec<FnKey<'tcx>>);
+impl<'tcx> DefSet<'tcx> {
+    pub fn insert(&mut self, d: FnKey<'tcx>) {
         if !self.0.contains(&d) {
             self.0.push(d)
         }
     }
-    pub fn contains(&self, d: &DefId) -> bool { self.0.contains(d) }
-    pub fn iter(&self) -> std::slice::Iter<'_, DefId> { self.0.iter() }
+    pub fn contains(&self, d: &FnKey<'tcx>) -> bool { self.0.contains(d) }
+    pub fn iter(&self) -> std::slice::Iter<'_, FnKey<'tcx>> { self.0.iter() }
     pub fn clear(&mut self) { self.0.clear() }
 }
 
@@ -41,8 +49,8 @@ pub struct ExtFun {
 }
 
 /// A translated local function (or constant thunk).
-pub struct FunDef {
-    pub def_id: DefId,
+pub struct FunDef<'tcx> {
+    pub key: FnKey<'tcx>,
     pub name: String,
     pub rust_path: String,
     /// HOL types of the parameters and of the result value.
@@ -51,7 +59,7 @@ pub struct FunDef {
     pub params: Vec<String>,
     /// Body (uRust, may contain call markers).
     pub body: String,
-    pub calls: crate::frontend::DefSet,
+    pub calls: DefSet<'tcx>,
     pub comments: Vec<String>,
 }
 
@@ -70,11 +78,19 @@ pub struct Frontend<'tcx> {
     pub placeholders: Vec<String>,
     /// Number of uses of placeholder types so far (see `ty_modelled`).
     placeholder_type_uses: usize,
-    pub fun_defs: Vec<FunDef>,
+    pub fun_defs: Vec<FunDef<'tcx>>,
     pub item_comments: Vec<String>,
     /// Table used by call markers (`\u{1}C<n>\u{2}` etc.).
-    pub marker_ids: Vec<DefId>,
-    marker_index: HashMap<DefId, usize>,
+    pub marker_ids: Vec<FnKey<'tcx>>,
+    marker_index: HashMap<FnKey<'tcx>, usize>,
+    /// Generic functions translated per instance: those whose body calls a trait method (or a
+    /// generic `Fn` argument) depending on their type parameters, directly or through other such
+    /// functions; trait default methods (generic over `Self`).
+    pub mono_fns: HashSet<DefId>,
+    instance_names: HashMap<(DefId, GenericArgsRef<'tcx>), String>,
+    instances_per_fn: HashMap<DefId, usize>,
+    /// Instances named but not yet translated.
+    pub pending: Vec<FnKey<'tcx>>,
     /// Local ADTs (structs/enums) that are translated.
     pub adts: Vec<DefId>,
     /// Structs translated as `datatype_record` (have lenses).
@@ -123,6 +139,10 @@ impl<'tcx> Frontend<'tcx> {
             item_comments: Vec::new(),
             marker_ids: Vec::new(),
             marker_index: HashMap::new(),
+            mono_fns: HashSet::new(),
+            instance_names: HashMap::new(),
+            instances_per_fn: HashMap::new(),
+            pending: Vec::new(),
             adts: Vec::new(),
             record_adts: HashSet::new(),
             ref_adts: HashSet::new(),
@@ -152,12 +172,62 @@ impl<'tcx> Frontend<'tcx> {
         marker
     }
 
-    pub fn marker(&mut self, did: DefId) -> usize {
-        if let Some(i) = self.marker_index.get(&did) { return *i }
+    pub fn marker(&mut self, key: FnKey<'tcx>) -> usize {
+        if let Some(i) = self.marker_index.get(&key) { return *i }
         let i = self.marker_ids.len();
-        self.marker_ids.push(did);
-        self.marker_index.insert(did, i);
+        self.marker_ids.push(key);
+        self.marker_index.insert(key, i);
         i
+    }
+
+    /// `x` (from the type-checking results of a generic body) at the concrete generic arguments
+    /// `args`, with projections normalised.
+    pub fn mono<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, args: GenericArgsRef<'tcx>, x: T) -> T {
+        let x = ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args);
+        match self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), x) {
+            Ok(n) => n,
+            Err(_) => x.skip_normalization(),
+        }
+    }
+
+    /// The function to call for the local item `did` at the generic arguments `args`: an instance
+    /// (queued for translation) if `did` is translated per instance and `args` are concrete,
+    /// otherwise the item itself. `None` if `did` already has `MAX_INSTANCES` instances.
+    pub fn callee(&mut self, did: DefId, args: GenericArgsRef<'tcx>) -> Option<FnKey<'tcx>> {
+        // an instance at a type without a uRust model (e.g. a closure type) could not be
+        // translated; the generic function, whose type variable it instantiates, is called instead
+        if !self.mono_fns.contains(&did) || args.has_param() || !args.types().all(|t| self.has_model(t)) {
+            return Some((did, None));
+        }
+        let args = self.tcx.erase_and_anonymize_regions(args);
+        if !self.instance_names.contains_key(&(did, args)) {
+            let k = self.instances_per_fn.entry(did).or_insert(0);
+            if *k >= MAX_INSTANCES {
+                return None;
+            }
+            *k += 1;
+            let mut segs = self.path_segments(did);
+            segs.extend(args.types().map(|t| self.short_ty_name(t)));
+            let base = names::global_name(&segs);
+            let mut n = base.clone();
+            let mut k = 1;
+            while self.used_names.contains(&n) {
+                k += 1;
+                n = format!("{}_{}", base, k);
+            }
+            self.used_names.insert(n.clone());
+            self.instance_names.insert((did, args), n);
+            self.pending.push((did, Some(args)));
+        }
+        Some((did, Some(args)))
+    }
+
+    /// HOL name of a function (`def_name` of the item, or the name of the instance).
+    pub fn fn_name(&mut self, key: FnKey<'tcx>) -> String {
+        match key.1 {
+            None => self.def_name(key.0),
+            Some(args) => self.instance_names[&(key.0, args)].clone(),
+        }
     }
 
     // ------------------------------------------------------------------
