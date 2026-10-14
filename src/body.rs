@@ -1219,7 +1219,32 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup(format!("call of `{}`", self.tcx.def_path_str(target)));
         }
         let n = self.fe.ext_fun(target, false);
-        Ok(self.named_call(&n, argv))
+        let call = self.named_call(&n, argv);
+        // a type variable of the template's result that occurs in no parameter (e.g. of `into`,
+        // `collect`) is not determined by the call: the known type of the result is stated
+        let t = self.ty_of(e);
+        if Self::result_undetermined(self.tcx, target) && !t.is_never() && self.fe.has_model(t) {
+            let h = self.fe.ty(t);
+            let tmp = self.fresh("res");
+            return Ok(Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, call.at(20), tmp, h)));
+        }
+        Ok(call)
+    }
+
+    /// Does the result type of the signature of `did` contain a type parameter that occurs in no
+    /// parameter type, or a projection (both are type variables of its template)?
+    fn result_undetermined(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
+        let sig = tcx.fn_sig(did).instantiate_identity().skip_binder();
+        let params_of = |t: Ty<'tcx>| -> Vec<Ty<'tcx>> {
+            t.walk()
+                .filter_map(|g| match g.kind() {
+                    ty::GenericArgKind::Type(x) if matches!(x.kind(), ty::Param(_) | ty::Alias(..)) => Some(x),
+                    _ => None,
+                })
+                .collect()
+        };
+        let in_inputs: Vec<Ty<'tcx>> = sig.inputs().iter().flat_map(|t| params_of(*t)).collect();
+        params_of(sig.output()).iter().any(|x| matches!(x.kind(), ty::Alias(..)) || !in_inputs.contains(x))
     }
 
     /// Key used for the standard library table: (type or trait name, item name).

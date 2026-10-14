@@ -26,6 +26,7 @@ impl DefSet {
 }
 
 /// A placeholder or external type, declared in the types template.
+#[derive(Clone)]
 pub struct ExtType {
     pub arity: usize,
     pub comment: String,
@@ -63,6 +64,7 @@ pub struct Frontend<'tcx> {
     pub ext_types: BTreeMap<String, ExtType>,
     pub ext_funs: BTreeMap<String, ExtFun>,
     ext_fun_ids: HashMap<DefId, String>,
+    ext_type_ids: HashMap<DefId, String>,
     pub foreign_funs: BTreeMap<String, ExtFun>,
     pub alloc_types: Vec<String>,
     pub placeholders: Vec<String>,
@@ -112,6 +114,7 @@ impl<'tcx> Frontend<'tcx> {
             ext_types: BTreeMap::new(),
             ext_funs: BTreeMap::new(),
             ext_fun_ids: HashMap::new(),
+            ext_type_ids: HashMap::new(),
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
             placeholders: Vec::new(),
@@ -362,6 +365,18 @@ impl<'tcx> Frontend<'tcx> {
         (h, self.placeholder_type_uses == before)
     }
 
+    /// Does every part of `t` have a uRust model? Nothing is recorded (no placeholder type).
+    pub fn has_model(&mut self, t: Ty<'tcx>) -> bool {
+        let placeholders = self.placeholders.len();
+        let ext_types = self.ext_types.clone();
+        let ext_type_ids = self.ext_type_ids.clone();
+        let (_, modelled) = self.ty_modelled(t);
+        self.placeholders.truncate(placeholders);
+        self.ext_types = ext_types;
+        self.ext_type_ids = ext_type_ids;
+        modelled
+    }
+
     /// Map a Rust type to a HOL type.
     pub fn ty(&mut self, t: Ty<'tcx>) -> String {
         match t.kind() {
@@ -417,13 +432,7 @@ impl<'tcx> Frontend<'tcx> {
                         } else if did.is_local() {
                             self.placeholder_type(&format!("union {}", self.tcx.item_name(did)), targs.len())
                         } else {
-                            let n = format!("ext_{}", names::ident_chars(self.tcx.item_name(did).as_str()));
-                            let path = self.tcx.def_path_str(did);
-                            self.ext_types.entry(n.clone()).or_insert(ExtType {
-                                arity: targs.len(),
-                                comment: format!("Rust: {}", path),
-                            });
-                            n
+                            self.ext_type(did, targs.len())
                         };
                         let mut a: Vec<String> = vec![];
                         if self.ref_adts.contains(&did) {
@@ -453,7 +462,17 @@ impl<'tcx> Frontend<'tcx> {
                     None => self.placeholder_type("alias_or_impl_trait", 0),
                 }
             }
-            ty::Closure(..) => self.placeholder_type("closure", 0),
+            // a uRust closure `|x, y| e` is `λx y. FunctionBody e`: a function of its formals
+            ty::Closure(_, args) => {
+                let sig = self.tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
+                let formals: Vec<Ty<'tcx>> = match sig.inputs()[0].kind() {
+                    ty::Tuple(ts) => ts.iter().collect(),
+                    _ => vec![sig.inputs()[0]],
+                };
+                let params: Vec<String> = formals.iter().map(|t| self.ty(*t)).collect();
+                let ret = self.ty(sig.output());
+                self.fun_type(&params, &ret)
+            }
             ty::FnDef(..) => self.placeholder_type("fn_item", 0),
             _ => self.placeholder_type(&format!("{}", t), 0),
         }
@@ -473,6 +492,24 @@ impl<'tcx> Frontend<'tcx> {
         if !self.alloc_types.iter().any(|t| t == hol_ty) {
             self.alloc_types.push(hol_ty.to_string());
         }
+    }
+
+    /// Register (or look up) an external ADT with `arity` type arguments, returning its HOL name,
+    /// made of its full path: items of different modules may share a name.
+    fn ext_type(&mut self, did: DefId, arity: usize) -> String {
+        if let Some(n) = self.ext_type_ids.get(&did) { return n.clone() }
+        let mut segs = vec![self.crate_of(did)];
+        segs.extend(self.path_segments(did));
+        let base = format!("ext_{}", names::ident_chars(&segs.join("_")));
+        let mut n = base.clone();
+        let mut k = 1;
+        while self.ext_types.contains_key(&n) || self.used_type_names.contains(&n) {
+            k += 1;
+            n = format!("{}_{}", base, k);
+        }
+        self.ext_types.insert(n.clone(), ExtType { arity, comment: format!("Rust: {}", self.tcx.def_path_str(did)) });
+        self.ext_type_ids.insert(did, n.clone());
+        n
     }
 
     // ------------------------------------------------------------------
