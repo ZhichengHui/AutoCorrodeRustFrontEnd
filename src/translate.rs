@@ -78,41 +78,128 @@ pub fn sccs<N: Copy + Eq + std::hash::Hash>(nodes: &[N], succ: &dyn Fn(N) -> Vec
 
 pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     let mut fe = Frontend::new(tcx);
-    let items = tcx.hir_crate_items(());
+    let adt_sccs = collect_adts(&mut fe);
+    let types_text = emit_types(&mut fe, &adt_sccs);
 
-    // ---------------- types ----------------
-    let mut adts: Vec<DefId> = vec![];
+    // ---------------- functions / consts ----------------
+    let items = tcx.hir_crate_items(());
+    let mut bodies: Vec<DefId> = vec![];
     for id in items.free_items() {
         let item = tcx.hir_item(id);
         let did = item.owner_id.to_def_id();
         match item.kind {
-            hir::ItemKind::Struct(..) | hir::ItemKind::Enum(..) => adts.push(did),
-            hir::ItemKind::Union(..) => {
-                let m = fe.placeholder("union (declared as an abstract type)", Some(tcx.def_span(did)));
-                fe.item_comments.push(m);
+            hir::ItemKind::Fn { .. } if !fe.bodiless_intrinsic(did) => bodies.push(did),
+            hir::ItemKind::Const(..) => bodies.push(did),
+            hir::ItemKind::Static(m, ..) => {
+                if m.is_mut() {
+                    fe.item_placeholder("static mut", tcx.def_span(did));
+                } else {
+                    bodies.push(did);
+                }
             }
+            hir::ItemKind::TraitAlias(..) => fe.item_placeholder("trait alias", tcx.def_span(did)),
+            hir::ItemKind::GlobalAsm { .. } => fe.item_placeholder("global assembly", item.span),
+            hir::ItemKind::Impl(_) => {
+                if !tcx.is_automatically_derived(did)
+                    && let Some(tr) = tcx.impl_opt_trait_ref(did)
+                    && tcx.is_lang_item(tr.skip_binder().def_id, LangItem::Drop)
+                {
+                    fe.item_placeholder(
+                        "destructor semantics (drop is translated as an ordinary function; destructor calls are not inserted)",
+                        tcx.def_span(did),
+                    );
+                }
+            }
+            hir::ItemKind::ForeignMod { items: fitems, .. } => {
+                for fi in fitems.iter() {
+                    let fdid = fi.owner_id.to_def_id();
+                    if matches!(tcx.def_kind(fdid), DefKind::Fn) {
+                        fe.ext_fun(fdid, true);
+                    } else {
+                        fe.item_placeholder("foreign static", tcx.def_span(fdid));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for id in items.impl_items() {
+        let ii = tcx.hir_impl_item(id);
+        let did = ii.owner_id.to_def_id();
+        if tcx.is_automatically_derived(tcx.parent(did)) {
+            continue;
+        }
+        match ii.kind {
+            hir::ImplItemKind::Fn(..) | hir::ImplItemKind::Const(..) => bodies.push(did),
+            // its uses are normalised to the type it defines
+            hir::ImplItemKind::Type(..) => {}
+        }
+    }
+    // default methods are generic over `Self`: translated at the instances they are called at
+    let default_methods: Vec<DefId> = items
+        .trait_items()
+        .filter(|&id| matches!(tcx.hir_trait_item(id).kind, hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_))))
+        .map(|id| id.owner_id.to_def_id())
+        .collect();
+    fe.mono_fns = mono_fns(&fe, &bodies, &default_methods);
+    for &d in &bodies {
+        fe.def_name(d);
+    }
+    for &d in &bodies {
+        translate_item(&mut fe, (d, None));
+    }
+    // instances called from the translated bodies, and from those instances
+    while let Some(key) = fe.pending.pop() {
+        translate_item(&mut fe, key);
+    }
+    for d in default_methods {
+        if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
+            fe.item_placeholder("trait default method (not called at a concrete type)", tcx.def_span(d));
+        }
+    }
+
+    let funs_text = emit_funs(&mut fe);
+    write_all(&mut fe, opts, types_text, funs_text);
+}
+
+/// The types occurring in the fields of the local ADT `d`: the field types and their parts.
+fn field_subtypes<'tcx>(tcx: TyCtxt<'tcx>, d: DefId) -> impl Iterator<Item = Ty<'tcx>> {
+    tcx.adt_def(d)
+        .all_fields()
+        .flat_map(move |f| tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().filter_map(|g| g.as_type()))
+}
+
+/// Collect and classify the local ADTs (see the fields of `Frontend`); returns their groups,
+/// used ones first.
+fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
+    let tcx = fe.tcx;
+    let mut adts: Vec<DefId> = vec![];
+    for id in tcx.hir_crate_items(()).free_items() {
+        let item = tcx.hir_item(id);
+        let did = item.owner_id.to_def_id();
+        match item.kind {
+            hir::ItemKind::Struct(..) | hir::ItemKind::Enum(..) => adts.push(did),
+            hir::ItemKind::Union(..) => fe.item_placeholder("union (declared as an abstract type)", tcx.def_span(did)),
             _ => {}
         }
     }
     // type dependency graph
     let adt_set: HashSet<DefId> = adts.iter().copied().collect();
     let deps = |did: DefId| -> Vec<DefId> {
-        let mut out = vec![];
-        for f in tcx.adt_def(did).all_fields() {
-            let t = tcx.type_of(f.did).instantiate_identity().skip_normalization();
-            for g in t.walk() {
-                if let ty::GenericArgKind::Type(tt) = g.kind() {
-                    if let ty::Adt(d, _) = tt.kind() {
-                        if adt_set.contains(&d.did()) {
-                            out.push(d.did())
-                        }
-                    }
-                }
-            }
-        }
-        out
+        field_subtypes(tcx, did)
+            .filter_map(|t| match t.kind() {
+                ty::Adt(d, _) if adt_set.contains(&d.did()) => Some(d.did()),
+                _ => None,
+            })
+            .collect()
     };
     let adt_sccs = sccs(&adts, &deps);
+    let opaque = |fe: &mut Frontend<'tcx>, comp: &[DefId], why: &'static str, what: &str| {
+        for &d in comp {
+            fe.opaque_adts.insert(d, why);
+            fe.item_placeholder(what, tcx.def_span(d));
+        }
+    };
     // associated types of an ADT's type parameters in its fields (`S::Unit` in
     // `struct H<S: Shape> { u: S::Unit }`) become extra type parameters of its datatype; the
     // groups come after the ADTs they use
@@ -131,38 +218,25 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     // with other type arguments than `d`'s own parameters, is a placeholder
     let own_types = |d: DefId| -> Vec<Ty<'_>> { ty::GenericArgs::identity_for_item(tcx, d).types().collect() };
     for comp in &adt_sccs {
+        // the members of a group would have to share their extra type parameters (see `adt_projs`)
+        if comp.len() > 1 && comp.iter().any(|d| fe.adt_projs.contains_key(d)) {
+            opaque(
+                fe,
+                comp,
+                "mutually recursive with associated types",
+                "mutually recursive type with an associated type of a type parameter in a field (declared as an abstract type)",
+            );
+            continue;
+        }
         let arity = own_types(comp[0]).len();
         let nonuniform = comp.iter().any(|&d| {
             let own = own_types(d);
             own.len() != arity
-                || tcx.adt_def(d).all_fields().any(|f| {
-                    tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().any(|g| match g.kind() {
-                        ty::GenericArgKind::Type(tt) => match tt.kind() {
-                            ty::Adt(e, args) if comp.contains(&e.did()) => args.types().collect::<Vec<_>>() != own,
-                            _ => false,
-                        },
-                        _ => false,
-                    })
-                })
+                || field_subtypes(tcx, d)
+                    .any(|t| matches!(t.kind(), ty::Adt(e, args) if comp.contains(&e.did()) && args.types().collect::<Vec<_>>() != own))
         });
-        // the members of a group would have to share their extra type parameters (see `adt_projs`)
-        if comp.len() > 1 && comp.iter().any(|d| fe.adt_projs.contains_key(d)) {
-            for &d in comp {
-                fe.opaque_adts.insert(d, "mutually recursive with associated types");
-                let m = fe.placeholder(
-                    "mutually recursive type with an associated type of a type parameter in a field (declared as an abstract type)",
-                    Some(tcx.def_span(d)),
-                );
-                fe.item_comments.push(m);
-            }
-            continue;
-        }
         if nonuniform {
-            for &d in comp {
-                fe.opaque_adts.insert(d, "non-uniformly recursive");
-                let m = fe.placeholder("non-uniformly recursive type (declared as an abstract type)", Some(tcx.def_span(d)));
-                fe.item_comments.push(m);
-            }
+            opaque(fe, comp, "non-uniformly recursive", "non-uniformly recursive type (declared as an abstract type)");
         }
     }
     // a shared reference `&T` is a value of `T`, so a type whose every value contains a value of
@@ -175,14 +249,13 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         .filter(|&d| fe.finite_ty(tcx.type_of(d).instantiate_identity().skip_normalization(), &adt_set, &mut vec![], &mut known))
         .collect();
     for comp in &adt_sccs {
-        if comp.iter().all(|d| finite.contains(d)) { continue }
-        for &d in comp {
-            fe.opaque_adts.insert(d, "without finite values");
-            let m = fe.placeholder(
+        if !comp.iter().all(|d| finite.contains(d)) {
+            opaque(
+                fe,
+                comp,
+                "without finite values",
                 "type without finite values (a shared reference is its referent), or in a recursive group with one (declared as an abstract type)",
-                Some(tcx.def_span(d)),
             );
-            fe.item_comments.push(m);
         }
     }
     for comp in &adt_sccs {
@@ -201,15 +274,10 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             if fe.ref_adts.contains(&d) {
                 continue;
             }
-            let needs = tcx.adt_def(d).all_fields().any(|f| {
-                tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().any(|g| match g.kind() {
-                    ty::GenericArgKind::Type(tt) => match tt.kind() {
-                        ty::Ref(_, _, m) => m.is_mut(),
-                        ty::Adt(a, _) => fe.ref_adts.contains(&a.did()),
-                        _ => false,
-                    },
-                    _ => false,
-                })
+            let needs = field_subtypes(tcx, d).any(|t| match t.kind() {
+                ty::Ref(_, _, m) => m.is_mut(),
+                ty::Adt(a, _) => fe.ref_adts.contains(&a.did()),
+                _ => false,
             });
             if needs {
                 fe.ref_adts.insert(d);
@@ -220,109 +288,10 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             break;
         }
     }
-    fe.adts = adts.clone();
     for &d in &adts {
         fe.adt_name(d);
     }
-    let types_text = emit_types(&mut fe, &adt_sccs);
-
-    // ---------------- functions / consts ----------------
-    let mut bodies: Vec<(DefId, &'static str)> = vec![];
-    for id in items.free_items() {
-        let item = tcx.hir_item(id);
-        let did = item.owner_id.to_def_id();
-        match item.kind {
-            hir::ItemKind::Fn { .. } if !fe.bodiless_intrinsic(did) => bodies.push((did, "fn")),
-            hir::ItemKind::Const(..) => bodies.push((did, "const")),
-            hir::ItemKind::Static(m, ..) => {
-                if m.is_mut() {
-                    let m = fe.placeholder("static mut", Some(tcx.def_span(did)));
-                    fe.item_comments.push(m);
-                } else {
-                    bodies.push((did, "static"));
-                }
-            }
-            hir::ItemKind::TraitAlias(..) => {
-                let m = fe.placeholder("trait alias", Some(tcx.def_span(did)));
-                fe.item_comments.push(m);
-            }
-            hir::ItemKind::GlobalAsm { .. } => {
-                let m = fe.placeholder("global assembly", Some(item.span));
-                fe.item_comments.push(m);
-            }
-            hir::ItemKind::Impl(_) => {
-                if tcx.is_automatically_derived(did) {
-                    continue;
-                }
-                if let Some(tr) = tcx.impl_opt_trait_ref(did) {
-                    if tcx.is_lang_item(tr.skip_binder().def_id, LangItem::Drop) {
-                        let m = fe.placeholder(
-                            "destructor semantics (drop is translated as an ordinary function; destructor calls are not inserted)",
-                            Some(tcx.def_span(did)),
-                        );
-                        fe.item_comments.push(m);
-                    }
-                }
-            }
-            hir::ItemKind::ForeignMod { items: fitems, .. } => {
-                for fi in fitems.iter() {
-                    let fdid = fi.owner_id.to_def_id();
-                    if matches!(tcx.def_kind(fdid), DefKind::Fn) {
-                        fe.ext_fun(fdid, true);
-                    } else {
-                        let m = fe.placeholder("foreign static", Some(tcx.def_span(fdid)));
-                        fe.item_comments.push(m);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    for id in items.impl_items() {
-        let ii = tcx.hir_impl_item(id);
-        let did = ii.owner_id.to_def_id();
-        let imp = tcx.parent(did);
-        if tcx.is_automatically_derived(imp) {
-            continue;
-        }
-        match ii.kind {
-            hir::ImplItemKind::Fn(..) => bodies.push((did, "fn")),
-            hir::ImplItemKind::Const(..) => bodies.push((did, "const")),
-            // its uses are normalised to the type it defines
-            hir::ImplItemKind::Type(..) => {}
-        }
-    }
-    // default methods are generic over `Self`: translated at the instances they are called at
-    let mut default_methods: Vec<DefId> = vec![];
-    for id in items.trait_items() {
-        let ti = tcx.hir_trait_item(id);
-        match ti.kind {
-            hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)) => default_methods.push(ti.owner_id.to_def_id()),
-            _ => {}
-        }
-    }
-    fe.mono_fns = mono_fns(tcx, &bodies, &default_methods);
-    for (d, _) in &bodies {
-        fe.def_name(*d);
-    }
-    for (did, kind) in &bodies {
-        let fd = translate_item(&mut fe, (*did, None), kind);
-        fe.fun_defs.push(fd);
-    }
-    // instances called from the translated bodies, and from those instances
-    while let Some(key) = fe.pending.pop() {
-        let fd = translate_item(&mut fe, key, "fn");
-        fe.fun_defs.push(fd);
-    }
-    for d in default_methods {
-        if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
-            let m = fe.placeholder("trait default method (not called at a concrete type)", Some(tcx.def_span(d)));
-            fe.item_comments.push(m);
-        }
-    }
-
-    let funs_text = emit_funs(&mut fe);
-    write_all(&mut fe, opts, types_text, funs_text);
+    adt_sccs
 }
 
 /// The calls of a body whose callee depends on the body's generic parameters: trait methods and
@@ -359,11 +328,7 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
             self.call(did, self.typeck.node_args(e.hir_id));
         }
         if let hir::ExprKind::Call(callee, _) = e.kind {
-            let mut t = self.typeck.expr_ty_adjusted(callee);
-            while let ty::Ref(_, inner, _) = t.kind() {
-                t = *inner;
-            }
-            match *t.kind() {
+            match *self.typeck.expr_ty_adjusted(callee).peel_refs().kind() {
                 ty::FnDef(did, args) => self.call(did, args.skip_binder()),
                 ty::Param(_) => self.dependent = true,
                 _ => {}
@@ -375,14 +340,15 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
 
 /// The generic functions translated per instance: trait default methods, and generic functions
 /// with a call depending on their generic parameters, directly or through other such functions.
-fn mono_fns<'tcx>(tcx: TyCtxt<'tcx>, bodies: &[(DefId, &str)], default_methods: &[DefId]) -> HashSet<DefId> {
+fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefId]) -> HashSet<DefId> {
+    let tcx = fe.tcx;
     let mut mono: HashSet<DefId> = default_methods.iter().copied().collect();
     let mut callees: Vec<(DefId, Vec<DefId>)> = vec![];
-    for &(did, kind) in bodies {
-        let Some(ld) = did.as_local() else { continue };
-        if kind != "fn" || tcx.hir_maybe_body_owned_by(ld).is_none() {
+    for &did in bodies {
+        if !fe.local_fn_with_body(did) {
             continue;
         }
+        let ld = did.expect_local();
         let mut v = GenericCalls { tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
         v.visit_body(tcx.hir_body_owned_by(ld));
         if v.dependent {
@@ -423,37 +389,35 @@ fn alias_of(t: Ty<'_>) -> ty::AliasTy<'_> {
 /// implementation (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`), so with two of
 /// them the signature's types are not modelled. One occurring only in the body is not a variable
 /// (it would be an extra type variable of the definition).
-fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> FunDef<'tcx> {
-    if key.1.is_none() && kind == "fn" {
-        let did = key.0;
-        let sig = fe.tcx.instantiate_bound_regions_with_erased(fe.tcx.fn_sig(did).instantiate_identity().skip_normalization());
-        let env = ty::TypingEnv::post_analysis(fe.tcx, did);
-        let tys: Vec<Ty<'tcx>> = sig
-            .inputs_and_output
-            .iter()
-            .map(|t| fe.tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t))
-            .collect();
-        let ps: Vec<ty::AliasTy<'tcx>> = fe.projections(did, &tys).into_iter().map(alias_of).collect();
-        let selves: Vec<Ty<'tcx>> = ps.iter().filter(|a| a.try_to_projection().is_some()).map(|a| a.args.type_at(0)).collect();
-        if (1..selves.len()).all(|i| !selves[..i].contains(&selves[i])) {
-            fe.proj_tvars = Some(ps.into_iter().enumerate().map(|(k, a)| (a, proj_tvar(k))).collect());
-        }
+fn proj_tvars<'tcx>(fe: &Frontend<'tcx>, did: DefId, sig_tys: &[Ty<'tcx>]) -> Option<HashMap<ty::AliasTy<'tcx>, String>> {
+    let ps: Vec<ty::AliasTy<'tcx>> = fe.projections(did, sig_tys).into_iter().map(alias_of).collect();
+    let selves: Vec<Ty<'tcx>> = ps.iter().filter(|a| a.try_to_projection().is_some()).map(|a| a.args.type_at(0)).collect();
+    if (1..selves.len()).all(|i| !selves[..i].contains(&selves[i])) {
+        Some(ps.into_iter().enumerate().map(|(k, a)| (a, proj_tvar(k))).collect())
+    } else {
+        None
     }
-    let fd = translate_fn(fe, key, kind);
-    fe.proj_tvars = None;
-    fd
 }
 
-fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> FunDef<'tcx> {
+/// Translate the function or constant `key` and record its definition.
+fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) {
+    let fd = translate_fn(fe, key);
+    // the projections' type variables (see `proj_tvars`) are those of one definition
+    fe.proj_tvars = None;
+    fe.fun_defs.push(fd);
+}
+
+fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx> {
     let tcx = fe.tcx;
     let did = key.0;
     let ld: LocalDefId = did.expect_local();
+    let is_fn = matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn);
     let name = fe.fn_name(key);
     let rust_path = match key.1 {
         None => tcx.def_path_str(did),
         Some(args) => tcx.def_path_str_with_args(did, args),
     };
-    let (params, ret): (Vec<(String, bool)>, (String, bool)) = if kind == "fn" {
+    let (params, ret): (Vec<(String, bool)>, (String, bool)) = if is_fn {
         let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(did).instantiate_identity().skip_normalization());
         // an instance's types at its arguments; a generic item's projections normalised in its own
         // typing environment (e.g. `<Iter<T> as Iterator>::Item` through the impl)
@@ -463,9 +427,12 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> 
                 .try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, did), ty::Unnormalized::new_wip(t))
                 .unwrap_or(t),
         };
-        let ins: Vec<Ty<'tcx>> = sig.inputs().iter().map(|t| at(*t)).collect();
-        let out = at(sig.output());
-        (ins.iter().map(|t| fe.ty_modelled(*t)).collect(), fe.ty_modelled(out))
+        let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
+        if key.1.is_none() {
+            fe.proj_tvars = proj_tvars(fe, did, &tys);
+        }
+        let (out, ins) = tys.split_last().expect("a signature has an output");
+        (ins.iter().map(|t| fe.ty_modelled(*t)).collect(), fe.ty_modelled(*out))
     } else {
         (vec![], fe.ty_modelled(tcx.type_of(did).instantiate_identity().skip_normalization()))
     };
@@ -491,7 +458,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> 
         fd.calls.clear();
         fd.comments.push(m);
     };
-    if kind == "fn" && tcx.asyncness(did).is_async() {
+    if is_fn && tcx.asyncness(did).is_async() {
         fn_placeholder(fe, &mut fd, "async fn");
         return fd;
     }
@@ -507,7 +474,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> 
         return fd;
     }
     if !ret_modelled {
-        let msg = if kind == "fn" {
+        let msg = if is_fn {
             format!("result type `{}`", tcx.fn_sig(did).instantiate_identity().skip_binder().output())
         } else {
             format!("type `{}` of a constant", tcx.type_of(did).instantiate_identity().skip_normalization())
@@ -570,7 +537,6 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
         for &d in comp {
             let def = tcx.adt_def(d);
             let tn = fe.adt_name(d);
-            let generics = tcx.generics_of(d);
             // `d`'s k-th type parameter is the group's k-th
             let mut k = 0;
             let to_shared = ty::GenericArgs::for_item(tcx, d, |p, _| match p.kind {
@@ -585,7 +551,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
             fe.proj_tvars = Some(projs.into_iter().map(alias_of).zip(proj_names.iter().cloned()).collect());
-            let has_const = generics.own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
+            let has_const = tcx.generics_of(d).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
             let mut tparams = tparams.clone();
             tparams.extend(proj_names);
             if fe.ref_adts.contains(&d) {
@@ -778,7 +744,7 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> String {
             step
         )
         .unwrap();
-        let tuple = |xs: &[String]| if xs.len() == 1 { format!("({})", xs[0]) } else { format!("({})", xs.join(",\n   ")) };
+        let tuple = |xs: &[String]| format!("({})", xs.join(",\n   "));
         writeln!(
             out,
             "definition \"{}\" :: {} where\n  {}\n",
@@ -874,19 +840,15 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     te.push_str("  imports \"Micro_Rust_Std_Lib.Micro_Rust_Std_Lib\"\nbegin\n\n");
     te.push_str("text \\<open>Types without a uRust model. Replace these declarations by models.\\<close>\n\n");
     for (n, t) in &fe.ext_types {
-        let args = if t.arity == 0 {
-            String::new()
-        } else {
-            format!("({}) ", (0..t.arity).map(|i| format!("'t{}", i)).collect::<Vec<_>>().join(", "))
-        };
         if t.arity == 0 {
             writeln!(te, "(* {} *)\ntypedecl {}\n", cmt(&t.comment), n).unwrap();
         } else {
             // a one-constructor datatype (a BNF): recursive types may be nested through it. It holds
             // a list of values of each type argument, as an external container may hold none
             // (otherwise a type recursive through it, e.g. a tree of `HashMap`s, would be empty).
+            let args = (0..t.arity).map(|i| format!("'t{}", i)).collect::<Vec<_>>().join(", ");
             let vs: Vec<String> = (0..t.arity).map(|i| format!("\\<open>'t{} list\\<close>", i)).collect();
-            writeln!(te, "(* {} *)\ndatatype {}{} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
+            writeln!(te, "(* {} *)\ndatatype ({}) {} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
         }
     }
     te.push_str("end\n");

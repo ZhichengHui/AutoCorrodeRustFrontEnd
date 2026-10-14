@@ -102,10 +102,14 @@ pub fn local_name(s: &str) -> String {
     if is_reserved(&base) { format!("{}_v", base) } else { base }
 }
 
+/// Rust path segments as one identifier.
+fn joined(segments: &[String]) -> String {
+    segments.iter().map(|s| ident_chars(s)).collect::<Vec<_>>().join("_")
+}
+
 /// Name of a top-level HOL constant derived from Rust path segments.
 pub fn global_name(segments: &[String]) -> String {
-    let joined: Vec<String> = segments.iter().map(|s| ident_chars(s)).collect();
-    let base = joined.join("_");
+    let base = joined(segments);
     if is_reserved(&base) || OUTER_KEYWORDS.contains(&base.as_str()) { format!("{}_fn", base) } else { base }
 }
 
@@ -119,18 +123,14 @@ const RESERVED_TYPES: &[&str] = &[
     "Option", "Vec", "String",
 ];
 
+/// Name of a HOL type derived from Rust path segments.
 pub fn type_name(segments: &[String]) -> String {
-    let base = global_name_raw(segments);
+    let base = joined(segments);
     if RESERVED_TYPES.contains(&base.as_str()) || OUTER_KEYWORDS.contains(&base.as_str()) {
         format!("{}_t", base)
     } else {
         base
     }
-}
-
-fn global_name_raw(segments: &[String]) -> String {
-    let joined: Vec<String> = segments.iter().map(|s| ident_chars(s)).collect();
-    joined.join("_")
 }
 
 /// Type variable name for a Rust generic parameter. Locale type variables

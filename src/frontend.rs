@@ -91,8 +91,6 @@ pub struct Frontend<'tcx> {
     instances_per_fn: HashMap<DefId, usize>,
     /// Instances named but not yet translated.
     pub pending: Vec<FnKey<'tcx>>,
-    /// Local ADTs (structs/enums) that are translated.
-    pub adts: Vec<DefId>,
     /// Local ADTs that no HOL datatype expresses, with the reason: they recur with other type
     /// arguments than their own parameters (e.g. `enum E<A, B> { V(Box<E<B, A>>) }`), or have no
     /// finite values once shared references are values (e.g. `struct Node(&'static Node)`), or
@@ -154,7 +152,6 @@ impl<'tcx> Frontend<'tcx> {
             instance_names: HashMap::new(),
             instances_per_fn: HashMap::new(),
             pending: Vec::new(),
-            adts: Vec::new(),
             opaque_adts: HashMap::new(),
             record_adts: HashSet::new(),
             ref_adts: HashSet::new(),
@@ -168,12 +165,6 @@ impl<'tcx> Frontend<'tcx> {
         self.tcx.sess.source_map().span_to_snippet(sp).unwrap_or_else(|_| "?".to_string())
     }
 
-    pub fn line_of(&self, sp: Span) -> String {
-        let sm = self.tcx.sess.source_map();
-        let loc = sm.lookup_char_pos(sp.lo());
-        format!("line {}", loc.line)
-    }
-
     /// Record a placeholder for the unsupported feature `what` at `sp` (if known). Returns the
     /// text that marks it in the generated theories, in a term or in a comment.
     pub fn placeholder(&mut self, what: &str, sp: Option<Span>) -> String {
@@ -181,9 +172,16 @@ impl<'tcx> Frontend<'tcx> {
             Some(sp) => format!("PLACEHOLDER {}: {}", what, one_line(&self.snippet(sp))),
             None => format!("PLACEHOLDER {}", what),
         };
-        let loc = sp.map(|sp| format!("{}: ", self.line_of(sp))).unwrap_or_default();
+        let loc = sp.map(|sp| format!("line {}: ", self.tcx.sess.source_map().lookup_char_pos(sp.lo()).line)).unwrap_or_default();
         self.placeholders.push(format!("{}{}", loc, marker));
         marker
+    }
+
+    /// Record a placeholder for an item (outside any function body): it is listed in the
+    /// comments at the head of the functions theory.
+    pub fn item_placeholder(&mut self, what: &str, sp: Span) {
+        let m = self.placeholder(what, Some(sp));
+        self.item_comments.push(m);
     }
 
     pub fn marker(&mut self, key: FnKey<'tcx>) -> usize {
@@ -210,25 +208,19 @@ impl<'tcx> Frontend<'tcx> {
     pub fn callee(&mut self, did: DefId, args: GenericArgsRef<'tcx>) -> Option<FnKey<'tcx>> {
         // an instance at a type without a uRust model (e.g. a closure type) could not be
         // translated; the generic function, whose type variable it instantiates, is called instead
-        if !self.mono_fns.contains(&did) || args.has_param() || !args.types().all(|t| self.has_model(t)) {
+        if !self.mono_fns.contains(&did) || args.has_param() || !args.types().all(|t| self.ty_dry(t).1) {
             return Some((did, None));
         }
         let args = self.tcx.erase_and_anonymize_regions(args);
         if !self.instance_names.contains_key(&(did, args)) {
-            let k = self.instances_per_fn.entry(did).or_insert(0);
-            if *k >= MAX_INSTANCES {
+            let count = self.instances_per_fn.entry(did).or_insert(0);
+            if *count >= MAX_INSTANCES {
                 return None;
             }
-            *k += 1;
+            *count += 1;
             let mut segs = self.path_segments(did);
             segs.extend(args.types().map(|t| self.short_ty_name(t)));
-            let base = names::global_name(&segs);
-            let mut n = base.clone();
-            let mut k = 1;
-            while self.used_names.contains(&n) {
-                k += 1;
-                n = format!("{}_{}", base, k);
-            }
+            let n = unique(names::global_name(&segs), |n| self.used_names.contains(n));
             self.used_names.insert(n.clone());
             self.instance_names.insert((did, args), n);
             self.pending.push((did, Some(args)));
@@ -297,14 +289,7 @@ impl<'tcx> Frontend<'tcx> {
     /// HOL constant name of a local item (function, const, static).
     pub fn def_name(&mut self, did: DefId) -> String {
         if let Some(n) = self.names.get(&did) { return n.clone() }
-        let segs = self.path_segments(did);
-        let base = names::global_name(&segs);
-        let mut n = base.clone();
-        let mut k = 1;
-        while self.used_names.contains(&n) {
-            k += 1;
-            n = format!("{}_{}", base, k);
-        }
+        let n = unique(names::global_name(&self.path_segments(did)), |n| self.used_names.contains(n));
         self.used_names.insert(n.clone());
         self.names.insert(did, n.clone());
         n
@@ -313,14 +298,9 @@ impl<'tcx> Frontend<'tcx> {
     /// HOL type name of a local ADT.
     pub fn adt_name(&mut self, did: DefId) -> String {
         if let Some(n) = self.type_names.get(&did) { return n.clone() }
-        let segs = self.path_segments(did);
-        let base = names::type_name(&segs);
-        let mut n = base.clone();
-        let mut k = 1;
-        while self.used_type_names.contains(&n) || self.used_names.contains(&n) {
-            k += 1;
-            n = format!("{}_{}", base, k);
-        }
+        let n = unique(names::type_name(&self.path_segments(did)), |n| {
+            self.used_type_names.contains(n) || self.used_names.contains(n)
+        });
         self.used_type_names.insert(n.clone());
         // constructor function / notation names derive from the type name
         self.used_names.insert(n.clone());
@@ -447,11 +427,6 @@ impl<'tcx> Frontend<'tcx> {
         let before = self.placeholder_type_uses;
         let h = self.ty(t);
         (h, self.placeholder_type_uses == before)
-    }
-
-    /// Does every part of `t` have a uRust model? Nothing is recorded (no placeholder type).
-    pub fn has_model(&mut self, t: Ty<'tcx>) -> bool {
-        self.ty_dry(t).1
     }
 
     /// `ty_modelled` without recording anything (placeholder or external types).
@@ -683,13 +658,9 @@ impl<'tcx> Frontend<'tcx> {
         if let Some(n) = self.ext_type_ids.get(&did) { return n.clone() }
         let mut segs = vec![self.crate_of(did)];
         segs.extend(self.path_segments(did));
-        let base = format!("ext_{}", names::ident_chars(&segs.join("_")));
-        let mut n = base.clone();
-        let mut k = 1;
-        while self.ext_types.contains_key(&n) || self.used_type_names.contains(&n) {
-            k += 1;
-            n = format!("{}_{}", base, k);
-        }
+        let n = unique(format!("ext_{}", names::ident_chars(&segs.join("_"))), |n| {
+            self.ext_types.contains_key(n) || self.used_type_names.contains(n)
+        });
         self.ext_types.insert(n.clone(), ExtType { arity, comment: format!("Rust: {}", self.tcx.def_path_str(did)) });
         self.ext_type_ids.insert(did, n.clone());
         n
@@ -706,17 +677,11 @@ impl<'tcx> Frontend<'tcx> {
         if !did.is_local() { segs.push(self.crate_of(did)); }
         segs.extend(self.path_segments(did));
         let base = format!("{}{}", if foreign { "" } else { "ext_" }, names::global_name(&segs));
-        let mut n = base.clone();
-        let mut k = 1;
-        while self.used_names.contains(&n) {
-            k += 1;
-            n = format!("{}_{}", base, k);
-        }
+        let n = unique(base, |n| self.used_names.contains(n));
         self.used_names.insert(n.clone());
         let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
-        let inputs: Vec<Ty<'tcx>> = sig.inputs().iter().copied().collect();
         self.alias_tvars = Some(0);
-        let params: Vec<String> = inputs.iter().map(|t| self.ty(*t)).collect();
+        let params: Vec<String> = sig.inputs().iter().map(|t| self.ty(*t)).collect();
         let ret = self.ty(sig.output());
         self.alias_tvars = None;
         let hol_type = self.fun_type(&params, &ret);
@@ -746,6 +711,17 @@ impl<'tcx> Frontend<'tcx> {
     pub fn is_trait_item(&self, did: DefId) -> bool {
         matches!(self.tcx.def_kind(self.tcx.parent(did)), DefKind::Trait)
     }
+}
+
+/// `base`, or the first of `base_2`, `base_3`, ... that is not `taken`.
+fn unique(base: String, taken: impl Fn(&str) -> bool) -> String {
+    let mut n = base.clone();
+    let mut k = 1;
+    while taken(&n) {
+        k += 1;
+        n = format!("{}_{}", base, k);
+    }
+    n
 }
 
 pub fn one_line(s: &str) -> String {

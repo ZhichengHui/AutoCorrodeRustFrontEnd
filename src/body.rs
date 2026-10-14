@@ -24,7 +24,7 @@ use crate::frontend::Frontend;
 use crate::names;
 
 pub struct Unsup(pub String);
-pub type R<T> = Result<T, Unsup>;
+type R<T> = Result<T, Unsup>;
 
 fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
@@ -32,16 +32,16 @@ fn unsup<T>(msg: impl Into<String>) -> R<T> {
 
 /// A translated expression with its uRust precedence (1000 = atomic).
 #[derive(Clone, Debug)]
-pub struct Tr {
-    pub s: String,
-    pub prec: u32,
+struct Tr {
+    s: String,
+    prec: u32,
 }
 
 impl Tr {
-    pub fn atom(s: impl Into<String>) -> Tr { Tr { s: s.into(), prec: 1000 } }
-    pub fn new(s: impl Into<String>, prec: u32) -> Tr { Tr { s: s.into(), prec } }
+    fn atom(s: impl Into<String>) -> Tr { Tr { s: s.into(), prec: 1000 } }
+    fn new(s: impl Into<String>, prec: u32) -> Tr { Tr { s: s.into(), prec } }
     /// Render with at least precedence `p`, adding parentheses otherwise.
-    pub fn at(&self, p: u32) -> String {
+    fn at(&self, p: u32) -> String {
         // `(|` is the ASCII form of the record bracket: separate it from a closure
         if self.prec >= p { self.s.clone() } else if self.s.starts_with('|') { format!("( {})", self.s) } else { format!("({})", self.s) }
     }
@@ -142,16 +142,33 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         ))
     }
 
+    /// `{ let tmp = v; ⟪tmp :: h⟫ }`: the value `v` stated to have the HOL type `h`.
+    fn typed(&mut self, base: &str, v: Tr, h: &str) -> Tr {
+        let tmp = self.fresh(base);
+        Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, v.at(20), tmp, h))
+    }
+
     fn ty_of(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.expr_ty(e)) }
     fn ty_adj(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.expr_ty_adjusted(e)) }
 
-    fn peel_refs(t: Ty<'tcx>) -> Ty<'tcx> {
-        let mut t = t;
-        while let ty::Ref(_, inner, _) = t.kind() { t = *inner; }
-        t
+    /// A slice, array or `Vec` (possibly behind references): a uRust list.
+    fn list_like(&self, t: Ty<'tcx>) -> bool {
+        match t.peel_refs().kind() {
+            ty::Slice(_) | ty::Array(..) => true,
+            ty::Adt(def, _) => self.fe.std_adt(def.did()) == Some("Vec"),
+            _ => false,
+        }
     }
 
-    fn is_unit_like(t: Ty<'tcx>) -> bool { t.is_unit() || t.is_never() }
+    /// Bind the pattern variable `hid` to the uRust local `name`; a `mut` binding is a mutable
+    /// local (a cell), which needs storage for its type.
+    fn declare(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<()> {
+        if m.is_mut() {
+            self.alloc(self.node_ty(hid))?;
+        }
+        self.locals.insert(hid, Local { name: name.to_string(), cell: m.is_mut() });
+        Ok(())
+    }
 
     // ------------------------------------------------------------------
     // Function bodies
@@ -167,13 +184,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let n = names::local_name(ident.as_str());
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
+                    self.declare(hid, &n, m)?;
                     if m.is_mut() {
-                        let t = self.node_ty(hid);
-                        self.alloc(t)?;
                         prologue.push(format!("let mut {} = {};", n, n));
-                        self.locals.insert(hid, Local { name: n, cell: true });
-                    } else {
-                        self.locals.insert(hid, Local { name: n, cell: false });
                     }
                 }
                 PatKind::Wild => params.push(format!("unused_{}", i)),
@@ -186,10 +199,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
         }
         let b = self.block_expr_inner(body.value)?;
-        let mut s = prologue.join("\n");
-        if !s.is_empty() { s.push('\n'); }
-        s.push_str(&b);
-        Ok((params, s))
+        Ok((params, with_prologue(&prologue, &b)))
     }
 
     /// Translate an expression used as a whole body (no braces).
@@ -224,9 +234,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn block_seq(&mut self, stmts: &'tcx [hir::Stmt<'tcx>], tail: Option<&'tcx hir::Expr<'tcx>>) -> R<String> {
         let mut parts: Vec<String> = vec![];
         let mut ended_by_divergence = false;
-        let mut i = 0;
-        while i < stmts.len() {
-            let st = &stmts[i];
+        for (i, st) in stmts.iter().enumerate() {
             match st.kind {
                 StmtKind::Item(_) => {}
                 StmtKind::Let(l) => {
@@ -245,7 +253,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     parts.push(s);
                 }
             }
-            i += 1;
         }
         if !ended_by_divergence {
             if let Some(t) = tail {
@@ -307,8 +314,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// type, which unless the context fixes it is an extra type variable of the definition (a
     /// `TYPE` argument of the constant).
     fn never_as(&mut self, tr: Tr, h: &str) -> Tr {
-        let d = self.fresh("never");
-        Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", d, tr.at(20), d, h))
+        self.typed("never", tr, h)
     }
 
     /// Is `e` a call of a standard library function that never returns (translated as a panic,
@@ -360,10 +366,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // `let x;` -- deferred initialisation: model as a mutable local.
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
-                    let t = self.node_ty(hid);
-                    self.alloc(t)?;
-                    let ht = self.fe.ty(t);
-                    self.locals.insert(hid, Local { name: n.clone(), cell: true });
+                    self.declare(hid, &n, hir::Mutability::Mut)?;
+                    let ht = self.fe.ty(self.node_ty(hid));
                     Ok((format!("let mut {} = \\<llangle>undefined :: {}\\<rrangle>;", n, ht), String::new()))
                 } else {
                     unsup("let without initializer and with a non-identifier pattern")
@@ -385,15 +389,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pat.kind {
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                 let n = names::local_name(ident.as_str());
-                if m.is_mut() {
-                    let t = self.node_ty(hid);
-                    self.alloc(t)?;
-                    self.locals.insert(hid, Local { name: n.clone(), cell: true });
-                    Ok(format!("let mut {} = {};", n, v.at(20)))
-                } else {
-                    self.locals.insert(hid, Local { name: n.clone(), cell: false });
-                    Ok(format!("let {} = {};", n, v.at(20)))
-                }
+                self.declare(hid, &n, m)?;
+                Ok(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)))
             }
             PatKind::Wild => Ok(format!("let _ = {};", v.at(20))),
             _ => {
@@ -411,22 +408,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => {}
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
                 let n = names::local_name(ident.as_str());
-                if m.is_mut() {
-                    let t = self.node_ty(hid);
-                    self.alloc(t)?;
-                    out.push(format!("let mut {} = {};", n, v.at(20)));
-                    self.locals.insert(hid, Local { name: n.clone(), cell: true });
-                } else {
-                    out.push(format!("let {} = {};", n, v.at(20)));
-                    self.locals.insert(hid, Local { name: n.clone(), cell: false });
-                }
+                self.declare(hid, &n, m)?;
+                out.push(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)));
                 if let Some(s) = sub {
                     out.extend(self.irrefutable(s, &Tr::atom(n))?);
                 }
             }
             PatKind::Binding(..) => return unsup("`ref` binding"),
             PatKind::Tuple(ps, ddpos) => {
-                let t = Self::peel_refs(self.pat_ty(pat));
+                let t = self.pat_ty(pat).peel_refs();
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
                     if let Some(p) = p {
@@ -437,7 +427,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             PatKind::Struct(_, fields, _) => {
-                let t = Self::peel_refs(self.pat_ty(pat));
+                let t = self.pat_ty(pat).peel_refs();
                 let ty::Adt(def, _) = t.kind() else { return unsup("struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable struct pattern in irrefutable position") }
                 let adt = def.did();
@@ -448,7 +438,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             PatKind::TupleStruct(_, ps, ddpos) => {
-                let t = Self::peel_refs(self.pat_ty(pat));
+                let t = self.pat_ty(pat).peel_refs();
                 let ty::Adt(def, _) = t.kind() else { return unsup("tuple-struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable tuple-struct pattern in irrefutable position") }
                 let adt = def.did();
@@ -466,7 +456,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(out)
     }
 
-    /// Read field `fidx` of a value of local struct `adt`.
     /// A local ADT with no HOL datatype (see `Frontend::opaque_adts`): its values are opaque.
     fn opaque_adt(&self, adt: DefId) -> R<()> {
         if let Some(why) = self.fe.opaque_adts.get(&adt) {
@@ -475,6 +464,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(())
     }
 
+    /// Read field `fidx` of the value `v` of the local struct `adt`.
     fn field_read(&mut self, adt: DefId, fidx: usize, v: &Tr) -> R<Tr> {
         self.opaque_adt(adt)?;
         let f = self.fe.field_name(adt, 0, fidx);
@@ -490,7 +480,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     // ------------------------------------------------------------------
 
     /// Translate an expression to a value; unsupported constructs become placeholders.
-    pub fn expr(&mut self, e: &'tcx hir::Expr<'tcx>) -> Tr {
+    fn expr(&mut self, e: &'tcx hir::Expr<'tcx>) -> Tr {
         match self.pv_adjusted(e) {
             Ok(pv) => self.to_val(pv),
             Err(Unsup(m)) => {
@@ -520,6 +510,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(self.to_val(pv))
     }
 
+    /// The values of `es`, in order.
+    fn vals(&mut self, es: impl IntoIterator<Item = &'tcx hir::Expr<'tcx>>) -> R<Vec<Tr>> {
+        es.into_iter().map(|e| self.val(e)).collect()
+    }
+
     fn to_val(&self, pv: PV) -> Tr {
         match pv {
             PV::Val(t) => t,
@@ -543,8 +538,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Adjust::Deref(DerefAdjustKind::Builtin) => self.deref_pv(pv, cur)?,
                 Adjust::Deref(DerefAdjustKind::Overloaded(_)) => {
                     // Box<T> ~ T, Vec<T> ~ [T] ~ list, String ~ str ~ String.literal
-                    let a = self.fe.ty(Self::peel_refs(cur));
-                    let b = self.fe.ty(Self::peel_refs(target));
+                    let a = self.fe.ty(cur.peel_refs());
+                    let b = self.fe.ty(target.peel_refs());
                     if a != b { return unsup(format!("overloaded dereference of `{}`", cur)) }
                     pv
                 }
@@ -593,18 +588,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn pv_unadj(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<PV> {
         match e.kind {
-            ExprKind::Path(ref qp) => {
-                if let Res::Local(hid) = self.typeck.qpath_res(qp, e.hir_id) {
-                    let Some(l) = self.locals.get(&hid).cloned() else {
-                        return unsup("use of a captured or unknown local");
-                    };
-                    return Ok(if l.cell { PV::Ref(Tr::atom(l.name)) } else { PV::Val(Tr::atom(l.name)) });
-                }
-                Ok(PV::Val(self.val_unadj(e)?))
+            ExprKind::Path(ref qp) if let Res::Local(hid) = self.typeck.qpath_res(qp, e.hir_id) => {
+                let Some(l) = self.locals.get(&hid).cloned() else {
+                    return unsup("use of a captured or unknown local");
+                };
+                Ok(if l.cell { PV::Ref(Tr::atom(l.name)) } else { PV::Val(Tr::atom(l.name)) })
             }
             ExprKind::Unary(UnOp::Deref, inner) => {
                 if self.typeck.type_dependent_def_id(e.hir_id).is_some() {
-                    let a = self.fe.ty(Self::peel_refs(self.ty_adj(inner)));
+                    let a = self.fe.ty(self.ty_adj(inner).peel_refs());
                     let b = self.fe.ty(self.ty_of(e));
                     if a == b { return self.pv_adjusted(inner) }
                     return unsup("overloaded dereference");
@@ -620,17 +612,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     ty::Adt(def, _) if def.is_struct() && def.did().is_local() => {
                         let fidx = self.typeck.field_index(e.hir_id).as_usize();
                         let adt = def.did();
-                        self.opaque_adt(adt)?;
-                        let f = self.fe.field_name(adt, 0, fidx);
-                        if !self.fe.record_adts.contains(&adt) {
-                            return match bpv {
-                                PV::Val(v) => Ok(PV::Val(self.field_read(adt, fidx, &v)?)),
-                                PV::Ref(_) => unsup("field of a recursive struct through a reference"),
-                            };
-                        }
                         match bpv {
-                            PV::Val(v) => Ok(PV::Val(Tr::new(format!("{}.{}", v.at(99), f), 100))),
-                            PV::Ref(r) => Ok(PV::Ref(Tr::new(format!("{}.{}", r.at(99), f), 100))),
+                            PV::Val(v) => Ok(PV::Val(self.field_read(adt, fidx, &v)?)),
+                            PV::Ref(r) => {
+                                self.opaque_adt(adt)?;
+                                if !self.fe.record_adts.contains(&adt) {
+                                    return unsup("field of a recursive struct through a reference");
+                                }
+                                let f = self.fe.field_name(adt, 0, fidx);
+                                Ok(PV::Ref(Tr::new(format!("{}.{}", r.at(99), f), 100)))
+                            }
                         }
                     }
                     ty::Tuple(ts) => {
@@ -658,13 +649,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             ExprKind::Index(base, idx, _) => {
-                let bt = Self::peel_refs(self.ty_adj(base));
-                let list_like = match bt.kind() {
-                    ty::Slice(_) | ty::Array(..) => true,
-                    ty::Adt(def, _) => self.fe.std_adt(def.did()) == Some("Vec"),
-                    _ => false,
-                };
-                if !list_like {
+                let bt = self.ty_adj(base).peel_refs();
+                if !self.list_like(bt) {
                     // `base[idx]` on a local type is `*Index::index(&base, idx)`, or
                     // `*IndexMut::index_mut(&mut base, idx)` in a mutable place; the borrow of the
                     // base is its adjustment, the method resolves to the local implementation
@@ -672,12 +658,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if !local_adt { return unsup(format!("indexing into `{}`", bt)) }
                     let did = self.typeck.type_dependent_def_id(e.hir_id).expect("overloaded indexing has a method");
                     let gargs = self.node_args(e.hir_id);
-                    let argv = vec![self.val(base)?, self.val(idx)?];
+                    let argv = self.vals([base, idx])?;
                     let r = self.call_def(did, gargs, argv, &[base, idx], e)?;
                     let is_mut = self.tcx.trait_of_assoc(did) == self.tcx.lang_items().index_mut_trait();
                     return Ok(if is_mut { PV::Ref(r) } else { PV::Val(r) });
                 }
-                let is_range = matches!(Self::peel_refs(self.ty_adj(idx)).kind(), ty::Adt(..));
+                let is_range = matches!(self.ty_adj(idx).peel_refs().kind(), ty::Adt(..));
                 let mut bpv = self.pv_adjusted(base)?;
                 // overloaded `Index(Mut)` auto-borrows the base: go back to the place
                 let mut bt_adj = self.ty_adj(base);
@@ -724,10 +710,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     return unsup("unresolved method call");
                 };
                 let gargs = self.node_args(e.hir_id);
-                let mut argv = vec![self.val(recv)?];
-                for a in args.iter() { argv.push(self.val(a)?); }
-                let mut arg_exprs = vec![recv];
-                arg_exprs.extend(args.iter());
+                let arg_exprs: Vec<&'tcx hir::Expr<'tcx>> = std::iter::once(recv).chain(args).collect();
+                let argv = self.vals(arg_exprs.iter().copied())?;
                 self.call_def(did, gargs, argv, &arg_exprs, e)
             }
             ExprKind::Tup(es) => {
@@ -738,7 +722,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::Binary(op, l, r) => self.binary(e, op.node, l, r),
             ExprKind::Unary(UnOp::Not, x) => {
-                let xt = Self::peel_refs(self.ty_adj(x));
+                let xt = self.ty_adj(x).peel_refs();
                 if self.typeck.type_dependent_def_id(e.hir_id).is_some() { return self.overloaded_op(e, &[x]) }
                 if !(xt.is_bool() || Self::int_suffix(xt).is_some()) { return unsup(format!("`!` on `{}`", xt)) }
                 let v = self.val(x)?;
@@ -746,7 +730,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::Unary(UnOp::Neg, x) => {
                 if self.typeck.type_dependent_def_id(e.hir_id).is_some() { return self.overloaded_op(e, &[x]) }
-                unsup(format!("negation of `{}`", Self::peel_refs(self.ty_adj(x))))
+                unsup(format!("negation of `{}`", self.ty_adj(x).peel_refs()))
             }
             ExprKind::Unary(UnOp::Deref, _) => unreachable!(),
             ExprKind::Cast(x, _) => self.cast(x, self.ty_of(e)),
@@ -846,8 +830,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         t.is_integral() && Self::int_suffix(t).is_none()
     }
 
-    fn is_u64(t: Ty<'tcx>) -> bool {
-        matches!(t.kind(), ty::Uint(ty::UintTy::U64) | ty::Uint(ty::UintTy::Usize))
+    /// The right operand `r` (translated as `rv`, of type `rt`) of a shift: uRust shifts take a
+    /// `64 word` amount.
+    fn shift_amount(r: &'tcx hir::Expr<'tcx>, rv: Tr, rt: Ty<'tcx>) -> Tr {
+        if matches!(rt.kind(), ty::Uint(ty::UintTy::U64 | ty::UintTy::Usize)) {
+            return rv;
+        }
+        match r.kind {
+            ExprKind::Lit(hir::Lit { node: LitKind::Int(v, _), .. }) => Tr::atom(format!("{}_u64", v.get())),
+            _ => Tr::atom(format!("({}) as u64", rv.s)),
+        }
     }
 
     fn int_lit(v: u128, t: Ty<'tcx>) -> R<Tr> {
@@ -876,14 +868,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn path_value(&mut self, qp: &'tcx hir::QPath<'tcx>, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         let res = self.typeck.qpath_res(qp, e.hir_id);
         match res {
-            Res::Def(DefKind::Ctor(CtorOf::Struct, CtorKind::Const), ctor) => {
-                let adt = self.tcx.parent(ctor);
-                self.unit_ctor(adt, 0)
-            }
-            Res::Def(DefKind::Ctor(CtorOf::Variant, CtorKind::Const), ctor) => {
-                let var = self.tcx.parent(ctor);
-                let adt = self.tcx.parent(var);
-                let vidx = self.tcx.adt_def(adt).variant_index_with_id(var).as_usize();
+            Res::Def(DefKind::Ctor(of, CtorKind::Const), ctor) => {
+                let (adt, vidx) = self.ctor_variant(of, ctor);
                 self.unit_ctor(adt, vidx)
             }
             Res::SelfCtor(_) => {
@@ -897,6 +883,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Res::Def(DefKind::Fn | DefKind::AssocFn, _) => unsup("function item used as a value"),
             Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) => unsup("constructor used as a function value"),
             _ => unsup(format!("path `{}`", self.fe.snippet(e.span))),
+        }
+    }
+
+    /// The ADT and the variant index of the constructor `ctor`.
+    fn ctor_variant(&self, of: CtorOf, ctor: DefId) -> (DefId, usize) {
+        let tcx = self.tcx;
+        match of {
+            CtorOf::Struct => (tcx.parent(ctor), 0),
+            CtorOf::Variant => {
+                let var = tcx.parent(ctor);
+                let adt = tcx.parent(var);
+                (adt, tcx.adt_def(adt).variant_index_with_id(var).as_usize())
+            }
         }
     }
 
@@ -916,39 +915,37 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx)))
     }
 
-    /// Evaluate a constant, unless it is generic or a trait's associated constant
-    /// (evaluating those would make rustc abort).
-    fn const_eval(&self, did: DefId) -> Option<rustc_middle::mir::interpret::EvalToConstValueResult<'tcx>> {
-        if self.fe.is_trait_item(did) || self.tcx.is_static(did) || self.tcx.generics_of(did).requires_monomorphization(self.tcx) {
+    /// The constant `did` of the integer or `bool` type `t` as a literal (e.g. `u32::MAX`), if it
+    /// evaluates to one. A generic constant or a trait's associated constant is not evaluated
+    /// (rustc would abort).
+    fn scalar_const(&self, did: DefId, t: Ty<'tcx>) -> Option<R<Tr>> {
+        let tcx = self.tcx;
+        if !(t.is_integral() || t.is_bool())
+            || self.fe.is_trait_item(did)
+            || tcx.is_static(did)
+            || tcx.generics_of(did).requires_monomorphization(tcx)
+        {
             return None;
         }
-        Some(self.tcx.const_eval_poly(did))
+        let s = tcx.const_eval_poly(did).ok()?.try_to_scalar_int()?;
+        let bits = s.to_bits(s.size());
+        Some(if t.is_bool() { Ok(Tr::atom(if bits != 0 { "true" } else { "false" })) } else { Self::int_lit(bits, t) })
     }
 
     fn const_use(&mut self, did: DefId, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         let t = self.ty_of(e);
-        if let DefKind::Static { mutability, .. } = self.tcx.def_kind(did) {
-            if mutability.is_mut() { return unsup("`static mut`") }
+        if let DefKind::Static { mutability, .. } = self.tcx.def_kind(did)
+            && mutability.is_mut()
+        {
+            return unsup("`static mut`");
         }
-        if did.is_local() {
-            if self.tcx.hir_maybe_body_owned_by(did.expect_local()).is_some()
-                && !self.fe.is_trait_item(did)
-            {
-                self.calls.insert((did, None));
-                let m = self.fe.marker((did, None));
-                return Ok(Tr::new(format!("\u{1}Z{}\u{2}", m), 999));
-            }
+        if did.is_local() && self.tcx.hir_maybe_body_owned_by(did.expect_local()).is_some() && !self.fe.is_trait_item(did) {
+            self.calls.insert((did, None));
+            let m = self.fe.marker((did, None));
+            return Ok(Tr::new(format!("\u{1}Z{}\u{2}", m), 999));
         }
-        // try to evaluate (e.g. `u32::MAX`)
-        if t.is_integral() || t.is_bool() {
-            if let Some(Ok(v)) = self.const_eval(did) {
-                if let Some(s) = v.try_to_scalar_int() {
-                    if t.is_bool() {
-                        return Ok(Tr::atom(if s.to_bits(s.size()) != 0 { "true" } else { "false" }));
-                    }
-                    return Self::int_lit(s.to_bits(s.size()), t);
-                }
-            }
+        if let Some(lit) = self.scalar_const(did, t) {
+            return lit;
         }
         unsup(format!("use of constant `{}`", self.tcx.def_path_str(did)))
     }
@@ -992,8 +989,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn binary(&mut self, e: &'tcx hir::Expr<'tcx>, op: BinOpKind, l: &'tcx hir::Expr<'tcx>, r: &'tcx hir::Expr<'tcx>) -> R<Tr> {
-        let lt = Self::peel_refs(self.ty_adj(l));
-        let rt = Self::peel_refs(self.ty_adj(r));
+        let lt = self.ty_adj(l).peel_refs();
+        let rt = self.ty_adj(r).peel_refs();
         if Self::unmodelled_int(lt) || Self::unmodelled_int(rt) {
             return unsup(format!("binary operator on `{}`", if Self::unmodelled_int(lt) { lt } else { rt }));
         }
@@ -1032,15 +1029,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if lt.is_char() && !matches!(op, BinOpKind::Eq | BinOpKind::Ne) {
             return unsup("ordering comparison on `char`");
         }
-        let rv = if matches!(op, BinOpKind::Shl | BinOpKind::Shr) && !Self::is_u64(rt) {
-            // uRust shifts take a `64 word` shift amount
-            match r.kind {
-                ExprKind::Lit(hir::Lit { node: LitKind::Int(v, _), .. }) => Tr::atom(format!("{}_u64", v.get())),
-                _ => Tr::atom(format!("({}) as u64", rv.s)),
-            }
-        } else {
-            rv
-        };
+        let rv = if matches!(op, BinOpKind::Shl | BinOpKind::Shr) { Self::shift_amount(r, rv, rt) } else { rv };
         let (tok, p) = Self::binop_info(op);
         Ok(Self::mk_bin(tok, p, &lv, &rv))
     }
@@ -1051,15 +1040,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let args = self.node_args(e.hir_id);
         match ty::Instance::try_resolve(self.tcx, self.typing_env(), did, args) {
             Ok(Some(inst)) => {
+                // derived impls, and the std impls (Option, tuples, references, str, slices)
                 let rd = inst.def_id();
-                if let Some(imp) = self.tcx.impl_of_assoc(rd) {
-                    if self.tcx.is_automatically_derived(imp) { return true }
-                    if self.fe.is_std(rd) {
-                        // std impls (Option, tuples, references, str, slices) are structural
-                        return true;
-                    }
-                }
-                false
+                self.tcx.impl_of_assoc(rd).is_some() && (self.derived(rd) || self.fe.is_std(rd))
             }
             _ => false,
         }
@@ -1071,18 +1054,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("operator on a non-primitive type");
         };
         let args = self.node_args(e.hir_id);
-        let mut argv = vec![];
-        for o in operands { argv.push(self.val(o)?); }
+        let argv = self.vals(operands.iter().copied())?;
         self.call_def(did, args, argv, operands, e)
     }
 
     fn assign_op(&mut self, e: &'tcx hir::Expr<'tcx>, op: hir::AssignOpKind, lhs: &'tcx hir::Expr<'tcx>, rhs: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         use hir::AssignOpKind as A;
-        let lt = Self::peel_refs(self.ty_adj(lhs));
+        let lt = self.ty_adj(lhs).peel_refs();
         if Self::unmodelled_int(lt) { return unsup(format!("compound assignment on `{}`", lt)) }
-        if !(lt.is_integral() || lt.is_bool()) || self.typeck.type_dependent_def_id(e.hir_id).is_some() && !lt.is_integral() {
+        let overloaded = self.typeck.type_dependent_def_id(e.hir_id);
+        if !lt.is_integral() && (!lt.is_bool() || overloaded.is_some()) {
             // overloaded compound assignment: call `T::add_assign(&mut lhs, rhs)`
-            let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return unsup("compound assignment") };
+            let Some(did) = overloaded else { return unsup("compound assignment") };
             let args = self.node_args(e.hir_id);
             let p = self.place(lhs)?;
             let v = self.val(rhs)?;
@@ -1090,6 +1073,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         let p = self.place(lhs)?;
         let mut v = self.val(rhs)?;
+        if lt.is_bool() {
+            let tok = match op { A::BitAndAssign => "&&", A::BitOrAssign => "||", A::BitXorAssign => "!=", _ => return unsup("compound assignment on bool") };
+            return Ok(Tr::new(format!("*{} = *{} {} {}", p.at(200), p.at(200), tok, v.at(45)), 40));
+        }
         let tok = match op {
             A::AddAssign => "+=",
             A::SubAssign => "-=",
@@ -1099,13 +1086,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             A::BitOrAssign => "|=",
             A::BitXorAssign => "^=",
             A::ShlAssign | A::ShrAssign => {
-                let rt = Self::peel_refs(self.ty_adj(rhs));
-                if !Self::is_u64(rt) {
-                    v = match rhs.kind {
-                        ExprKind::Lit(hir::Lit { node: LitKind::Int(n, _), .. }) => Tr::atom(format!("{}_u64", n.get())),
-                        _ => Tr::atom(format!("({}) as u64", v.s)),
-                    };
-                }
+                v = Self::shift_amount(rhs, v, self.ty_adj(rhs).peel_refs());
                 if matches!(op, A::ShlAssign) { "<<=" } else { ">>=" }
             }
             A::DivAssign => {
@@ -1115,10 +1096,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 return Ok(Tr::new(format!("*{} = *{} / {}", p.at(200), p.at(200), v.at(51)), 40));
             }
         };
-        if lt.is_bool() {
-            let t2 = match op { A::BitAndAssign => "&&", A::BitOrAssign => "||", A::BitXorAssign => "!=", _ => return unsup("compound assignment on bool") };
-            return Ok(Tr::new(format!("*{} = *{} {} {}", p.at(200), p.at(200), t2, v.at(45)), 40));
-        }
         Ok(Tr::new(format!("*{} {} {}", p.at(200), tok, v.at(40)), 40))
     }
 
@@ -1140,35 +1117,25 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // per-node table has no entry for paths built by desugarings, e.g. of `for`)
                 let ty::FnDef(_, gargs) = *self.ty_of(callee).kind() else { return unsup("call target") };
                 let gargs = self.tcx.instantiate_bound_regions_with_erased(gargs);
-                let mut argv = vec![];
-                for a in args { argv.push(self.val(a)?); }
+                let argv = self.vals(args)?;
                 let arg_exprs: Vec<&'tcx hir::Expr<'tcx>> = args.iter().collect();
                 self.call_def(did, gargs, argv, &arg_exprs, e)
             }
             Res::Def(DefKind::Ctor(of, CtorKind::Fn), ctor) => {
-                let (adt, vidx) = match of {
-                    CtorOf::Struct => (self.tcx.parent(ctor), 0),
-                    CtorOf::Variant => {
-                        let var = self.tcx.parent(ctor);
-                        let adt = self.tcx.parent(var);
-                        (adt, self.tcx.adt_def(adt).variant_index_with_id(var).as_usize())
-                    }
-                };
-                let mut argv = vec![];
-                for a in args { argv.push(self.val(a)?); }
+                let (adt, vidx) = self.ctor_variant(of, ctor);
+                let argv = self.vals(args)?;
                 self.ctor_call(adt, vidx, argv)
             }
             Res::SelfCtor(_) => {
                 let t = self.ty_of(e);
                 let ty::Adt(def, _) = t.kind() else { return unsup("Self constructor") };
-                let mut argv = vec![];
-                for a in args { argv.push(self.val(a)?); }
+                let argv = self.vals(args)?;
                 self.ctor_call(def.did(), 0, argv)
             }
             Res::Local(hid) => {
                 let Some(l) = self.locals.get(&hid).cloned() else { return unsup("call of unknown local") };
                 let mut t = self.ty_of(callee);
-                if !matches!(Self::peel_refs(t).kind(), ty::Closure(..)) {
+                if !matches!(t.peel_refs().kind(), ty::Closure(..)) {
                     return unsup("call through a generic `Fn` parameter (trait call in generic code)");
                 }
                 // the closure value is read out of the local's cell and through the references
@@ -1183,8 +1150,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     t = inner;
                 }
                 let fv = self.to_val(pv);
-                let mut argv = vec![];
-                for a in args { argv.push(self.val(a)?.at(11)); }
+                let argv: Vec<String> = self.vals(args)?.iter().map(|a| a.at(11)).collect();
                 if argv.len() > 8 { return unsup("call with more than 8 arguments") }
                 let (bind, f) = if !read { (None, l.name) } else {
                     let f = self.fresh("clo");
@@ -1321,17 +1287,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     ty::InstanceKind::Virtual(..) => return unsup("dynamic dispatch (trait object)"),
                     _ => {
                         // compiler-generated shims, e.g. `Clone` for primitive/tuple types
-                        if let Some(t) = self.std_call(did, did, argv.clone(), arg_exprs, e)? { return Ok(t) }
+                        if let Some(t) = self.std_call(did, did, &argv, arg_exprs, e)? { return Ok(t) }
                         return unsup(format!("call of `{}`", self.tcx.def_path_str(did)));
                     }
                 },
                 _ => return unsup("trait method call in generic code (needs monomorphisation)"),
             };
-            if target.is_local() {
-                let derived = self.tcx.impl_of_assoc(target).map(|i| self.tcx.is_automatically_derived(i)).unwrap_or(false);
-                if !derived {
-                    return self.local_call(target, targs, argv);
-                }
+            if target.is_local() && !self.derived(target) {
+                return self.local_call(target, targs, argv);
             }
         }
         // functions declared in `extern` blocks: emit a foreign template definition
@@ -1340,15 +1303,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return Ok(self.named_call(&n, argv));
         }
         // methods of types with interior mutability cannot be modelled by values
-        let mut tys: Vec<Ty<'tcx>> = arg_exprs.iter().take(1).map(|a| self.ty_adj(a)).collect();
-        tys.push(self.ty_of(e));
-        for t in tys {
-            let t = Self::peel_refs(t);
+        let receiver = arg_exprs.first().map(|a| self.ty_adj(a));
+        for t in receiver.into_iter().chain([self.ty_of(e)]) {
+            let t = t.peel_refs();
             if self.fe.interior_mutable(t) {
                 return unsup(format!("interior mutability (`{}`)", t));
             }
         }
-        if let Some(t) = self.std_call(did, target, argv.clone(), arg_exprs, e)? {
+        if let Some(t) = self.std_call(did, target, &argv, arg_exprs, e)? {
             return Ok(t);
         }
         if target.is_local() && !self.fe.bodiless_intrinsic(target) {
@@ -1361,8 +1323,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let t = self.ty_of(e);
         if Self::result_undetermined(self.tcx, target) && !t.is_never() {
             let h = self.fe.ty(t);
-            let tmp = self.fresh("res");
-            return Ok(Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, call.at(20), tmp, h)));
+            return Ok(self.typed("res", call, &h));
         }
         Ok(call)
     }
@@ -1405,7 +1366,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         &mut self,
         orig: DefId,
         target: DefId,
-        argv: Vec<Tr>,
+        argv: &[Tr],
         arg_exprs: &[&'tcx hir::Expr<'tcx>],
         e: &'tcx hir::Expr<'tcx>,
     ) -> R<Option<Tr>> {
@@ -1417,27 +1378,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let a = |i: usize| -> Tr { argv[i].clone() };
         let same_hol = |this: &mut Self| -> bool {
             if arg_exprs.is_empty() { return false }
-            let src = Self::peel_refs(this.ty_adj(arg_exprs[0]));
-            let dst = Self::peel_refs(this.ty_of(e));
+            let src = this.ty_adj(arg_exprs[0]).peel_refs();
+            let dst = this.ty_of(e).peel_refs();
             this.fe.ty(src) == this.fe.ty(dst)
         };
         // HOL `=` needs both operands at the same HOL type
         let same_operands = |this: &mut Self| -> bool {
             if arg_exprs.len() != 2 { return false }
-            let l = Self::peel_refs(this.ty_adj(arg_exprs[0]));
-            let r = Self::peel_refs(this.ty_adj(arg_exprs[1]));
+            let l = this.ty_adj(arg_exprs[0]).peel_refs();
+            let r = this.ty_adj(arg_exprs[1]).peel_refs();
             this.fe.ty_dry(l).0 == this.fe.ty_dry(r).0
         };
         let r = match (tk.as_str(), tn.as_str()) {
-            ("Clone", "clone") if !target.is_local() || self.derived(target) => Some(a(0)),
-            ("PartialEq", "eq") if (!target.is_local() || self.derived(target)) && same_operands(self) => {
-                Some(Self::mk_bin("==", 44, &a(0), &a(1)))
-            }
-            ("PartialEq", "ne") if (!target.is_local() || self.derived(target)) && same_operands(self) => {
-                Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
-            }
+            ("Clone", "clone") => Some(a(0)),
+            ("PartialEq", "eq") if same_operands(self) => Some(Self::mk_bin("==", 44, &a(0), &a(1))),
+            ("PartialEq", "ne") if same_operands(self) => Some(Self::mk_bin("!=", 44, &a(0), &a(1))),
             // AutoCorrode's `cmp` needs an `order` on the operands' HOL type
-            ("Ord", "cmp") if !target.is_local() && self.hol_ordered(Self::peel_refs(self.ty_adj(arg_exprs[0]))) => {
+            ("Ord", "cmp") if !target.is_local() && self.hol_ordered(self.ty_adj(arg_exprs[0]).peel_refs()) => {
                 Some(self.named_call("cmp", vec![a(0), a(1)]))
             }
             ("Option", "unwrap") => Some(self.named_call("option_unwrap", vec![a(0)])),
@@ -1539,9 +1496,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         if !adt.is_local() || def.is_union() { return unsup(format!("struct expression of `{}`", t)) }
         self.opaque_adt(adt)?;
-        let res = self.typeck.qpath_res(qp, e.hir_id);
-        let variant = def.variant_of_res(res);
-        let vidx = def.variants().iter().position(|v| v.def_id == variant.def_id).expect("variant of its ADT");
+        let variant = def.variant_of_res(self.typeck.qpath_res(qp, e.hir_id));
+        let vidx = def.variant_index_with_id(variant.def_id).as_usize();
         let nf = variant.fields.len();
         let mut vals: Vec<Option<Tr>> = vec![None; nf];
         let mut pre = vec![];
@@ -1553,8 +1509,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let reordered = base.is_some() || idxs.windows(2).any(|w| w[0] > w[1]);
         let effects = fields.iter().map(|f| f.expr).chain(base).any(|x| !self.is_simple(x));
         let need_tmp = reordered && effects;
-        for f in fields {
-            let idx = self.typeck.field_index(f.hir_id).as_usize();
+        for (f, &idx) in fields.iter().zip(&idxs) {
             let v = self.val(f.expr)?;
             if need_tmp {
                 let tmp = self.fresh("fld");
@@ -1616,9 +1571,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if let ExprKind::Let(le) = c.kind {
             let iv = self.scrut(le.init)?;
             let p = self.pat(le.pat)?;
-            let mut tb = p.prologue.join("\n");
-            if !tb.is_empty() { tb.push('\n'); }
-            tb.push_str(&self.branch(t)?);
+            let tb = with_prologue(&p.prologue, &self.branch(t)?);
             let eb = match el { Some(x) => self.branch(x)?, None => "()".into() };
             if p.conds.is_empty() {
                 return Ok(Tr::new(format!("if let {} = {} {{\n{}\n}} else {{\n{}\n}}", p.pat, iv.at(20), tb, eb), 11));
@@ -1650,7 +1603,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }) else {
             return Ok(None);
         };
-        let from = Self::peel_refs(self.ty_adj(inner));
+        let from = self.ty_adj(inner).peel_refs();
         let to = self.ty_of(ret);
         let (ty::Adt(fd, fa), ty::Adt(td, ta)) = (from.kind(), to.kind()) else { return Ok(None) };
         if self.fe.std_adt(fd.did()) != Some("Result") || self.fe.std_adt(td.did()) != Some("Result") {
@@ -1671,8 +1624,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = self.fe.ext_fun(rd, false);
                 let call = self.named_call(&n, vec![Tr::atom(err.clone())]);
                 let h = self.fe.ty(e2);
-                let tmp = self.fresh("res");
-                Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, call.at(20), tmp, h))
+                self.typed("res", call, &h)
             }
             _ => return unsup("`?` with an unresolved error conversion"),
         };
@@ -1691,7 +1643,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, src: LoopSource) -> R<Tr> {
-        if !Self::is_unit_like(self.ty_of(e)) {
+        let t = self.ty_of(e);
+        if !(t.is_unit() || t.is_never()) {
             return unsup("loop producing a value (`break` with a value)");
         }
         match src {
@@ -1703,9 +1656,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if let ExprKind::Let(le) = cond.kind {
                     let iv = self.scrut(le.init)?;
                     let p = self.pat(le.pat)?;
-                    let mut body = p.prologue.join("\n");
-                    if !body.is_empty() { body.push('\n'); }
-                    body.push_str(&self.branch(then)?);
+                    let body = with_prologue(&p.prologue, &self.branch(then)?);
                     let tuple = matches!(le.pat.kind, PatKind::Tuple(..));
                     if p.conds.is_empty() && !tuple {
                         return Ok(Tr::new(format!("{} while let {} = {} {{\n{}\n}}", FUEL, p.pat, iv.at(20), body), 11));
@@ -1736,12 +1687,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// Is `e` a call of the standard library's slice method `name` (e.g. `iter`), also through
-    /// `Vec` and arrays?
-    fn is_slice_method(&self, e: &hir::Expr<'tcx>, name: &str) -> bool {
-        let ExprKind::MethodCall(_, _, [], _) = e.kind else { return false };
-        let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return false };
-        self.fe.is_std(did) && self.std_key(did) == ("slice".to_string(), name.to_string())
+    /// The receiver of `e` if it is a call (without further arguments) of the standard library's
+    /// slice method `name` (e.g. `iter`), also through `Vec` and arrays.
+    fn slice_method_recv(&self, e: &'tcx hir::Expr<'tcx>, name: &str) -> Option<&'tcx hir::Expr<'tcx>> {
+        let ExprKind::MethodCall(_, recv, [], _) = e.kind else { return None };
+        let did = self.typeck.type_dependent_def_id(e.hir_id)?;
+        (self.fe.is_std(did) && self.std_key(did) == ("slice".to_string(), name.to_string())).then_some(recv)
     }
 
     fn for_loop(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
@@ -1749,16 +1700,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ExprKind::Call(_, [head]) = head_call.kind else { return unsup("for-loop head") };
         let [arm] = arms else { return unsup("for-loop desugaring") };
         let ExprKind::Loop(lb, _, LoopSource::ForLoop, _) = arm.body.kind else { return unsup("for-loop desugaring") };
-        let inner_match = lb.stmts.iter().find_map(|s| match s.kind {
-            StmtKind::Expr(x) | StmtKind::Semi(x) => match x.kind {
-                ExprKind::Match(next, arms2, MatchSource::ForLoopDesugar) => Some((next, arms2)),
-                _ => None,
-            },
+        let stmt_exprs = lb.stmts.iter().filter_map(|s| match s.kind {
+            StmtKind::Expr(x) | StmtKind::Semi(x) => Some(x),
             _ => None,
-        }).or_else(|| lb.expr.and_then(|x| match x.kind {
+        });
+        let inner_match = stmt_exprs.chain(lb.expr).find_map(|x| match x.kind {
             ExprKind::Match(next, arms2, MatchSource::ForLoopDesugar) => Some((next, arms2)),
             _ => None,
-        }));
+        });
         let Some((next, arms2)) = inner_match else { return unsup("for-loop desugaring") };
         // `Some { 0: pat } => body` (a struct pattern in current HIR; a tuple-struct pattern in older ones)
         let some = arms2.iter().find_map(|a| match a.pat.kind {
@@ -1769,31 +1718,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some((some_arm, pat)) = some else { return unsup("for-loop desugaring") };
         // the iterable: a range, slice, array or Vec is iterated by a uRust `for` loop
         let ht = self.ty_of(head);
-        let list_like = |this: &Self, t: Ty<'tcx>| match Self::peel_refs(t).kind() {
-            ty::Slice(_) | ty::Array(..) => true,
-            ty::Adt(def, _) => this.fe.std_adt(def.did()) == Some("Vec"),
-            _ => false,
-        };
         // over `&mut` of a slice, array or Vec (or `xs.iter_mut()`) the items are references to
         // the elements: AutoCorrode's `iter_mut`
         let mut_items = match ht.kind() {
-            ty::Ref(_, inner, m) if m.is_mut() && list_like(self, *inner) => Some(self.val(head)?),
-            _ if self.is_slice_method(head, "iter_mut") => {
-                let ExprKind::MethodCall(_, recv, [], _) = head.kind else { unreachable!() };
-                Some(self.val(recv)?)
-            }
+            ty::Ref(_, inner, m) if m.is_mut() && self.list_like(*inner) => Some(self.val(head)?),
+            _ if let Some(recv) = self.slice_method_recv(head, "iter_mut") => Some(self.val(recv)?),
             _ => None,
         };
-        let iter_s = match Self::peel_refs(ht).kind() {
+        let iter_s = match ht.peel_refs().kind() {
             _ if let Some(r) = mut_items => Tr::new(format!("iter_mut({})", r.at(11)), 999),
             ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Range") | Some("RangeInclusive")) => self.val(head)?,
-            ty::Adt(def, _) if self.fe.std_adt(def.did()) == Some("Vec") => self.val(head)?,
-            ty::Slice(_) | ty::Array(..) => self.val(head)?,
+            _ if self.list_like(ht) => self.val(head)?,
             // `xs.iter()` over a slice, array or Vec: iterate over `xs`
-            _ if self.is_slice_method(head, "iter") => {
-                let ExprKind::MethodCall(_, recv, [], _) = head.kind else { unreachable!() };
-                self.val(recv)?
-            }
+            _ if let Some(recv) = self.slice_method_recv(head, "iter") => self.val(recv)?,
             // any other iterator, as Rust defines `for`: `let mut iter = IntoIterator::into_iter(e);
             // while let Some(p) = Iterator::next(&mut iter) { body }`
             _ => {
@@ -1807,9 +1744,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let next_v = self.val(next)?;
                 let p = self.pat(some_arm.pat)?;
                 if !p.conds.is_empty() { return unsup("for-loop pattern with literal or range sub-patterns") }
-                let mut body = p.prologue.join("\n");
-                if !body.is_empty() { body.push('\n'); }
-                body.push_str(&self.branch(some_arm.body)?);
+                let body = with_prologue(&p.prologue, &self.branch(some_arm.body)?);
                 return Ok(Tr::atom(format!(
                     "{{\n{}\n{} while let {} = {} {{\n{}\n}}\n}}",
                     init,
@@ -1825,13 +1760,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ps = match pat.kind {
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                 let n = names::local_name(ident.as_str());
+                self.declare(hid, &n, m)?;
                 if m.is_mut() {
-                    let t = self.node_ty(hid);
-                    self.alloc(t)?;
                     pro.push(format!("let mut {} = {};", n, n));
-                    self.locals.insert(hid, Local { name: n.clone(), cell: true });
-                } else {
-                    self.locals.insert(hid, Local { name: n.clone(), cell: false });
                 }
                 n
             }
@@ -1842,9 +1773,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 tmp
             }
         };
-        let mut body = pro.join("\n");
-        if !body.is_empty() { body.push('\n'); }
-        body.push_str(&self.branch(some_arm.body)?);
+        let body = with_prologue(&pro, &self.branch(some_arm.body)?);
         Ok(Tr::new(format!("for {} in {} {{\n{}\n}}", ps, iter_s.at(20), body), 11))
     }
 
@@ -1853,7 +1782,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     // ------------------------------------------------------------------
 
     fn int_like(&self, t: Ty<'tcx>) -> bool {
-        let t = Self::peel_refs(t);
+        let t = t.peel_refs();
         t.is_integral() || t.is_char() || t.is_str() || matches!(t.kind(), ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String"))
     }
 
@@ -1892,10 +1821,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let gv = self.val(g)?;
                 conds.push(gv.at(44));
             }
-            let mut body = p.prologue.join("\n");
-            if !body.is_empty() {
-                body.push('\n');
-            }
             let irref = Self::irrefutable_shape(arm.pat);
             if irref && !conds.is_empty() {
                 let rest = if i + 1 < arms.len() {
@@ -1904,11 +1829,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     "panic!(\"non-exhaustive match\")".to_string()
                 };
                 let then = self.branch(arm.body)?;
-                body.push_str(&format!("if {} {{\n{}\n}} else {{\n{}\n}}", conds.join(" && "), then, rest));
+                let body = with_prologue(&p.prologue, &format!("if {} {{\n{}\n}} else {{\n{}\n}}", conds.join(" && "), then, rest));
                 out.push(format!("  {} \\<Rightarrow> {{\n{}\n}}", p.pat, body));
                 break;
             }
-            body.push_str(&self.branch(arm.body)?);
+            let body = with_prologue(&p.prologue, &self.branch(arm.body)?);
             let guard = if conds.is_empty() { String::new() } else { format!(" if {}", conds.join(" && ")) };
             out.push(format!("  {}{} \\<Rightarrow> {{\n{}\n}}", p.pat, guard, body));
             if irref {
@@ -1950,8 +1875,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 hir::PatExprKind::Lit { .. } => true,
                 hir::PatExprKind::Path(ref qp) => match self.typeck.qpath_res(qp, pe.hir_id) {
                     Res::Def(DefKind::Ctor(CtorOf::Variant, CtorKind::Const), c) => {
-                        let adt = self.tcx.parent(self.tcx.parent(c));
-                        self.fe.std_adt(adt) == Some("Ordering")
+                        self.fe.std_adt(self.ctor_variant(CtorOf::Variant, c).0) == Some("Ordering")
                     }
                     Res::Def(DefKind::Const | DefKind::AssocConst { .. }, _) => true,
                     _ => false,
@@ -1973,9 +1897,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut branches: Vec<(Option<String>, String)> = vec![];
         for arm in arms {
             let (cond, binds) = self.pat_cond(arm.pat, &tv)?;
-            let mut body = binds.join("\n");
-            if !body.is_empty() { body.push('\n'); }
-            body.push_str(&self.branch(arm.body)?);
+            let body = with_prologue(&binds, &self.branch(arm.body)?);
             let cond = match arm.guard {
                 Some(g) => {
                     if contains_let(g) { return unsup("`if let` guard") }
@@ -1997,16 +1919,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => Ok((None, vec![])),
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
                 let n = names::local_name(ident.as_str());
-                let mut binds = vec![];
-                if m.is_mut() {
-                    let t = self.node_ty(hid);
-                    self.alloc(t)?;
-                    binds.push(format!("let mut {} = {};", n, v.at(20)));
-                    self.locals.insert(hid, Local { name: n.clone(), cell: true });
-                } else {
-                    binds.push(format!("let {} = {};", n, v.at(20)));
-                    self.locals.insert(hid, Local { name: n.clone(), cell: false });
-                }
+                self.declare(hid, &n, m)?;
+                let mut binds = vec![format!("let {}{} = {};", m.prefix_str(), n, v.at(20))];
                 match sub {
                     Some(s) => {
                         let (c, b2) = self.pat_cond(s, v)?;
@@ -2019,13 +1933,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(..) => unsup("`ref` binding"),
             PatKind::Expr(pe) => Ok((Some(format!("{} == {}", v.at(45), self.pat_expr(pe, pat)?.at(45))), vec![])),
             PatKind::Range(lo, hi, end) => {
-                let mut cs = vec![];
-                if let Some(lo) = lo { cs.push(format!("{} <= {}", self.pat_expr(lo, pat)?.at(45), v.at(45))); }
-                if let Some(hi) = hi {
-                    let op = if matches!(end, hir::RangeEnd::Included) { "<=" } else { "<" };
-                    cs.push(format!("{} {} {}", v.at(45), op, self.pat_expr(hi, pat)?.at(45)));
-                }
                 if self.ty_is_char(pat) { return unsup("range pattern on `char`") }
+                let cs = self.range_conds(lo, hi, end, pat, &v.at(45))?;
                 Ok((Some(cs.into_iter().map(|c| format!("({})", c)).collect::<Vec<_>>().join(" && ")), vec![]))
             }
             PatKind::Or(ps) => {
@@ -2038,7 +1947,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok((Some(cs.join(" || ")), vec![]))
             }
             PatKind::Tuple(ps, ddpos) => {
-                let t = Self::peel_refs(self.pat_ty(pat));
+                let t = self.pat_ty(pat).peel_refs();
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 if n > 16 { return unsup("tuple with more than 16 components") }
                 let mut cs = vec![];
@@ -2059,42 +1968,48 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn ty_is_char(&self, pat: &'tcx hir::Pat<'tcx>) -> bool {
-        Self::peel_refs(self.pat_ty(pat)).is_char()
+        self.pat_ty(pat).peel_refs().is_char()
+    }
+
+    /// The conditions of the range pattern `lo..hi` / `lo..=hi` (in `pat`) on the value `v`.
+    fn range_conds(
+        &mut self,
+        lo: Option<&'tcx hir::PatExpr<'tcx>>,
+        hi: Option<&'tcx hir::PatExpr<'tcx>>,
+        end: hir::RangeEnd,
+        pat: &'tcx hir::Pat<'tcx>,
+        v: &str,
+    ) -> R<Vec<String>> {
+        let mut cs = vec![];
+        if let Some(lo) = lo {
+            cs.push(format!("{} <= {}", self.pat_expr(lo, pat)?.at(45), v));
+        }
+        if let Some(hi) = hi {
+            let op = if matches!(end, hir::RangeEnd::Included) { "<=" } else { "<" };
+            cs.push(format!("{} {} {}", v, op, self.pat_expr(hi, pat)?.at(45)));
+        }
+        Ok(cs)
     }
 
     /// A literal / constant inside a pattern, as a uRust value.
     fn pat_expr(&mut self, pe: &'tcx hir::PatExpr<'tcx>, pat: &'tcx hir::Pat<'tcx>) -> R<Tr> {
-        let t = Self::peel_refs(self.node_ty(pe.hir_id));
-        let t = if t.is_integral() || t.is_char() || t.is_bool() || t.is_str() { t } else { Self::peel_refs(self.pat_ty(pat)) };
+        let t = self.node_ty(pe.hir_id).peel_refs();
+        let t = if t.is_integral() || t.is_char() || t.is_bool() || t.is_str() { t } else { self.pat_ty(pat).peel_refs() };
         match pe.kind {
             hir::PatExprKind::Lit { lit, negated } => {
                 if negated { return unsup(format!("negative literal pattern of type `{}`", t)) }
                 self.lit(&lit.node, t)
             }
-            hir::PatExprKind::Path(ref qp) => {
-                let res = self.typeck.qpath_res(qp, pe.hir_id);
-                match res {
-                    Res::Def(DefKind::Const | DefKind::AssocConst { .. }, did) => {
-                        if t.is_integral() || t.is_bool() {
-                            if let Some(Ok(v)) = self.const_eval(did) {
-                                if let Some(s) = v.try_to_scalar_int() {
-                                    let bits = s.to_bits(s.size());
-                                    if t.is_bool() { return Ok(Tr::atom(if bits != 0 { "true" } else { "false" })) }
-                                    return Self::int_lit(bits, t);
-                                }
-                            }
-                        }
-                        unsup("constant in pattern")
-                    }
-                    Res::Def(DefKind::Ctor(CtorOf::Variant, CtorKind::Const), c) => {
-                        let var = self.tcx.parent(c);
-                        let adt = self.tcx.parent(var);
-                        let vidx = self.tcx.adt_def(adt).variant_index_with_id(var).as_usize();
-                        self.unit_ctor(adt, vidx)
-                    }
-                    _ => unsup("path in pattern expression"),
+            hir::PatExprKind::Path(ref qp) => match self.typeck.qpath_res(qp, pe.hir_id) {
+                Res::Def(DefKind::Const | DefKind::AssocConst { .. }, did) => {
+                    self.scalar_const(did, t).unwrap_or_else(|| unsup("constant in pattern"))
                 }
-            }
+                Res::Def(DefKind::Ctor(of, CtorKind::Const), c) => {
+                    let (adt, vidx) = self.ctor_variant(of, c);
+                    self.unit_ctor(adt, vidx)
+                }
+                _ => unsup("path in pattern expression"),
+            },
         }
     }
 
@@ -2111,19 +2026,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => Ok("_".into()),
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
                 // binding mode after match ergonomics
-                if let Some(bm) = self.typeck.pat_binding_modes().get(hid) {
-                    if let hir::ByRef::Yes(_, mutbl) = bm.0 {
-                        if mutbl.is_mut() { return unsup("binding by mutable reference (match ergonomics)") }
-                    }
+                if let Some(hir::BindingMode(hir::ByRef::Yes(_, mutbl), _)) = self.typeck.pat_binding_modes().get(hid)
+                    && mutbl.is_mut()
+                {
+                    return unsup("binding by mutable reference (match ergonomics)");
                 }
                 let n = names::local_name(ident.as_str());
+                self.declare(hid, &n, m)?;
                 if m.is_mut() {
-                    let t = self.node_ty(hid);
-                    self.alloc(t)?;
                     pro.push(format!("let mut {} = {};", n, n));
-                    self.locals.insert(hid, Local { name: n.clone(), cell: true });
-                } else {
-                    self.locals.insert(hid, Local { name: n.clone(), cell: false });
                 }
                 match sub {
                     None => Ok(n),
@@ -2145,7 +2056,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             PatKind::Binding(..) => unsup("`ref` binding"),
             PatKind::Tuple(ps, ddpos) => {
-                let t = Self::peel_refs(self.pat_ty(pat));
+                let t = self.pat_ty(pat).peel_refs();
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 if n < 2 { return unsup("tuple pattern with fewer than 2 components") }
                 let mut parts = vec![];
@@ -2174,21 +2085,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 self.ctor_pat(adt, vidx, parts)
             }
             PatKind::Expr(pe) => {
-                if let hir::PatExprKind::Path(ref qp) = pe.kind {
-                    let res = self.typeck.qpath_res(qp, pe.hir_id);
-                    match res {
-                        Res::Def(DefKind::Ctor(CtorOf::Variant, CtorKind::Const), ctor) => {
-                            let var = self.tcx.parent(ctor);
-                            let adt = self.tcx.parent(var);
-                            let vidx = self.tcx.adt_def(adt).variant_index_with_id(var).as_usize();
-                            return self.ctor_pat(adt, vidx, vec![]);
-                        }
-                        Res::Def(DefKind::Ctor(CtorOf::Struct, CtorKind::Const), ctor) => {
-                            let adt = self.tcx.parent(ctor);
-                            return self.ctor_pat(adt, 0, vec![]);
-                        }
-                        _ => {}
-                    }
+                if let hir::PatExprKind::Path(ref qp) = pe.kind
+                    && let Res::Def(DefKind::Ctor(of, CtorKind::Const), ctor) = self.typeck.qpath_res(qp, pe.hir_id)
+                {
+                    let (adt, vidx) = self.ctor_variant(of, ctor);
+                    return self.ctor_pat(adt, vidx, vec![]);
                 }
                 let v = self.pat_expr(pe, pat)?;
                 let tmp = self.fresh("lit");
@@ -2198,12 +2099,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Range(lo, hi, end) => {
                 if self.ty_is_char(pat) { return unsup("range pattern on `char`") }
                 let tmp = self.fresh("rng");
-                let tv = Tr::atom(tmp.clone());
-                if let Some(lo) = lo { conds.push(format!("{} <= {}", self.pat_expr(lo, pat)?.at(45), tv.s)); }
-                if let Some(hi) = hi {
-                    let op = if matches!(end, hir::RangeEnd::Included) { "<=" } else { "<" };
-                    conds.push(format!("{} {} {}", tv.s, op, self.pat_expr(hi, pat)?.at(45)));
-                }
+                conds.extend(self.range_conds(lo, hi, end, pat, &tmp)?);
                 Ok(tmp)
             }
             PatKind::Or(ps) => {
@@ -2218,7 +2114,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro),
             PatKind::Slice(before, None, after) if after.is_empty() => {
-                let t = Self::peel_refs(self.pat_ty(pat));
+                let t = self.pat_ty(pat).peel_refs();
                 if !matches!(t.kind(), ty::Slice(_) | ty::Array(..)) { return unsup("slice pattern") }
                 let mut parts = vec![];
                 for p in before.iter() { parts.push(self.pat_rec(p, conds, pro)?); }
@@ -2232,12 +2128,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn pat_variant(&mut self, qp: &'tcx hir::QPath<'tcx>, pat: &'tcx hir::Pat<'tcx>) -> R<(DefId, usize)> {
-        let t = Self::peel_refs(self.pat_ty(pat));
+        let t = self.pat_ty(pat).peel_refs();
         let ty::Adt(def, _) = t.kind() else { return unsup("constructor pattern on non-ADT") };
-        let res = self.typeck.qpath_res(qp, pat.hir_id);
-        let v = def.variant_of_res(res);
-        let vidx = def.variants().iter().position(|x| x.def_id == v.def_id).expect("variant of its ADT");
-        Ok((def.did(), vidx))
+        let v = def.variant_of_res(self.typeck.qpath_res(qp, pat.hir_id));
+        Ok((def.did(), def.variant_index_with_id(v.def_id).as_usize()))
     }
 
     fn ctor_pat(&mut self, adt: DefId, vidx: usize, parts: Vec<String>) -> R<String> {
@@ -2321,13 +2215,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if modelled {
                         pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
                     }
+                    self.declare(hid, &n, m)?;
                     if m.is_mut() {
-                        let t = self.node_ty(hid);
-                        self.alloc(t)?;
                         pro.push(format!("let mut {} = {};", n, n));
-                        self.locals.insert(hid, Local { name: n.clone(), cell: true });
-                    } else {
-                        self.locals.insert(hid, Local { name: n.clone(), cell: false });
                     }
                     ps.push(n);
                 }
@@ -2338,13 +2228,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
         }
-        let mut b = pro.join("\n");
-        if !b.is_empty() { b.push('\n'); }
-        b.push_str(&self.block_expr_inner(body.value)?);
-        Ok((ps, b))
+        let b = self.block_expr_inner(body.value)?;
+        Ok((ps, with_prologue(&pro, &b)))
     }
 }
-
 
 /// Finds, in a closure body, a mutation of a place owned by a captured variable (the variable,
 /// its fields, elements or boxed contents, not what a reference in it points to): an assignment
@@ -2414,6 +2301,15 @@ fn if_chain(branches: Vec<(Option<String>, String)>) -> String {
     acc.unwrap_or_else(|| "panic!(\"empty match\")".into())
 }
 
+/// The statements `pro` followed by `body`.
+fn with_prologue(pro: &[String], body: &str) -> String {
+    let mut s = pro.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s.push_str(body);
+    s
+}
 
 fn paren_if(c: &str) -> String {
     if c.contains(' ') { format!("({})", c) } else { c.to_string() }
