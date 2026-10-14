@@ -113,6 +113,18 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         out
     };
     let adt_sccs = sccs(&adts, &deps);
+    // associated types of an ADT's type parameters in its fields (`S::Unit` in
+    // `struct H<S: Shape> { u: S::Unit }`) become extra type parameters of its datatype; the
+    // groups come after the ADTs they use
+    for comp in &adt_sccs {
+        for &d in comp {
+            let ftys: Vec<Ty<'tcx>> = tcx.adt_def(d).all_fields().map(|f| adt_field_ty(tcx, d, f)).collect();
+            let ps = fe.projections(d, &ftys);
+            if !ps.is_empty() {
+                fe.adt_projs.insert(d, ps);
+            }
+        }
+    }
     // the datatypes of a HOL `datatype ... and ...` have the same type parameters, and each recurs
     // with exactly these, in order (`emit_types` names them after the first member): a group of
     // ADTs with different numbers of type parameters, or in which an ADT `d` refers to a member
@@ -133,6 +145,18 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
                     })
                 })
         });
+        // the members of a group would have to share their extra type parameters (see `adt_projs`)
+        if comp.len() > 1 && comp.iter().any(|d| fe.adt_projs.contains_key(d)) {
+            for &d in comp {
+                fe.opaque_adts.insert(d, "mutually recursive with associated types");
+                let m = fe.placeholder(
+                    "mutually recursive type with an associated type of a type parameter in a field (declared as an abstract type)",
+                    Some(tcx.def_span(d)),
+                );
+                fe.item_comments.push(m);
+            }
+            continue;
+        }
         if nonuniform {
             for &d in comp {
                 fe.opaque_adts.insert(d, "non-uniformly recursive");
@@ -218,13 +242,6 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
                     bodies.push((did, "static"));
                 }
             }
-            hir::ItemKind::Trait { .. } => {
-                let m = fe.placeholder(
-                    "trait definition (its implementations are translated as ordinary functions)",
-                    Some(tcx.def_span(did)),
-                );
-                fe.item_comments.push(m);
-            }
             hir::ItemKind::TraitAlias(..) => {
                 let m = fe.placeholder("trait alias", Some(tcx.def_span(did)));
                 fe.item_comments.push(m);
@@ -271,10 +288,8 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         match ii.kind {
             hir::ImplItemKind::Fn(..) => bodies.push((did, "fn")),
             hir::ImplItemKind::Const(..) => bodies.push((did, "const")),
-            hir::ImplItemKind::Type(..) => {
-                let m = fe.placeholder("associated type", Some(tcx.def_span(did)));
-                fe.item_comments.push(m);
-            }
+            // its uses are normalised to the type it defines
+            hir::ImplItemKind::Type(..) => {}
         }
     }
     // default methods are generic over `Self`: translated at the instances they are called at
@@ -283,10 +298,6 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         let ti = tcx.hir_trait_item(id);
         match ti.kind {
             hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)) => default_methods.push(ti.owner_id.to_def_id()),
-            hir::TraitItemKind::Type(..) => {
-                let m = fe.placeholder("associated type", Some(tcx.def_span(ti.owner_id.to_def_id())));
-                fe.item_comments.push(m);
-            }
             _ => {}
         }
     }
@@ -392,7 +403,48 @@ fn mono_fns<'tcx>(tcx: TyCtxt<'tcx>, bodies: &[(DefId, &str)], default_methods: 
     }
 }
 
+/// The type variable of the `k`-th projection of a datatype or generic function (type
+/// parameters' variables are `'r..`, see `names::tvar_name`).
+fn proj_tvar(k: usize) -> String {
+    format!("'proj{}", k)
+}
+
+fn alias_of(t: Ty<'_>) -> ty::AliasTy<'_> {
+    match t.kind() {
+        ty::Alias(_, a) => *a,
+        _ => unreachable!("projections are aliases"),
+    }
+}
+
+/// A generic function is a HOL constant polymorphic also in the associated types of its type
+/// parameters in its signature (`T::Output` in `fn first<T: Index<usize>>(x: &T) -> &T::Output`):
+/// they are type variables, which each instance fixes (`Output = u32` at `T = Buf`). Independent
+/// variables cannot express that two associated types of the same type are equal through an
+/// implementation (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`), so with two of
+/// them the signature's types are not modelled. One occurring only in the body is not a variable
+/// (it would be an extra type variable of the definition).
 fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> FunDef<'tcx> {
+    if key.1.is_none() && kind == "fn" {
+        let did = key.0;
+        let sig = fe.tcx.instantiate_bound_regions_with_erased(fe.tcx.fn_sig(did).instantiate_identity().skip_normalization());
+        let env = ty::TypingEnv::post_analysis(fe.tcx, did);
+        let tys: Vec<Ty<'tcx>> = sig
+            .inputs_and_output
+            .iter()
+            .map(|t| fe.tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t))
+            .collect();
+        let ps: Vec<ty::AliasTy<'tcx>> = fe.projections(did, &tys).into_iter().map(alias_of).collect();
+        let selves: Vec<Ty<'tcx>> = ps.iter().filter(|a| a.try_to_projection().is_some()).map(|a| a.args.type_at(0)).collect();
+        if (1..selves.len()).all(|i| !selves[..i].contains(&selves[i])) {
+            fe.proj_tvars = Some(ps.into_iter().enumerate().map(|(k, a)| (a, proj_tvar(k))).collect());
+        }
+    }
+    let fd = translate_fn(fe, key, kind);
+    fe.proj_tvars = None;
+    fd
+}
+
+fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>, kind: &str) -> FunDef<'tcx> {
     let tcx = fe.tcx;
     let did = key.0;
     let ld: LocalDefId = did.expect_local();
@@ -528,9 +580,14 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 }
                 _ => tcx.mk_param_from_def(p),
             });
-            let field_ty = |f: &ty::FieldDef| tcx.type_of(f.did).instantiate(tcx, to_shared).skip_normalization();
+            let field_ty = |f: &ty::FieldDef| ty::EarlyBinder::bind(tcx, adt_field_ty(tcx, d, f)).instantiate(tcx, to_shared).skip_normalization();
+            // a group with associated types in fields has one member (see `run`)
+            let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
+            let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
+            fe.proj_tvars = Some(projs.into_iter().map(alias_of).zip(proj_names.iter().cloned()).collect());
             let has_const = generics.own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
             let mut tparams = tparams.clone();
+            tparams.extend(proj_names);
             if fe.ref_adts.contains(&d) {
                 tparams.insert(0, "'gv".into());
                 tparams.insert(0, "'addr".into());
@@ -585,12 +642,20 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
             }
         }
+        fe.proj_tvars = None;
         if !decls.is_empty() {
             writeln!(out, "datatype {}\n", decls.join("\nand ")).unwrap();
         }
         out.push_str(&after);
     }
     out
+}
+
+/// The type of field `f` of the local ADT `d`, without regions, normalised in `d`'s typing
+/// environment: what remains of a projection depends on `d`'s type parameters.
+fn adt_field_ty<'tcx>(tcx: TyCtxt<'tcx>, d: DefId, f: &ty::FieldDef) -> Ty<'tcx> {
+    let t = tcx.erase_and_anonymize_regions(tcx.type_of(f.did).instantiate_identity().skip_normalization());
+    tcx.try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, d), ty::Unnormalized::new_wip(t)).unwrap_or(t)
 }
 
 /// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.

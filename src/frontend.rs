@@ -105,6 +105,12 @@ pub struct Frontend<'tcx> {
     pub ref_adts: HashSet<DefId>,
     /// When set, unnormalisable projections and `impl Trait` become fresh type variables.
     pub alias_tvars: Option<usize>,
+    /// For a local ADT whose fields mention associated types of its type parameters (e.g.
+    /// `struct H<S: Shape> { u: S::Unit }`), these projections in order: each is an extra type
+    /// parameter of its datatype, instantiated at a use `H<Sq>` by the normalised `<Sq as Shape>::Unit`.
+    pub adt_projs: HashMap<DefId, Vec<Ty<'tcx>>>,
+    /// While a datatype is declared: its projections' type variables (see `adt_projs`).
+    pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
 }
 
 pub fn paren_ty(s: &str) -> String {
@@ -153,6 +159,8 @@ impl<'tcx> Frontend<'tcx> {
             record_adts: HashSet::new(),
             ref_adts: HashSet::new(),
             alias_tvars: None,
+            adt_projs: HashMap::new(),
+            proj_tvars: None,
         }
     }
 
@@ -502,6 +510,42 @@ impl<'tcx> Frontend<'tcx> {
         }
     }
 
+    /// The associated types of type parameters in the types `tys` (normalised in `did`'s typing
+    /// environment), in order of occurrence: those written, and those the datatypes of local ADTs
+    /// in them take as extra type parameters (see `adt_projs`).
+    pub fn projections(&self, did: DefId, tys: &[Ty<'tcx>]) -> Vec<Ty<'tcx>> {
+        let env = ty::TypingEnv::post_analysis(self.tcx, did);
+        let mut out: Vec<Ty<'tcx>> = vec![];
+        let add = |p: Ty<'tcx>, out: &mut Vec<Ty<'tcx>>| {
+            if let ty::Alias(_, a) = p.kind()
+                && p.has_param()
+                && !out.iter().any(|q| matches!(q.kind(), ty::Alias(_, b) if b == a))
+            {
+                out.push(p);
+            }
+        };
+        for &t in tys {
+            let mut w = self.tcx.erase_and_anonymize_regions(t).walk();
+            while let Some(g) = w.next() {
+                let ty::GenericArgKind::Type(x) = g.kind() else { continue };
+                match x.kind() {
+                    ty::Alias(..) => {
+                        w.skip_current_subtree();
+                        add(x, &mut out);
+                    }
+                    ty::Adt(def, args) => {
+                        for &p in self.adt_projs.get(&def.did()).into_iter().flatten() {
+                            let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
+                            add(self.tcx.try_normalize_erasing_regions(env, at).unwrap_or(at.skip_normalization()), &mut out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
     /// Map a Rust type to a HOL type.
     pub fn ty(&mut self, t: Ty<'tcx>) -> String {
         match t.kind() {
@@ -568,6 +612,12 @@ impl<'tcx> Frontend<'tcx> {
                             a.push("'gv".into());
                         }
                         a.extend(targs.iter().map(|x| self.ty(*x)));
+                        if let Some(ps) = self.adt_projs.get(&did).cloned() {
+                            for p in ps {
+                                let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args).skip_normalization();
+                                a.push(self.ty(at));
+                            }
+                        }
                         if a.is_empty() { name } else { format!("({}) {}", a.join(", "), name) }
                     }
                 }
@@ -579,6 +629,9 @@ impl<'tcx> Frontend<'tcx> {
                 // associated-type projections that can be resolved (e.g. `<V2 as Add>::Output`); lifetime
                 // parameters do not matter (HOL has no regions), so they are erased first
                 let t = self.tcx.erase_and_anonymize_regions(t);
+                if let ty::Alias(_, a) = t.kind() && let Some(v) = self.proj_tvars.as_ref().and_then(|m| m.get(a)) {
+                    return v.clone();
+                }
                 if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
                     if !matches!(n.kind(), ty::Alias(..)) {
                         return self.ty(n);
