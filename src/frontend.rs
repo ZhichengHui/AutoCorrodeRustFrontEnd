@@ -458,15 +458,46 @@ impl<'tcx> Frontend<'tcx> {
         r
     }
 
-    /// Does the HOL type of `t` (see `ty`) have a finite value, given the local ADTs `local` of
-    /// which those in `finite` are known to? `&T` and `Box<T>` are `T`; every other type (lists,
-    /// options, references `&mut`, type variables, abstract types) has one.
-    pub fn finite_ty(&self, t: Ty<'tcx>, local: &HashSet<DefId>, finite: &HashSet<DefId>) -> bool {
+    /// Does the HOL type of `t` (see `ty`) have a finite value? `&T`, `Box<T>`, ranges of `T` and
+    /// tuples have one iff their parts do, `Result<A, B>` iff `A` or `B` does, a local ADT of
+    /// `local` iff some variant's fields do (at its type arguments); lists, options, `&mut`
+    /// references, type variables and abstract types always have one. `stack` holds the local
+    /// ADTs being decided: a value of one of them inside itself is not finite (least fixpoint).
+    /// `known` holds local ADTs found to have a finite value (which does not depend on `stack`).
+    pub fn finite_ty(&self, t: Ty<'tcx>, local: &HashSet<DefId>, stack: &mut Vec<Ty<'tcx>>, known: &mut HashSet<Ty<'tcx>>) -> bool {
         match t.kind() {
-            ty::Ref(_, inner, m) if !m.is_mut() => self.finite_ty(*inner, local, finite),
-            ty::Tuple(ts) => ts.iter().all(|x| self.finite_ty(x, local, finite)),
-            ty::Adt(def, _) if local.contains(&def.did()) => finite.contains(&def.did()),
-            ty::Adt(def, args) if self.std_adt(def.did()) == Some("Box") => self.finite_ty(args.type_at(0), local, finite),
+            ty::Ref(_, inner, m) if !m.is_mut() => self.finite_ty(*inner, local, stack, known),
+            ty::Tuple(ts) => ts.iter().all(|x| self.finite_ty(x, local, stack, known)),
+            ty::Adt(def, args) if local.contains(&def.did()) => {
+                if self.opaque_adts.contains_key(&def.did()) || (def.is_enum() && def.variants().is_empty()) {
+                    return true;
+                }
+                if known.contains(&t) {
+                    return true;
+                }
+                if stack.contains(&t) {
+                    return false;
+                }
+                stack.push(t);
+                let r = def.variants().iter().any(|v| {
+                    v.fields.iter().all(|f| {
+                        let ft = self.tcx.type_of(f.did).instantiate(self.tcx, args).skip_normalization();
+                        self.finite_ty(ft, local, stack, known)
+                    })
+                });
+                stack.pop();
+                if r {
+                    known.insert(t);
+                }
+                r
+            }
+            ty::Adt(def, args) => match self.std_adt(def.did()) {
+                Some("Box") | Some("Range") | Some("RangeInclusive") => self.finite_ty(args.type_at(0), local, stack, known),
+                Some("Result") => {
+                    self.finite_ty(args.type_at(0), local, stack, known) || self.finite_ty(args.type_at(1), local, stack, known)
+                }
+                _ => true,
+            },
             _ => true,
         }
     }
@@ -522,12 +553,12 @@ impl<'tcx> Frontend<'tcx> {
                     }
                     _ => {
                         let name = if let Some(&why) = self.opaque_adts.get(&did) {
-                            let n = self.tcx.item_name(did);
+                            let n = self.tcx.def_path_str(did);
                             self.placeholder_type(&format!("{} {}", why, n), targs.len())
                         } else if did.is_local() && !def.is_union() {
                             self.adt_name(did)
                         } else if did.is_local() {
-                            self.placeholder_type(&format!("union {}", self.tcx.item_name(did)), targs.len())
+                            self.placeholder_type(&format!("union {}", self.tcx.def_path_str(did)), targs.len())
                         } else {
                             self.ext_type(did, targs.len())
                         };

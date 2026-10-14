@@ -113,22 +113,25 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         out
     };
     let adt_sccs = sccs(&adts, &deps);
-    // a HOL datatype recurs with its own type parameters, in order: a group of ADTs recurring with
-    // other type arguments is a placeholder
+    // the datatypes of a HOL `datatype ... and ...` have the same type parameters, and each recurs
+    // with exactly these, in order (`emit_types` names them after the first member): a group of
+    // ADTs with different numbers of type parameters, or in which an ADT `d` refers to a member
+    // with other type arguments than `d`'s own parameters, is a placeholder
+    let own_types = |d: DefId| -> Vec<Ty<'_>> { ty::GenericArgs::identity_for_item(tcx, d).types().collect() };
     for comp in &adt_sccs {
+        let arity = own_types(comp[0]).len();
         let nonuniform = comp.iter().any(|&d| {
-            tcx.adt_def(d).all_fields().any(|f| {
-                tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().any(|g| match g.kind() {
-                    ty::GenericArgKind::Type(tt) => match tt.kind() {
-                        ty::Adt(e, args) if comp.contains(&e.did()) => {
-                            let own = ty::GenericArgs::identity_for_item(tcx, e.did());
-                            args.types().collect::<Vec<_>>() != own.types().collect::<Vec<_>>()
-                        }
+            let own = own_types(d);
+            own.len() != arity
+                || tcx.adt_def(d).all_fields().any(|f| {
+                    tcx.type_of(f.did).instantiate_identity().skip_normalization().walk().any(|g| match g.kind() {
+                        ty::GenericArgKind::Type(tt) => match tt.kind() {
+                            ty::Adt(e, args) if comp.contains(&e.did()) => args.types().collect::<Vec<_>>() != own,
+                            _ => false,
+                        },
                         _ => false,
-                    },
-                    _ => false,
+                    })
                 })
-            })
         });
         if nonuniform {
             for &d in comp {
@@ -140,33 +143,19 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     }
     // a shared reference `&T` is a value of `T`, so a type whose every value contains a value of
     // the same type through shared references (e.g. `struct Node(&'static Node)`, whose values are
-    // cycles of statics) has no finite values, and its HOL datatype (a least fixpoint) is empty.
-    // Least fixpoint of the ADTs with finite values; abstract types (`typedecl`) are not empty.
-    let mut finite: HashSet<DefId> = adts
+    // cycles of statics) has no finite values, and its HOL datatype (a least fixpoint) is empty
+    let mut known = HashSet::new();
+    let finite: HashSet<DefId> = adts
         .iter()
         .copied()
-        .filter(|d| fe.opaque_adts.contains_key(d) || (tcx.adt_def(*d).is_enum() && tcx.adt_def(*d).variants().is_empty()))
+        .filter(|&d| fe.finite_ty(tcx.type_of(d).instantiate_identity().skip_normalization(), &adt_set, &mut vec![], &mut known))
         .collect();
-    loop {
-        let mut changed = false;
-        for &d in &adts {
-            if finite.contains(&d) { continue }
-            let has_finite_value = tcx.adt_def(d).variants().iter().any(|v| {
-                v.fields.iter().all(|f| fe.finite_ty(tcx.type_of(f.did).instantiate_identity().skip_normalization(), &adt_set, &finite))
-            });
-            if has_finite_value {
-                finite.insert(d);
-                changed = true;
-            }
-        }
-        if !changed { break }
-    }
     for comp in &adt_sccs {
         if comp.iter().all(|d| finite.contains(d)) { continue }
         for &d in comp {
             fe.opaque_adts.insert(d, "without finite values");
             let m = fe.placeholder(
-                "type without finite values when shared references are values, or recursive with one (declared as an abstract type)",
+                "type without finite values (a shared reference is its referent), or in a recursive group with one (declared as an abstract type)",
                 Some(tcx.def_span(d)),
             );
             fe.item_comments.push(m);
@@ -517,18 +506,31 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
         }
         let mut decls = vec![];
         let mut after = String::new();
+        // the type parameters of the first member, shared by the group (see `run`)
+        let shared: Vec<Ty<'tcx>> = ty::GenericArgs::identity_for_item(tcx, comp[0]).types().collect();
+        let tparams: Vec<String> = shared
+            .iter()
+            .map(|t| match t.kind() {
+                ty::Param(p) => names::tvar_name(p.name.as_str()),
+                _ => unreachable!("identity arguments are parameters"),
+            })
+            .collect();
         for &d in comp {
             let def = tcx.adt_def(d);
             let tn = fe.adt_name(d);
             let generics = tcx.generics_of(d);
-            let tparams: Vec<String> = generics
-                .own_params
-                .iter()
-                .filter(|p| matches!(p.kind, ty::GenericParamDefKind::Type { .. }))
-                .map(|p| names::tvar_name(p.name.as_str()))
-                .collect();
+            // `d`'s k-th type parameter is the group's k-th
+            let mut k = 0;
+            let to_shared = ty::GenericArgs::for_item(tcx, d, |p, _| match p.kind {
+                ty::GenericParamDefKind::Type { .. } => {
+                    k += 1;
+                    shared[k - 1].into()
+                }
+                _ => tcx.mk_param_from_def(p),
+            });
+            let field_ty = |f: &ty::FieldDef| tcx.type_of(f.did).instantiate(tcx, to_shared).skip_normalization();
             let has_const = generics.own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
-            let mut tparams = tparams;
+            let mut tparams = tparams.clone();
             if fe.ref_adts.contains(&d) {
                 tparams.insert(0, "'gv".into());
                 tparams.insert(0, "'addr".into());
@@ -550,8 +552,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             }
             if def.is_struct() {
                 let v = def.non_enum_variant();
-                let ftys: Vec<String> =
-                    v.fields.iter().map(|f| fe.ty(tcx.type_of(f.did).instantiate_identity().skip_normalization())).collect();
+                let ftys: Vec<String> = v.fields.iter().map(|f| fe.ty(field_ty(f))).collect();
                 let fnames: Vec<String> = (0..v.fields.len()).map(|k| fe.field_name(d, 0, k)).collect();
                 if v.fields.is_empty() {
                     decls.push(format!("{} = make_{}", head, tn));
@@ -574,8 +575,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 let mut ctors = vec![];
                 for (vi, v) in def.variants().iter().enumerate() {
                     let cn = fe.variant_ctor_name(d, vi);
-                    let ftys: Vec<String> =
-                        v.fields.iter().map(|f| fe.ty(tcx.type_of(f.did).instantiate_identity().skip_normalization())).collect();
+                    let ftys: Vec<String> = v.fields.iter().map(|f| fe.ty(field_ty(f))).collect();
                     let args: Vec<String> = ftys.iter().map(|t| cart(t)).collect();
                     ctors.push(if args.is_empty() { cn.clone() } else { format!("{} {}", cn, args.join(" ")) });
                     if !ftys.is_empty() {

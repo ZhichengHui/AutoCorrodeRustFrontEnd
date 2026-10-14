@@ -7,13 +7,14 @@
 //! * a value of type `&T` is represented by the value of type `T` (shared
 //!   borrows of data without interior mutability are observationally values).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustc_ast::ast::LitKind;
 use rustc_hir as hir;
 use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeckResults};
@@ -269,13 +270,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// is reached only when the fuel of a loop is exhausted. A panic or placeholder becomes the
     /// value of the block.
     fn diverging(&mut self, parts: &mut Vec<String>, e: &'tcx hir::Expr<'tcx>) {
-        let tr = self.expr(e);
-        if tr.s.starts_with("unimplemented!") || tr.s.starts_with("panic!") {
+        // the value is discarded: its coercion (`NeverToAny`) does not apply
+        let tr = match self.pv_unadj(e) {
+            Ok(pv) => self.to_val(pv),
+            Err(Unsup(m)) => {
+                // the placeholder of an expression of type `!` has any type
+                let marker = self.fe.placeholder(&m, Some(e.span));
+                let p = self.placeholder_term(&marker, self.ty_of(e));
+                parts.push(format!("\u{3}{}", p.s));
+                return;
+            }
+        };
+        // a panic (of any type) is the value of the block
+        if self.is_std_panic(e) {
             parts.push(format!("\u{3}{}", tr.s));
             return;
         }
-        // a `return` that is translated (not a placeholder) leaves the function
-        if matches!(e.kind, ExprKind::Ret(_)) && tr.s.starts_with("return") {
+        if matches!(e.kind, ExprKind::Ret(_)) {
             // \u{4}: ends with its own semicolon
             parts.push(if tr.s.ends_with(';') { format!("\u{4}{}", tr.s) } else { format!("{};", tr.s) });
             return;
@@ -286,18 +297,42 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if matches!(e.kind, ExprKind::Loop(..)) {
             parts.push(format!("{};", tr.at(11)));
         } else {
-            let d = self.fresh("never");
-            parts.push(format!("{{ let {} = {}; \\<llangle>{} :: unit\\<rrangle> }};", d, tr.at(20), d));
+            parts.push(format!("{};", self.never_as(tr, "unit").s));
         }
         parts.push("\u{3}panic!(\"unreachable: diverging expression completed\")".to_string());
     }
 
-    /// An expression in statement position, rendered as a complete statement.
+    /// The value of an expression of type `!` stated to have the HOL type `h` (the type it is
+    /// coerced to; `!` itself is `unit`, see `Frontend::ty`): a panic or `return` in it has any
+    /// type, which unless the context fixes it is an extra type variable of the definition (a
+    /// `TYPE` argument of the constant).
+    fn never_as(&mut self, tr: Tr, h: &str) -> Tr {
+        let d = self.fresh("never");
+        Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", d, tr.at(20), d, h))
+    }
+
+    /// Is `e` a call of a standard library function that never returns (translated as a panic,
+    /// see `panic_or_print`), possibly as the only part of a block (a macro expansion)?
+    fn is_std_panic(&self, e: &'tcx hir::Expr<'tcx>) -> bool {
+        match e.kind {
+            ExprKind::Block(b, None) => match (b.stmts, b.expr) {
+                ([], Some(x)) => self.is_std_panic(x),
+                ([st], None) => matches!(st.kind, StmtKind::Expr(x) | StmtKind::Semi(x) if self.is_std_panic(x)),
+                _ => false,
+            },
+            ExprKind::Call(callee, _) => match *self.ty_of(callee).kind() {
+                ty::FnDef(did, _) => self.fe.is_std(did) && self.tcx.fn_sig(did).skip_binder().output().skip_binder().is_never(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// An expression statement of a type other than `!` (see `diverging`).
     fn stmt_expr(&mut self, e: &'tcx hir::Expr<'tcx>) -> String {
         let t = self.ty_of(e);
         let tr = self.expr(e);
-        if t.is_unit() || tr.s.starts_with("unimplemented!") {
+        if t.is_unit() {
             format!("{};", tr.at(11))
         } else {
             format!("let _ = {};", tr.at(20))
@@ -335,7 +370,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             Some(init) => {
-                let iv = self.expr(init);
+                let mut iv = self.expr(init);
+                // a variable of type `!` (no coercion of the initializer fixes its type)
+                if self.ty_adj(init).is_never() {
+                    iv = self.never_as(iv, "unit");
+                }
                 Ok((self.bind_pattern(l.pat, iv)?, String::new()))
             }
         }
@@ -494,7 +533,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         for adj in self.typeck.expr_adjustments(e) {
             let target = self.mono(adj.target);
             pv = match &adj.kind {
-                Adjust::NeverToAny => pv,
+                // a `return` is a statement (its block has the value `()`)
+                Adjust::NeverToAny if matches!(e.kind, ExprKind::Ret(_)) => pv,
+                Adjust::NeverToAny => {
+                    let h = self.fe.ty(target);
+                    let v = self.to_val(pv);
+                    PV::Val(self.never_as(v, &h))
+                }
                 Adjust::Deref(DerefAdjustKind::Builtin) => self.deref_pv(pv, cur)?,
                 Adjust::Deref(DerefAdjustKind::Overloaded(_)) => {
                     // Box<T> ~ T, Vec<T> ~ [T] ~ list, String ~ str ~ String.literal
@@ -1127,10 +1172,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     return unsup("call through a generic `Fn` parameter (trait call in generic code)");
                 }
                 // the closure value is read out of the local's cell and through the references
-                // to it; closures never mutate their captures (see `closure`), so a call does not
-                // change the value
+                // to it; closures that mutate their captures are not translated (see `closure`), so
+                // a call does not change the value
+                // (a shared reference is its referent, so only a cell or `&mut` needs a read)
+                let mut read = l.cell;
                 let mut pv = if l.cell { PV::Ref(Tr::atom(l.name.clone())) } else { PV::Val(Tr::atom(l.name.clone())) };
-                while let ty::Ref(_, inner, _) = *t.kind() {
+                while let ty::Ref(_, inner, m) = *t.kind() {
+                    read |= m.is_mut();
                     pv = self.deref_pv(pv, t)?;
                     t = inner;
                 }
@@ -1138,7 +1186,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let mut argv = vec![];
                 for a in args { argv.push(self.val(a)?.at(11)); }
                 if argv.len() > 8 { return unsup("call with more than 8 arguments") }
-                let (bind, f) = if fv.s == l.name { (None, l.name) } else {
+                let (bind, f) = if !read { (None, l.name) } else {
                     let f = self.fresh("clo");
                     (Some(format!("let {} = {}; ", f, fv.at(20))), f)
                 };
@@ -1365,13 +1413,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !(self.fe.is_std(target) || self.derived(target)) {
             return Ok(None);
         }
-        // its uRust counterparts need the types' models (e.g. `cmp` needs an order); with an
-        // argument or result of a type without one, the external template is called instead
-        let mut tys: Vec<Ty<'tcx>> = arg_exprs.iter().map(|a| Self::peel_refs(self.ty_adj(a))).collect();
-        tys.push(Self::peel_refs(self.ty_of(e)));
-        if !tys.into_iter().all(|t| self.fe.has_model(t)) {
-            return Ok(None);
-        }
         let (tk, tn) = self.std_key(orig);
         let a = |i: usize| -> Tr { argv[i].clone() };
         let same_hol = |this: &mut Self| -> bool {
@@ -1395,7 +1436,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("PartialEq", "ne") if (!target.is_local() || self.derived(target)) && same_operands(self) => {
                 Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
             }
-            ("Ord", "cmp") if !target.is_local() => Some(self.named_call("cmp", vec![a(0), a(1)])),
+            // AutoCorrode's `cmp` needs an `order` on the operands' HOL type
+            ("Ord", "cmp") if !target.is_local() && self.hol_ordered(Self::peel_refs(self.ty_adj(arg_exprs[0]))) => {
+                Some(self.named_call("cmp", vec![a(0), a(1)]))
+            }
             ("Option", "unwrap") => Some(self.named_call("option_unwrap", vec![a(0)])),
             ("Option", "expect") => Some(self.named_call("option_expect", vec![a(0), a(1)])),
             ("Option", "is_some") => Some(self.named_call("urust_func_option_is_some", vec![a(0)])),
@@ -1433,6 +1477,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             _ => None,
         };
         Ok(r)
+    }
+
+    /// Is the HOL type of `t` (see `Frontend::ty`) ordered (class `order`)? Words, `bool` and
+    /// `String.literal` are; `char` is not (its order is in HOL-Library `Char_ord`, which
+    /// AutoCorrode does not import), nor are lists, tuples, options or abstract types.
+    fn hol_ordered(&self, t: Ty<'tcx>) -> bool {
+        match t.kind() {
+            ty::Uint(u) => *u != ty::UintTy::U128,
+            ty::Bool | ty::Str => true,
+            ty::Adt(def, _) => self.fe.std_adt(def.did()) == Some("String"),
+            _ => false,
+        }
     }
 
     fn derived(&self, did: DefId) -> bool {
@@ -1680,7 +1736,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// Is `e` a call of the standard library's `<[T]>::iter` (also through `Vec` and arrays)?
     /// Is `e` a call of the standard library's slice method `name` (e.g. `iter`), also through
     /// `Vec` and arrays?
     fn is_slice_method(&self, e: &hir::Expr<'tcx>, name: &str) -> bool {
@@ -2203,14 +2258,57 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn closure(&mut self, e: &'tcx hir::Expr<'tcx>, c: &'tcx hir::Closure<'tcx>) -> R<Tr> {
         if !matches!(c.kind, hir::ClosureKind::Closure) { return unsup("async block / coroutine") }
-        // a closure mutates a captured variable iff it captures it by a mutable (or unique) borrow
+        // a closure mutates a captured variable if it captures it by a mutable (or unique) borrow,
+        // or its body mutates a variable it captures by value (its own copy). The closure kind
+        // does not tell: it is taken from the expected `Fn*` bound when there is one
+        let captured: HashSet<HirId> =
+            self.typeck.closure_min_captures_flattened(c.def_id).map(|cap| cap.get_root_variable()).collect();
+        let mut finder = CaptureMutation { typeck: self.typeck, captured: &captured, found: false };
+        finder.visit_body(self.tcx.hir_body(c.body));
+        if finder.found {
+            return unsup("closure that mutates captured variables");
+        }
+        let mut copies = vec![];
+        let mut saved = vec![];
         for cap in self.typeck.closure_min_captures_flattened(c.def_id) {
-            if let ty::UpvarCapture::ByRef(k) = cap.info.capture_kind {
-                if !matches!(k, ty::BorrowKind::Immutable) {
-                    return unsup("closure that mutates captured variables");
+            match cap.info.capture_kind {
+                ty::UpvarCapture::ByRef(k) => {
+                    if !matches!(k, ty::BorrowKind::Immutable) {
+                        return unsup("closure that mutates captured variables");
+                    }
+                }
+                // a variable captured by value is copied when the closure is created: a mutable
+                // local is read then, and the closure body sees the (immutable) copy
+                ty::UpvarCapture::ByValue | ty::UpvarCapture::ByUse => {
+                    let root = cap.get_root_variable();
+                    if saved.iter().any(|(h, _)| *h == root) { continue }
+                    let l = self.locals.get(&root).cloned().expect("captured variable is a local of the enclosing body");
+                    if !l.cell { continue }
+                    let n = self.fresh(&format!("{}_copy", l.name));
+                    copies.push(format!("let {} = *{};", n, l.name));
+                    self.locals.insert(root, Local { name: n, cell: false });
+                    saved.push((root, l));
                 }
             }
         }
+        let r = self.closure_body(c);
+        for (h, l) in saved {
+            self.locals.insert(h, l);
+        }
+        let (ps, b) = r?;
+        let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
+        let closure = Tr::new(format!("{} {{\n{}\n}}", head, b), 10);
+        // the closure runs in the monad of the enclosing function: its type is stated, as nothing
+        // else fixes it when it is only passed to a polymorphic external function (placeholder
+        // types are declared HOL types, so they may occur in it)
+        let h = self.fe.ty(self.ty_of(e));
+        let tmp = self.fresh("closure");
+        copies.push(format!("let {} = {};", tmp, closure.at(20)));
+        Ok(Tr::atom(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))
+    }
+
+    /// The formals and the body of a closure.
+    fn closure_body(&mut self, c: &'tcx hir::Closure<'tcx>) -> R<(Vec<String>, String)> {
         let body = self.tcx.hir_body(c.body);
         let mut ps = vec![];
         let mut pro = vec![];
@@ -2243,17 +2341,64 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut b = pro.join("\n");
         if !b.is_empty() { b.push('\n'); }
         b.push_str(&self.block_expr_inner(body.value)?);
-        let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
-        let closure = Tr::new(format!("{} {{\n{}\n}}", head, b), 10);
-        // the closure runs in the monad of the enclosing function: its type is stated, as nothing
-        // else fixes it when it is only passed to a polymorphic external function (placeholder
-        // types are declared HOL types, so they may occur in it)
-        let h = self.fe.ty(self.ty_of(e));
-        let tmp = self.fresh("closure");
-        Ok(Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, closure.at(20), tmp, h)))
+        Ok((ps, b))
     }
 }
 
+
+/// Finds, in a closure body, a mutation of a place owned by a captured variable (the variable,
+/// its fields, elements or boxed contents, not what a reference in it points to): an assignment
+/// to it, or a mutable borrow of it (explicit, or an adjustment: autoref of a `&mut self` method
+/// receiver, `IndexMut`, compound assignment, `DerefMut`).
+struct CaptureMutation<'a, 'tcx> {
+    typeck: &'tcx TypeckResults<'tcx>,
+    captured: &'a HashSet<HirId>,
+    found: bool,
+}
+
+impl<'a, 'tcx> CaptureMutation<'a, 'tcx> {
+    /// The variable owning the place `e`, if `e` is a place of a captured variable.
+    fn owner(&self, e: &hir::Expr<'tcx>) -> Option<HirId> {
+        match e.kind {
+            ExprKind::Path(ref qp) => match self.typeck.qpath_res(qp, e.hir_id) {
+                Res::Local(h) if self.captured.contains(&h) => Some(h),
+                _ => None,
+            },
+            ExprKind::Field(b, _) | ExprKind::Index(b, _, _) | ExprKind::DropTemps(b) => self.owner(b),
+            ExprKind::Unary(UnOp::Deref, b) if self.typeck.expr_ty(b).is_box() => self.owner(b),
+            _ => None,
+        }
+    }
+
+    /// Do the adjustments of `e` borrow its place mutably (before going through a reference)?
+    fn borrowed_mutably(&self, e: &hir::Expr<'tcx>) -> bool {
+        let mut t = self.typeck.expr_ty(e);
+        for adj in self.typeck.expr_adjustments(e) {
+            match &adj.kind {
+                Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Mut { .. })) => return true,
+                Adjust::Deref(DerefAdjustKind::Overloaded(d)) => return d.mutbl.is_mut(),
+                Adjust::Deref(_) if !t.is_box() => return false,
+                _ => {}
+            }
+            t = adj.target;
+        }
+        false
+    }
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for CaptureMutation<'a, 'tcx> {
+    fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
+        let mutated = match e.kind {
+            ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => self.owner(lhs).is_some(),
+            ExprKind::AddrOf(_, hir::Mutability::Mut, x) => self.owner(x).is_some(),
+            _ => false,
+        };
+        if mutated || (self.owner(e).is_some() && self.borrowed_mutably(e)) {
+            self.found = true;
+        }
+        intravisit::walk_expr(self, e);
+    }
+}
 
 /// `if c1 { b1 } else { if c2 { b2 } else { .. } }` for (condition, body) branches;
 /// `None` is an unconditional branch.

@@ -20,7 +20,9 @@ const RESERVED: &[&str] = &[
     "Let", "If", "Pair", "Suc", "BIT", "OFCLASS", "SORT_CONSTRAINT", "pred", "in_rel", "SOME", "THE", "LEAST",
     "GREATEST", "op", "ALL", "EX", "UNIV", "WRT", "CONST", "TYPE", "PROP", "undefined",
     // HOL binder notations (big operators), not usable as terms
-    "MAX", "MIN", "SUM", "PROD", "SIGMA", "PI", "INT", "UN", "ARG_MIN", "ARG_MAX",
+    "MAX", "MIN", "SUM", "PROD", "SIGMA", "PI", "INT", "UN", "ARG_MIN", "ARG_MAX", "INFM", "MOST",
+    // HOL literal syntax
+    "STR", "CHR",
     "default", "if", "let", "in", "where", "and", "is", "with", "sorry", "oops",
     // Frequently used HOL / AutoCorrode constants
     "id", "map", "min", "max", "fst", "snd", "length", "len", "rev", "filter", "sum", "count",
