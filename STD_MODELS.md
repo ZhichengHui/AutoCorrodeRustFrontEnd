@@ -10,7 +10,7 @@
   2. 手写的模型：放在 AutoCorrode 的 `Micro_Rust_Std_Lib/StdLib_Frontend_Models.thy`（AutoCorrode 分支 `urust-frontend-std-models`），属于 `Micro_Rust_Std_Lib` 会话，由 `Micro_Rust_Std_Lib.thy` 导入，因而生成的每个 crate 都能使用。这个文件只放标准库函数的模型，不限于某一个类型。
   3. 前端直接生成的写法（例如恒等、`[]`），不对应任何 Isabelle 定义。
 - **序列的表示。** `Vec<T>` 和切片 `[T]` 都表示为元素的列表 `T list`，`&mut` 引用指向这个列表。这与 AutoCorrode 对切片的表示（`StdLib_Slice.thy` 的 `slice_index`）一致。代价是 `Vec` 的容量、内存位置没有建模。AutoCorrode 另有一个长度受类型参数限定的 `('v, 'l) vector` 类型，目前没有使用。
-- **未定义行为。** Rust 中的未定义行为（例如 `get_unchecked` 越界）在模型里以消息以 `undefined behaviour` 开头的 panic 中止，与 Rust 自身的 panic 区分开。
+- **未定义行为。** 模型若需要表示 Rust 中的未定义行为，以消息以 `undefined behaviour` 开头的 panic 中止，与 Rust 自身的 panic 区分开（目前没有模型用到）。
 - **重载解引用。** 编译器插入的 `Deref::deref`/`DerefMut::deref_mut`（自动解引用）不翻译成函数调用：解引用前后的类型（去掉引用后）翻译成的 HOL 类型相同时，当作恒等，否则登记为占位符（`pv_adjusted`）。这条规则依赖上面的类型替换，按现有的类型映射，满足它的只有 `Vec` 到切片、`String` 到 `str`、`Box<T>` 到 `T` 三种，下面各组分别列出。
 - **模型目前没有契约和证明**（手写模型只有定义）。
 
@@ -77,8 +77,6 @@
 | `Vec::pop` | `vec_pop`：空时 `None`，否则去掉并返回最后一个元素 | 手写 | 同上 |
 | `<[T]>::swap` | `slice_swap`：交换两个位置，越界时 panic | 手写 | 同上 |
 | `vec![x; n]`（`alloc::vec::from_elem`） | `vec_from_elem`：`replicate n x` | 手写 | 同上 |
-| `<[T]>::get_unchecked(i)`，`i: usize` | `slice_get_unchecked`：第 `i` 个元素；越界为未定义行为 | 手写 | 同上 |
-| `<[T]>::get_unchecked_mut(i)`，`i: usize` | `slice_get_unchecked_mut`：指向第 `i` 个元素的引用；越界为未定义行为 | 手写 | 同上 |
 
 丢掉的语义：容量（`with_capacity`、`reserve` 的效果、`capacity()`）和元素的内存位置。
 

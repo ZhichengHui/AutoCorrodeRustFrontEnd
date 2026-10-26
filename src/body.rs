@@ -1391,8 +1391,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("Vec", "push") => VecPush,
             ("Vec", "pop") => VecPop,
             ("slice", "swap") => SliceSwap,
-            ("slice", "get_unchecked") => SliceGetUnchecked,
-            ("slice", "get_unchecked_mut") => SliceGetUncheckedMut,
             ("uint", "checked_add") => Uint("checked_add"),
             ("uint", "checked_mul") => Uint("checked_mul"),
             ("uint", "saturating_sub") => Uint("saturating_sub"),
@@ -1457,18 +1455,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             RangeInclusiveNew => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
             Conversion | SliceIter if same_hol(self) => Some(a(0)),
             Uint(op) => Some(self.named_call(op, vec![a(0), a(1)])),
-            // the models of AutoCorrode's `StdLib_Frontend_Models` (`get_unchecked` is generic in the
-            // index; the models take a `usize`)
+            // the models of AutoCorrode's `StdLib_Frontend_Models`
             VecPush => Some(self.named_call("vec_push", vec![a(0), a(1)])),
             VecPop => Some(self.named_call("vec_pop", vec![a(0)])),
             SliceSwap => Some(self.named_call("slice_swap", vec![a(0), a(1), a(2)])),
             VecFromElem => Some(self.named_call("vec_from_elem", vec![a(0), a(1)])),
-            SliceGetUnchecked if self.ty_adj(arg_exprs[1]).is_usize() => {
-                Some(self.named_call("slice_get_unchecked", vec![a(0), a(1)]))
-            }
-            SliceGetUncheckedMut if self.ty_adj(arg_exprs[1]).is_usize() => {
-                Some(self.named_call("slice_get_unchecked_mut", vec![a(0), a(1)]))
-            }
             _ => None,
         };
         Ok(r)
@@ -2360,8 +2351,6 @@ enum StdFn {
     VecPop,
     VecFromElem,
     SliceSwap,
-    SliceGetUnchecked,
-    SliceGetUncheckedMut,
     /// an operation of unsigned integers, by its AutoCorrode name
     Uint(&'static str),
 }
