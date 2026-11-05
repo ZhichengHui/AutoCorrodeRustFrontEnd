@@ -1,6 +1,6 @@
 # urust-frontend
 
-把 Rust library crate 的 HIR（rustc `1.100.0-nightly (923c95cdf 2026-09-16)`，edition 2024）翻译成 AutoCorrode 的 uRust theory。规范以这些文档为准：`~/Work/main/autocorrode/frontend.md`、`language-features.md`、`signed-integer-syntax.md`、`urust-break-continue.md`。`language-features.md` 中没有给出解决方案的特性，一律输出占位符。
+把 Rust library crate 的 HIR（rustc `1.100.0-nightly (923c95cdf 2026-09-16)`，edition 2024）翻译成 AutoCorrode 的 uRust theory。前端对各类 Rust 语言构造的处理记录在 `LANGUAGE_FEATURES.md`，标准库的等价模型记录在 `STD_MODELS.md`。
 
 用 `scripts/cargo.sh` 构建，用 `scripts/urust-frontend.sh` 运行前端。
 
