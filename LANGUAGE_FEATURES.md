@@ -52,7 +52,7 @@
 - `while`、`loop` 翻译成 uRust 的带燃料循环 `#[fuel(urust_fuel)]`，`urust_fuel` 是 crate locale 的参数。燃料耗尽时循环结束（AutoCorrode 的 `bounded_while`）。
 - 循环的标签原样保留在翻译出的 uRust 循环上（`'l: for …`、`#[fuel(urust_fuel)] 'l: while …`、`#[fuel(urust_fuel)] 'l: loop …`、`#[fuel(urust_fuel)] 'l: while let …`），包括下面由 `while let` 和 `for` 展开成的循环。
 - `break`、`continue`、`break 'l`、`continue 'l` 翻译成 uRust 的 `break;`、`continue;`、`break 'l;`、`continue 'l;`。uRust 与 Rust 一样，按标签确定目标循环，没有标签时目标是最内层的循环。
-- `while let`：模式含元组或带守卫时，翻译成以标志变量控制的 `while` 加 `match`。
+- `while let`：模式含元组或带守卫时，按 Rust 的展开翻译成 `loop` 加 `match`，模式不匹配时 `break`。
 - `for`：遍历区间、`Vec`、切片、数组（或其 `iter()`）时翻译成 uRust 的 `for`；遍历 `&mut` 序列或 `iter_mut()` 时用 AutoCorrode 的 `iter_mut`；循环变量的模式可以是任意不可反驳的模式。遍历其他迭代器时按 Rust 的展开翻译：迭代器存入一个标注了类型的可变局部变量，再用 `while let` 反复调用 `next`；这时模式中不能含字面量或区间子模式。
 - `return`、`?`（错误类型不同时显式 `match` 并调用 `From::from`）。
 - 返回 `!` 的标准库函数写成 `panic!`（见 `STD_MODELS.md`）。

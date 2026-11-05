@@ -1707,17 +1707,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         return Ok(Tr::new(format!("{} {}while let {} = {} {{\n{}\n}}", FUEL, lbl, p.pat, iv.at(20), body), 11));
                     }
                     // uRust's `while let` takes no pattern conditions and only variables in a tuple
-                    // pattern; a flag ends the loop when the pattern fails
-                    self.alloc(self.tcx.types.bool)?;
-                    let go = self.fresh("go");
+                    // pattern; otherwise Rust's own expansion: `loop { match e { p => body, _ => break } }`
                     let guard = if p.conds.is_empty() { String::new() } else { format!(" if {}", p.conds.join(" && ")) };
-                    return Ok(Tr::atom(format!(
-                        "{{\nlet mut {go} = true;\n{FUEL} {lbl}while *{go} {{\nmatch {} {{\n  {}{} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{ *{go} = false; }}\n}};\n}}\n}}",
-                        iv.at(20),
-                        p.pat,
-                        guard,
-                        body
-                    )));
+                    return Ok(Tr::new(
+                        format!(
+                            "{FUEL} {lbl}loop {{\nmatch {} {{\n  {}{} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{ break; }}\n}};\n}}",
+                            iv.at(20),
+                            p.pat,
+                            guard,
+                            body
+                        ),
+                        11,
+                    ));
                 }
                 if contains_let(cond) { return unsup("`let` chain in `while` condition") }
                 let cv = self.val(cond)?;
