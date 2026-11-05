@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustc_ast::ast::LitKind;
+use rustc_ast::ast::{Label, LitKind};
 use rustc_hir as hir;
 use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
@@ -28,6 +28,20 @@ type R<T> = Result<T, Unsup>;
 
 fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
+}
+
+/// The label of a loop as it precedes the uRust loop (`'l: `), or nothing.
+fn loop_label(label: Option<Label>) -> String {
+    label.map(|l| format!("{}: ", l.ident)).unwrap_or_default()
+}
+
+/// `break` or `continue` (`kw`) to `dest`: uRust resolves a label, and the innermost loop without
+/// one, as Rust does.
+fn loop_jump(kw: &str, dest: hir::Destination) -> Tr {
+    Tr::atom(match dest.label {
+        Some(l) => format!("{} {};", kw, l.ident),
+        None => format!("{};", kw),
+    })
 }
 
 /// A translated expression with its uRust precedence (1000 = atomic).
@@ -293,7 +307,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             parts.push(format!("\u{3}{}", tr.s));
             return;
         }
-        if matches!(e.kind, ExprKind::Ret(_)) {
+        if matches!(e.kind, ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)) {
             // \u{4}: ends with its own semicolon
             parts.push(if tr.s.ends_with(';') { format!("\u{4}{}", tr.s) } else { format!("{};", tr.s) });
             return;
@@ -528,8 +542,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         for adj in self.typeck.expr_adjustments(e) {
             let target = self.mono(adj.target);
             pv = match &adj.kind {
-                // a `return` is a statement (its block has the value `()`)
-                Adjust::NeverToAny if matches!(e.kind, ExprKind::Ret(_)) => pv,
+                // a `return`, `break` or `continue` is a statement (its block has the value `()`)
+                Adjust::NeverToAny if matches!(e.kind, ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)) => pv,
                 Adjust::NeverToAny => {
                     let h = self.fe.ty(target);
                     let v = self.to_val(pv);
@@ -737,7 +751,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Type(x, _) => self.val(x),
             ExprKind::DropTemps(x) => self.val(x),
             ExprKind::If(c, t, el) => self.if_expr(c, t, el),
-            ExprKind::Loop(b, _, src, _) => self.loop_expr(e, b, src),
+            ExprKind::Loop(b, label, src, _) => self.loop_expr(e, b, label, src),
             ExprKind::Match(scrut, arms, src) => match src {
                 MatchSource::ForLoopDesugar => self.for_loop(scrut, arms),
                 MatchSource::TryDesugar(_) => {
@@ -780,9 +794,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             ExprKind::AddrOf(..) => unsup("raw borrow"),
-            // the original uRust has no `break` / `continue`
-            ExprKind::Break(..) => unsup("`break`"),
-            ExprKind::Continue(_) => unsup("`continue`"),
+            ExprKind::Break(dest, None) => Ok(loop_jump("break", dest)),
+            ExprKind::Break(_, Some(_)) => unsup("`break` with a value"),
+            ExprKind::Continue(dest) => Ok(loop_jump("continue", dest)),
             ExprKind::Ret(v) => match v {
                 Some(v) => {
                     let t = self.val(v)?;
@@ -1672,7 +1686,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         )))
     }
 
-    fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, src: LoopSource) -> R<Tr> {
+    fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, label: Option<Label>, src: LoopSource) -> R<Tr> {
+        let lbl = loop_label(label);
         let t = self.ty_of(e);
         if !(t.is_unit() || t.is_never()) {
             return unsup("loop producing a value (`break` with a value)");
@@ -1689,29 +1704,30 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let body = with_prologue(&p.prologue, &self.branch(then)?);
                     let tuple = matches!(le.pat.kind, PatKind::Tuple(..));
                     if p.conds.is_empty() && !tuple {
-                        return Ok(Tr::new(format!("{} while let {} = {} {{\n{}\n}}", FUEL, p.pat, iv.at(20), body), 11));
+                        return Ok(Tr::new(format!("{} {}while let {} = {} {{\n{}\n}}", FUEL, lbl, p.pat, iv.at(20), body), 11));
                     }
                     // uRust's `while let` takes no pattern conditions and only variables in a tuple
-                    // pattern; without `break`, a flag ends the loop when the pattern fails
-                    self.alloc(self.tcx.types.bool)?;
-                    let go = self.fresh("go");
+                    // pattern; otherwise Rust's own expansion: `loop { match e { p => body, _ => break } }`
                     let guard = if p.conds.is_empty() { String::new() } else { format!(" if {}", p.conds.join(" && ")) };
-                    return Ok(Tr::atom(format!(
-                        "{{\nlet mut {go} = true;\n{FUEL} while *{go} {{\nmatch {} {{\n  {}{} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{ *{go} = false; }}\n}};\n}}\n}}",
-                        iv.at(20),
-                        p.pat,
-                        guard,
-                        body
-                    )));
+                    return Ok(Tr::new(
+                        format!(
+                            "{FUEL} {lbl}loop {{\nmatch {} {{\n  {}{} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{ break; }}\n}};\n}}",
+                            iv.at(20),
+                            p.pat,
+                            guard,
+                            body
+                        ),
+                        11,
+                    ));
                 }
                 if contains_let(cond) { return unsup("`let` chain in `while` condition") }
                 let cv = self.val(cond)?;
                 let body = self.branch(then)?;
-                Ok(Tr::new(format!("{} while {} {{\n{}\n}}", FUEL, cv.at(20), body), 11))
+                Ok(Tr::new(format!("{} {}while {} {{\n{}\n}}", FUEL, lbl, cv.at(20), body), 11))
             }
             LoopSource::Loop => {
                 let body = self.block_seq(b.stmts, b.expr)?;
-                Ok(Tr::new(format!("{} loop {{\n{}\n}}", FUEL, body), 11))
+                Ok(Tr::new(format!("{} {}loop {{\n{}\n}}", FUEL, lbl, body), 11))
             }
             LoopSource::ForLoop => unsup("for-loop desugaring"),
         }
@@ -1729,7 +1745,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // match IntoIterator::into_iter(<head>) { mut iter => loop { match next(&mut iter) { None => break, Some(<pat>) => <body> } } }
         let ExprKind::Call(_, [head]) = head_call.kind else { return unsup("for-loop head") };
         let [arm] = arms else { return unsup("for-loop desugaring") };
-        let ExprKind::Loop(lb, _, LoopSource::ForLoop, _) = arm.body.kind else { return unsup("for-loop desugaring") };
+        let ExprKind::Loop(lb, label, LoopSource::ForLoop, _) = arm.body.kind else { return unsup("for-loop desugaring") };
+        let lbl = loop_label(label);
         let stmt_exprs = lb.stmts.iter().filter_map(|s| match s.kind {
             StmtKind::Expr(x) | StmtKind::Semi(x) => Some(x),
             _ => None,
@@ -1776,9 +1793,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if !p.conds.is_empty() { return unsup("for-loop pattern with literal or range sub-patterns") }
                 let body = with_prologue(&p.prologue, &self.branch(some_arm.body)?);
                 return Ok(Tr::atom(format!(
-                    "{{\n{}\n{} while let {} = {} {{\n{}\n}}\n}}",
+                    "{{\n{}\n{} {}while let {} = {} {{\n{}\n}}\n}}",
                     init,
                     FUEL,
+                    lbl,
                     p.pat,
                     next_v.at(20),
                     body
@@ -1804,7 +1822,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
         };
         let body = with_prologue(&pro, &self.branch(some_arm.body)?);
-        Ok(Tr::new(format!("for {} in {} {{\n{}\n}}", ps, iter_s.at(20), body), 11))
+        Ok(Tr::new(format!("{}for {} in {} {{\n{}\n}}", lbl, ps, iter_s.at(20), body), 11))
     }
 
     // ------------------------------------------------------------------

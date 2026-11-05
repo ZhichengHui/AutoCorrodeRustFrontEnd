@@ -41,7 +41,7 @@
 - 元组、数组字面量写成 uRust 的元组和列表；区间 `a..b`、`a..=b` 写成 uRust 的区间。
 - 结构体表达式：本地 struct 写成 uRust 的结构体表达式，enum 的 struct 变体写成构造子调用。书写顺序与声明顺序不同且字段表达式可能有副作用时，先按书写顺序绑定到临时变量；`..base` 先把 `base` 绑定到临时变量，再读出未写出的字段。
 - 块、`return` 原样翻译；类型标注和 rustc 插入的 `DropTemps` 不产生输出。
-- 类型为 `!` 的表达式：作为语句时标注为 `unit`，其后接 `panic!("unreachable: diverging expression completed")`；被强制转换成其他类型时标注为目标类型。
+- 类型为 `!` 的表达式：作为语句时标注为 `unit`，其后接 `panic!("unreachable: diverging expression completed")`；被强制转换成其他类型时标注为目标类型。`return`、`break`、`continue` 除外，它们在这两种位置上都写成语句。
 
 不支持（占位符）：浮点字面量、字节串、C 字符串、非 ASCII 字符字面量、含其他字符的字符串字面量；有符号整数、`u128` 的字面量与运算；内建的取负；`bool`、`char` 的大小比较；其他类型之间的 `as`；函数项或构造子作为值；`static mut`；解析到 trait 声明的关联常量、泛型常量；外部类型和其他标准库类型的构造子与结构体表达式；超过 8 个字段的构造子调用和结构体表达式；带默认字段值的结构体表达式；单元素元组表达式；超过 16 个分量的元组的字段访问；其他类型的字段访问；经引用访问递归 struct 的字段；对其他类型的下标；对非可变位置的赋值或可变借用；在含调用的位置上的 `/=`；`format!` 等格式化字符串；内部可变性类型的方法；其他解引用、到 trait 对象的强制转换、其他指针强制转换；裸借用、`offset_of`、内联常量块、数组重复表达式 `[x; n]`（标准库的 `vec![x; n]` 除外）、内联汇编、`yield`/`await`、`become`、`use` 表达式。
 
@@ -50,13 +50,15 @@
 - `if`/`else` 原样翻译；`if let` 的模式含字面量或区间子模式时，翻译成带守卫的 `match`。
 - `match`：被匹配的值是整数、`char`、`str` 或 `String`，或者所有分支的模式都只由字面量、区间、整数或 `bool` 常量、`Ordering` 变体、绑定以及它们组成的元组和或模式构成时，翻译成 `if` 链（被匹配的值先绑定到临时变量）。其他 `match` 翻译成 uRust 的 `match`：字面量和区间子模式变成守卫条件；不会失败但带条件的分支变成一个分支，在其中检查条件，不满足时匹配其余分支（都不满足时 `panic!("non-exhaustive match")`）；不会失败的分支之后的分支被省略（不可达）。
 - `while`、`loop` 翻译成 uRust 的带燃料循环 `#[fuel(urust_fuel)]`，`urust_fuel` 是 crate locale 的参数。燃料耗尽时循环结束（AutoCorrode 的 `bounded_while`）。
-- `while let`：模式含元组或带守卫时，翻译成以标志变量控制的 `while` 加 `match`。
+- 循环的标签原样保留在翻译出的 uRust 循环上（`'l: for …`、`#[fuel(urust_fuel)] 'l: while …`、`#[fuel(urust_fuel)] 'l: loop …`、`#[fuel(urust_fuel)] 'l: while let …`），包括下面由 `while let` 和 `for` 展开成的循环。
+- `break`、`continue`、`break 'l`、`continue 'l` 翻译成 uRust 的 `break;`、`continue;`、`break 'l;`、`continue 'l;`。uRust 与 Rust 一样，按标签确定目标循环，没有标签时目标是最内层的循环。
+- `while let`：模式含元组或带守卫时，按 Rust 的展开翻译成 `loop` 加 `match`，模式不匹配时 `break`。
 - `for`：遍历区间、`Vec`、切片、数组（或其 `iter()`）时翻译成 uRust 的 `for`；遍历 `&mut` 序列或 `iter_mut()` 时用 AutoCorrode 的 `iter_mut`；循环变量的模式可以是任意不可反驳的模式。遍历其他迭代器时按 Rust 的展开翻译：迭代器存入一个标注了类型的可变局部变量，再用 `while let` 反复调用 `next`；这时模式中不能含字面量或区间子模式。
 - `return`、`?`（错误类型不同时显式 `match` 并调用 `From::from`）。
 - 返回 `!` 的标准库函数写成 `panic!`（见 `STD_MODELS.md`）。
 - 递归函数（含互递归）：把一组互相调用的函数定义为一个非递归的步进函数迭代 `urust_fuel` 次，起点是以 `panic!("out of fuel")` 结束的函数。
 
-不支持（占位符）：`break`、`continue`、带值的 `loop`、带标签的块、`let` 链、`async` 块与协程。
+不支持（占位符）：带值的 `break`（以及产生值的 `loop`）、带标签的块、`let` 链、`async` 块与协程。
 
 ## 模式
 
