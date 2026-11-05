@@ -637,7 +637,7 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str) -> String {
     }
     ty.push_str(&format!("('s, {}, 'abort, 'i, 'o) function_body", self_ty));
     format!(
-        "definition \"{}\" :: {} where\n  {}\n\n",
+        "definition \"{}\" :: {} where\n  [crush_inline]: {}\n\n",
         name,
         cart(&ty),
         cart(&format!(
