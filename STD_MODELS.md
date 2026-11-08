@@ -19,7 +19,8 @@
 | Rust | 模型 | 与 Rust 的差别 |
 |---|---|---|
 | `u8`…`u64`、`usize` | `N word`（`usize` 为 `64 word`） | 假设 64 位平台；溢出按 debug 构建的语义 panic |
-| `i8`…`i128`、`isize`、`u128`、`f32`、`f64` | 无模型：占位类型，登记为占位符 | |
+| `i8`…`i64`、`isize` | `N sword`（`'l signed word`，`isize` 为 `64 sword`） | 同上；运算由 AutoCorrode `Numeric_Types` 定义，溢出、除法、取余、移位、比较、取负均按 Rust 的 debug 语义 |
+| `i128`、`u128`、`f32`、`f64` | 无模型：占位类型，登记为占位符 | |
 | `bool` | `bool` | |
 | `char` | HOL `char` | HOL `char` 只有 256 个值；非 ASCII 的字面量登记为占位符，其他来源的非 ASCII 字符无法表示 |
 | `str` | `String.literal` | 只能表示 ASCII；非 ASCII 字面量登记为占位符 |
@@ -100,7 +101,7 @@
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
 | `Ordering` 及其变体 | `ordering` | AutoCorrode `StdLib_Ordering` | `Frontend::ty`、`unit_ctor` |
-| `Ord::cmp`（操作数为无符号整数、`bool`、`str`、`String`） | `cmp` | AutoCorrode `StdLib_Ordering` | `std_call`（`hol_ordered`） |
+| `Ord::cmp`（操作数为有符号或无符号整数；AutoCorrode 的 `cmp` 只定义在 word 上，有符号时按有符号数比较） | `cmp` | AutoCorrode `StdLib_Ordering` | `std_call`（`hol_ordered`） |
 
 ### 相等（PartialEq）
 | Rust | 模型 | 来源 | 位置 |
@@ -128,10 +129,13 @@
 | `a..b`、`RangeInclusive::new` | uRust 的区间表达式 | AutoCorrode | `struct_expr`、`std_call` |
 | `for` 遍历区间 | uRust 的 `for` 循环 | AutoCorrode | `for_loop` |
 
-### 无符号整数的方法
+### 整数的方法
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| `checked_add`、`checked_mul`、`saturating_sub`、`wrapping_add`、`div_ceil` | 同名函数（`wrapping_add` 为 `wrapping_add_unsigned`） | AutoCorrode `StdLib_Arithmetic` | `std_fn`/`std_call` |
+| 无符号和有符号整数的 `checked_add`、`checked_mul`、`saturating_sub`、`div_ceil` | 同名函数（有符号时按有符号数） | AutoCorrode `StdLib_Arithmetic` | `std_fn`/`std_call` |
+| 有符号整数的 `wrapping_add_unsigned` | 同名函数 | AutoCorrode `StdLib_Arithmetic` | 同上 |
+
+无符号整数的 `wrapping_add` 不再有模型：AutoCorrode 只剩有符号的 `wrapping_add_unsigned`，所以按外部函数生成模板。其他整数方法（`cast_signed`、`cast_unsigned`、`abs`、`signum`、`unsigned_abs`、`wrapping_sub` 等）没有模型，同样生成外部函数模板。
 
 ### panic 与进程终止
 | Rust | 模型 | 来源 | 位置 |
