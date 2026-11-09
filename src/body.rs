@@ -17,7 +17,7 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeckResults};
+use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
 use crate::frontend::Frontend;
@@ -743,8 +743,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok(Tr::new(format!("!{}", v.at(300)), 300))
             }
             ExprKind::Unary(UnOp::Neg, x) => {
-                if self.typeck.type_dependent_def_id(e.hir_id).is_some() { return self.overloaded_op(e, &[x]) }
-                unsup(format!("negation of `{}`", self.ty_adj(x).peel_refs()))
+                let xt = self.ty_adj(x).peel_refs();
+                if Self::int_suffix(xt).is_none() {
+                    if self.typeck.type_dependent_def_id(e.hir_id).is_some() { return self.overloaded_op(e, &[x]) }
+                    return unsup(format!("negation of `{}`", xt));
+                }
+                // a minus sign directly in front of a literal is part of the literal (`-128_i8`)
+                if let ExprKind::Lit(hir::Lit { node: LitKind::Int(v, _), .. }) = x.kind {
+                    return Self::int_lit(v.get(), true, xt);
+                }
+                let v = self.val(x)?;
+                Ok(Tr::new(format!("-{}", v.at(300)), 300))
             }
             ExprKind::Unary(UnOp::Deref, _) => unreachable!(),
             ExprKind::Cast(x, _) => self.cast(x, self.ty_of(e)),
@@ -827,7 +836,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     // Literals, paths, casts, operators
     // ------------------------------------------------------------------
 
-    /// The uRust literal suffix of an integer type with a model (the unsigned ones up to 64 bits).
+    /// The uRust literal suffix of an integer type with a model (up to 64 bits).
     fn int_suffix(t: Ty<'tcx>) -> Option<&'static str> {
         Some(match t.kind() {
             ty::Uint(ty::UintTy::U8) => "u8",
@@ -835,11 +844,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Uint(ty::UintTy::U32) => "u32",
             ty::Uint(ty::UintTy::U64) => "u64",
             ty::Uint(ty::UintTy::Usize) => "usize",
+            ty::Int(ty::IntTy::I8) => "i8",
+            ty::Int(ty::IntTy::I16) => "i16",
+            ty::Int(ty::IntTy::I32) => "i32",
+            ty::Int(ty::IntTy::I64) => "i64",
+            ty::Int(ty::IntTy::Isize) => "isize",
             _ => return None,
         })
     }
 
-    /// An integer type without a uRust model: signed, or wider than 64 bits.
+    /// An integer type without a uRust model: wider than 64 bits.
     fn unmodelled_int(t: Ty<'tcx>) -> bool {
         t.is_integral() && Self::int_suffix(t).is_none()
     }
@@ -852,18 +866,34 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         match r.kind {
             ExprKind::Lit(hir::Lit { node: LitKind::Int(v, _), .. }) => Tr::atom(format!("{}_u64", v.get())),
-            _ => Tr::atom(format!("({}) as u64", rv.s)),
+            _ => Tr::new(format!("({}) as u64", rv.s), 299),
         }
     }
 
-    fn int_lit(v: u128, t: Ty<'tcx>) -> R<Tr> {
+    /// The literal of magnitude `v`, negated if `neg`, of the integer type `t`.
+    fn int_lit(v: u128, neg: bool, t: Ty<'tcx>) -> R<Tr> {
         let Some(sfx) = Self::int_suffix(t) else { return unsup(format!("integer literal of type `{}`", t)) };
-        Ok(Tr::atom(format!("{}_{}", v, sfx)))
+        if neg {
+            Ok(Tr::new(format!("-{}_{}", v, sfx), 300))
+        } else {
+            Ok(Tr::atom(format!("{}_{}", v, sfx)))
+        }
+    }
+
+    /// The literal of the integer type `t` whose bits are `s` (read as two's complement if `t` is signed).
+    fn scalar_int_lit(s: ScalarInt, t: Ty<'tcx>) -> R<Tr> {
+        let bits = s.to_bits(s.size());
+        if t.is_signed() {
+            let shift = 128 - s.size().bits();
+            let v = (bits as i128) << shift >> shift;
+            return Self::int_lit(v.unsigned_abs(), v < 0, t);
+        }
+        Self::int_lit(bits, false, t)
     }
 
     fn lit(&mut self, l: &LitKind, t: Ty<'tcx>) -> R<Tr> {
         match l {
-            LitKind::Int(v, _) => Self::int_lit(v.get(), t),
+            LitKind::Int(v, _) => Self::int_lit(v.get(), false, t),
             LitKind::Bool(b) => Ok(Tr::atom(if *b { "true" } else { "false" })),
             LitKind::Byte(b) => Ok(Tr::atom(format!("{}_u8", b))),
             LitKind::Char(c) => Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char(*c)?))),
@@ -942,8 +972,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return None;
         }
         let s = tcx.const_eval_poly(did).ok()?.try_to_scalar_int()?;
-        let bits = s.to_bits(s.size());
-        Some(if t.is_bool() { Ok(Tr::atom(if bits != 0 { "true" } else { "false" })) } else { Self::int_lit(bits, t) })
+        Some(if t.is_bool() {
+            Ok(Tr::atom(if s.to_bits(s.size()) != 0 { "true" } else { "false" }))
+        } else {
+            Self::scalar_int_lit(s, t)
+        })
     }
 
     fn const_use(&mut self, did: DefId, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
@@ -969,7 +1002,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some(tsfx) = Self::int_suffix(target) else { return unsup(format!("`as` cast to `{}`", target)) };
         if Self::int_suffix(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
         let v = self.val(x)?;
-        Ok(Tr::atom(format!("({}) as {}", v.s, tsfx)))
+        // `as` binds weaker than unary operators in uRust (precedence 299)
+        Ok(Tr::new(format!("({}) as {}", v.s, tsfx), 299))
     }
 
     fn binop_info(op: BinOpKind) -> (&'static str, u32) {
@@ -1384,6 +1418,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 ty::Adt(def, _) => self.fe.std_adt(def.did())?,
                 ty::Slice(_) => "slice",
                 ty::Uint(u) if *u != ty::UintTy::U128 => "uint",
+                ty::Int(i) if *i != ty::IntTy::I128 => "int",
                 _ => return None,
             },
             _ => return None,
@@ -1405,11 +1440,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("Vec", "push") => VecPush,
             ("Vec", "pop") => VecPop,
             ("slice", "swap") => SliceSwap,
-            ("uint", "checked_add") => Uint("checked_add"),
-            ("uint", "checked_mul") => Uint("checked_mul"),
-            ("uint", "saturating_sub") => Uint("saturating_sub"),
-            ("uint", "wrapping_add") => Uint("wrapping_add_unsigned"),
-            ("uint", "div_ceil") => Uint("div_ceil"),
+            ("uint" | "int", "checked_add") => IntOp("checked_add"),
+            ("uint" | "int", "checked_mul") => IntOp("checked_mul"),
+            ("uint" | "int", "saturating_sub") => IntOp("saturating_sub"),
+            ("uint" | "int", "div_ceil") => IntOp("div_ceil"),
+            ("int", "wrapping_add_unsigned") => IntOp("wrapping_add_unsigned"),
             _ => return None,
         })
     }
@@ -1468,7 +1503,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Drop => Some(Tr::atom(format!("{{ let _ = {}; () }}", a(0).s))),
             RangeInclusiveNew => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
             Conversion | SliceIter if same_hol(self) => Some(a(0)),
-            Uint(op) => Some(self.named_call(op, vec![a(0), a(1)])),
+            IntOp(op) => Some(self.named_call(op, vec![a(0), a(1)])),
             // the models of AutoCorrode's `StdLib_Frontend_Models`
             VecPush => Some(self.named_call("vec_push", vec![a(0), a(1)])),
             VecPop => Some(self.named_call("vec_pop", vec![a(0)])),
@@ -1479,14 +1514,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(r)
     }
 
-    /// Is the HOL type of `t` (see `Frontend::ty`) ordered (class `order`)? Words, `bool` and
-    /// `String.literal` are; `char` is not (its order is in HOL-Library `Char_ord`, which
-    /// AutoCorrode does not import), nor are lists, tuples, options or abstract types.
+    /// Does AutoCorrode's `cmp` apply to the HOL type of `t` (see `Frontend::ty`)? It is defined
+    /// on words only, comparing them as signed words for the signed integer types.
     fn hol_ordered(&self, t: Ty<'tcx>) -> bool {
         match t.kind() {
             ty::Uint(u) => *u != ty::UintTy::U128,
-            ty::Bool | ty::Str => true,
-            ty::Adt(def, _) => self.fe.std_adt(def.did()) == Some("String"),
+            ty::Int(i) => *i != ty::IntTy::I128,
             _ => false,
         }
     }
@@ -2045,8 +2078,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let t = if t.is_integral() || t.is_char() || t.is_bool() || t.is_str() { t } else { self.pat_ty(pat).peel_refs() };
         match pe.kind {
             hir::PatExprKind::Lit { lit, negated } => {
-                if negated { return unsup(format!("negative literal pattern of type `{}`", t)) }
-                self.lit(&lit.node, t)
+                match lit.node {
+                    LitKind::Int(v, _) => Self::int_lit(v.get(), negated, t),
+                    _ if negated => unsup(format!("negative literal pattern of type `{}`", t)),
+                    _ => self.lit(&lit.node, t),
+                }
             }
             hir::PatExprKind::Path(ref qp) => match self.typeck.qpath_res(qp, pe.hir_id) {
                 Res::Def(DefKind::Const | DefKind::AssocConst { .. }, did) => {
@@ -2369,8 +2405,8 @@ enum StdFn {
     VecPop,
     VecFromElem,
     SliceSwap,
-    /// an operation of unsigned integers, by its AutoCorrode name
-    Uint(&'static str),
+    /// an operation of integers, by its AutoCorrode name
+    IntOp(&'static str),
 }
 
 /// A lang item, or a diagnostic item by its name in the table of the standard library.
