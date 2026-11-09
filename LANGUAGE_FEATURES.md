@@ -117,4 +117,4 @@ Rust 路径的各段用 `_` 连接成一个 Isabelle 标识符。与 uRust 记�
 
 下面的构造前端已经翻译，但生成的 theory 在 Isabelle 中检查极慢。它不是占位符，`PLACEHOLDERS.txt` 中没有记录。
 
-- 含可能失败的分支（守卫，或翻译成守卫的字面量子模式）且分支体较大的 `match`，在 Isabelle 中检查超过 20 分钟。例：json 的 `write_json`（`Boolean(true)`、`Boolean(false)` 两个分支）、regex-lite 的 `Drop for Hir`、`PikeVM::epsilon_closure_explore`，splr 的 `AssignStack::reuse_saved_trail`。把同一构造子的分支合并成一个不会失败的分支、在分支体内用 `if` 区分后，json 的例子在 2 分钟内通过；直接写字面量模式 `Boolean(true)` 同样很慢。生成的文本本身正确。
+- 含守卫（或翻译成守卫的字面量子模式）且分支体较大的 `match`，在 AutoCorrode d15effd 下检查超过 20 分钟（例：json 的 `write_json`、regex-lite 的 `Drop for Hir`、splr 的 `AssignStack::reuse_saved_trail`）。原因在 AutoCorrode：带守卫的 match 逐个分支编译，每个可能失败的分支之后，其余分支被复制（守卫不成立时一次，通配子句经 HOL 的 case 翻译后每个其他构造子一次），项按可失败分支数指数增长。AutoCorrode PR #10 用 `Let` 共享其余分支，json、regex-lite 在约 2.5 分钟内通过；合并前仍然存在。生成的文本本身正确。
