@@ -99,7 +99,13 @@ pub fn ident_chars(s: &str) -> String {
 /// Name of a local variable / parameter.
 pub fn local_name(s: &str) -> String {
     let base = ident_chars(s);
-    if is_reserved(&base) { format!("{}_v", base) } else { base }
+    if is_reserved(&base) { return format!("{}_v", base) }
+    // `*const` and `&mut` are uRust delimiters and the lexer takes the longest one, so `*const_at`
+    // would read as `*const` `_at`: such names get a prefix
+    if base.len() > 5 && base.starts_with("const") || base.len() > 3 && base.starts_with("mut") {
+        return format!("v_{}", base);
+    }
+    base
 }
 
 /// Rust path segments as one identifier.
