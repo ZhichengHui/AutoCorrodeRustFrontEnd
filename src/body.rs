@@ -1011,6 +1011,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn cast(&mut self, x: &'tcx hir::Expr<'tcx>, target: Ty<'tcx>) -> R<Tr> {
         let src = self.ty_adj(x);
         let Some(tsfx) = Self::int_suffix(target) else { return unsup(format!("`as` cast to `{}`", target)) };
+        // `b as T` for `b: bool` is 1 or 0
+        if src.is_bool() {
+            let b = self.val(x)?;
+            return Ok(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", b.at(20), tsfx, tsfx), 21));
+        }
         if Self::int_suffix(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
         let v = self.val(x)?;
         // `as` binds weaker than unary operators in uRust (precedence 299)
