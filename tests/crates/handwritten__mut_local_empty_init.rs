@@ -13,3 +13,9 @@ pub fn last_even(xs: &[u32]) -> bool {
     }
     found.is_some()
 }
+
+pub fn with_capacity(n: usize) -> usize {
+    let mut v = Vec::with_capacity(n);
+    v.push(1u8);
+    v.len()
+}
