@@ -404,6 +404,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
+                // the allocator of a mutable local is chosen by its type: `[]` and `None` do not fix
+                // it when the uses that would are placeholders or external, so they are annotated
+                if m.is_mut() && (v.s == "[]" || v.s == "None") {
+                    let ht = self.fe.ty(self.node_ty(hid));
+                    return Ok(format!("let mut {} = \\<llangle>{} :: {}\\<rrangle>;", n, v.s, ht));
+                }
                 Ok(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)))
             }
             PatKind::Wild => Ok(format!("let _ = {};", v.at(20))),
