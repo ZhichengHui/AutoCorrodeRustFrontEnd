@@ -23,3 +23,6 @@ AUTOCORRODE=<AutoCorrode checkout> [MEMORY_MAX=4G] [CRATE_FILTER=<文件名片�
 ```
 
 先用 `CRATE_FILTER` 只跑一个 crate。跑完整语料前，先和用户约定内存预算。
+
+- Isabelle server 由 `systemd-run --user --scope` 启动，需要用户的 systemd 实例（有 `/run/user/<uid>/bus`）。在没有登录会话的进程里（例如远端 tmux 中的 agent、沙箱）它会失败，测试在读取 server 地址处 panic；这时从 ssh 登录会话里运行。在没有 Isabelle2025-2 默认路径的机器上用 `ISABELLE=<isabelle 可执行文件>` 指定。
+- 串行跑完整语料约 70 分钟（每个 crate 几秒，超时上限 300 秒）。要加快，可以对同一个已编译的测试二进制按 `CRATE_FILTER` 分片并行运行（每个进程有自己的工作目录和 Isabelle server），然后按 crate 合并结果。同时启动的 server 太多会互相冲突（server 没有输出地址，测试 panic），各分片的启动要错开几秒。

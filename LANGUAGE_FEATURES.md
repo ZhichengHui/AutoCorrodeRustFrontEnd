@@ -110,3 +110,11 @@
 ## 名字
 
 Rust 路径的各段用 `_` 连接成一个 Isabelle 标识符。与 uRust 记号或 HOL 关键字、常用常量同名时，局部变量加后缀 `_v`，全局名字加后缀 `_fn`，类型名加后缀 `_t`；重名时加数字后缀。
+
+## 已知缺陷
+
+下面的构造前端已经翻译，但生成的 theory 不被 Isabelle 接受或检查极慢。它们不是占位符，`PLACEHOLDERS.txt` 中没有记录。
+
+- `if let` 的模式是由构造子组成的元组时（如 `if let (Some(a), Some(b)) = (x.pop(), y.pop())`），Isabelle 在解析生成的 `let` 模式时抛出 `exception TERM`（`abs_tr`）。与元素类型无关（`u32` 同样出错）；`while let` 的同类模式可以通过。例：`tests/crates` 中的 `algorithms__math__postfix_evaluation`、`algorithms__sorting__pigeonhole_sort`。
+- C 变参函数（`unsafe extern "C" fn f(mut ap: ...)`）的定义中，变参参数从 HOL 类型中丢失，函数体却仍以 `λap.` 绑定它，类型检查失败。例：`charon__variadics`。对 C 变参函数的调用是占位符。
+- 带守卫、各分支为元组模式的大型 `match`（如 splr 的 `AssignStack::reuse_saved_trail`，10 个分支）在 Isabelle 中检查超过 15 分钟。生成的文本本身正确。

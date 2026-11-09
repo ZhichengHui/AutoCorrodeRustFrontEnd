@@ -103,6 +103,8 @@
 | `Ordering` 及其变体 | `ordering` | AutoCorrode `StdLib_Ordering` | `Frontend::ty`、`unit_ctor` |
 | `Ord::cmp`（操作数为有符号或无符号整数；AutoCorrode 的 `cmp` 只定义在 word 上，有符号时按有符号数比较） | `cmp` | AutoCorrode `StdLib_Ordering` | `std_call`（`hol_ordered`） |
 
+`bool`、`str`、`String` 的 `Ord::cmp` 没有模型（AutoCorrode 的 `cmp` 不接受这些类型），生成外部函数模板。
+
 ### 相等（PartialEq）
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
