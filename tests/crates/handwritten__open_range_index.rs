@@ -29,3 +29,8 @@ pub fn zero_tail_for(v: &mut [u8], a: usize) {
         *x = 0;
     }
 }
+
+pub fn tail_via_variable(v: &[u8], a: usize) -> usize {
+    let r = a..;
+    v[r].len()
+}

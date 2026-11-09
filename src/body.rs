@@ -747,6 +747,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         } else {
             return Ok(None);
         };
+        // a path is the unit struct `..` itself, or a variable holding a range (not handled here)
+        if matches!(idx.kind, ExprKind::Path(_)) && d != li.range_full_struct() {
+            return Ok(None);
+        }
         if !self.is_simple(base) { return unsup("open range index on a base with side effects") }
         let len = || match bpv {
             PV::Val(v) => format!("len({})", v.at(11)),
