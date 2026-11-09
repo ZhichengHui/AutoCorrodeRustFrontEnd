@@ -53,6 +53,9 @@ struct Tr {
 
 impl Tr {
     fn atom(s: impl Into<String>) -> Tr { Tr { s: s.into(), prec: 1000 } }
+    /// A block `{ ... }`: needs no parentheses as an argument or a `let` value, but does as the
+    /// operand of an operator, an index or a field access (its braces make the parse ambiguous).
+    fn block(s: impl Into<String>) -> Tr { Tr { s: s.into(), prec: 90 } }
     fn new(s: impl Into<String>, prec: u32) -> Tr { Tr { s: s.into(), prec } }
     /// Render with at least precedence `p`, adding parentheses otherwise.
     fn at(&self, p: u32) -> String {
@@ -73,6 +76,43 @@ enum PV {
 struct Local {
     name: String,
     cell: bool,
+}
+
+/// The mutability of a binding that is translated by value: a by-value binding, or an immutable
+/// `ref` binding (a shared reference is represented by the value it points to). `None` for
+/// `ref mut`.
+fn by_value(bm: hir::BindingMode) -> Option<hir::Mutability> {
+    match bm {
+        hir::BindingMode(hir::ByRef::No, m) => Some(m),
+        hir::BindingMode(hir::ByRef::Yes(_, hir::Mutability::Not), _) => Some(hir::Mutability::Not),
+        hir::BindingMode(hir::ByRef::Yes(..), _) => None,
+    }
+}
+
+/// The standard range types.
+#[derive(Clone, Copy)]
+enum RangeKind {
+    Range,
+    Inclusive,
+    From,
+    To,
+    ToInclusive,
+    Full,
+}
+
+/// Whether `pat` contains a tuple pattern with a component other than a variable or `_`: uRust's
+/// `if let` and `while let` accept only tuples of variables.
+fn tuple_of_non_variables(pat: &hir::Pat<'_>) -> bool {
+    let mut found = false;
+    pat.walk(|p| {
+        if let PatKind::Tuple(ps, _) = p.kind
+            && ps.iter().any(|q| !matches!(q.kind, PatKind::Binding(_, _, _, None) | PatKind::Wild))
+        {
+            found = true;
+        }
+        true
+    });
+    found
 }
 
 /// Information about a pattern translation for a uRust `match`/`if let`.
@@ -159,7 +199,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `{ let tmp = v; ⟪tmp :: h⟫ }`: the value `v` stated to have the HOL type `h`.
     fn typed(&mut self, base: &str, v: Tr, h: &str) -> Tr {
         let tmp = self.fresh(base);
-        Tr::atom(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, v.at(20), tmp, h))
+        Tr::block(format!("{{ let {} = {}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, v.at(20), tmp, h))
     }
 
     fn ty_of(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.expr_ty(e)) }
@@ -194,7 +234,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut prologue = vec![];
         for (i, p) in body.params.iter().enumerate() {
             match p.pat.kind {
-                PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+                PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                     let n = names::local_name(ident.as_str());
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
@@ -401,9 +441,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `let <pat> = <value>;` for an irrefutable pattern (one or more statements).
     fn bind_pattern(&mut self, pat: &'tcx hir::Pat<'tcx>, v: Tr) -> R<String> {
         match pat.kind {
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+            PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
+                // the allocator of a mutable local is chosen by its type; for a list or an option the
+                // initial value (`[]`, `None`, `Vec::with_capacity(n)`, ...) may not fix the element
+                // type when the uses that would are placeholders or external, so it is annotated
+                let lt = self.node_ty(hid);
+                if m.is_mut() && matches!(lt.kind(), ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Vec" | "Option"))) {
+                    let ht = self.fe.ty(lt);
+                    let tv = self.typed("init", v, &ht);
+                    return Ok(format!("let mut {} = {};", n, tv.s));
+                }
                 Ok(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)))
             }
             PatKind::Wild => Ok(format!("let _ = {};", v.at(20))),
@@ -420,7 +469,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut out = vec![];
         match pat.kind {
             PatKind::Wild => {}
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
+            PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 out.push(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)));
@@ -428,7 +477,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     out.extend(self.irrefutable(s, &Tr::atom(n))?);
                 }
             }
-            PatKind::Binding(..) => return unsup("`ref` binding"),
+            PatKind::Binding(..) => return unsup("`ref mut` binding"),
             PatKind::Tuple(ps, ddpos) => {
                 let t = self.pat_ty(pat).peel_refs();
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
@@ -512,7 +561,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut t = self.ty_adj(e);
         while let ty::Ref(_, inner, m) = t.kind() {
             if m.is_mut() {
-                v = Tr::new(format!("*{}", v.at(200)), 98);
+                v = Tr::new(format!("* {}", v.at(200)), 98);
             }
             t = *inner;
         }
@@ -532,7 +581,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn to_val(&self, pv: PV) -> Tr {
         match pv {
             PV::Val(t) => t,
-            PV::Ref(r) => Tr::new(format!("*{}", r.at(200)), 98),
+            PV::Ref(r) => Tr::new(format!("* {}", r.at(200)), 98),
         }
     }
 
@@ -559,7 +608,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 Adjust::Deref(_) => return unsup("pinned dereference"),
                 Adjust::Borrow(AutoBorrow::Ref(m)) => match m {
-                    AutoBorrowMutability::Mut { .. } => self.borrow_mut(pv, cur)?,
+                    AutoBorrowMutability::Mut { .. } => self.borrow_mut(e, pv, cur)?,
                     AutoBorrowMutability::Not => PV::Val(self.to_val(pv)),
                 },
                 Adjust::Borrow(_) => return unsup("raw or pinned auto-borrow"),
@@ -587,15 +636,54 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
+    /// Which standard range type `t` is (by lang item), if any.
+    fn range_kind(&self, t: Ty<'tcx>) -> Option<RangeKind> {
+        let ty::Adt(def, _) = t.kind() else { return None };
+        let li = self.tcx.lang_items();
+        let d = Some(def.did());
+        [
+            (li.range_struct(), RangeKind::Range),
+            (li.range_inclusive_struct(), RangeKind::Inclusive),
+            (li.range_from_struct(), RangeKind::From),
+            (li.range_to_struct(), RangeKind::To),
+            (li.range_to_inclusive_struct(), RangeKind::ToInclusive),
+            (li.range_full_struct(), RangeKind::Full),
+        ]
+        .into_iter()
+        .find(|(item, _)| *item == d)
+        .map(|(_, k)| k)
+    }
+
+    /// Whether the place `e` is, or lies inside, a subslice `v[a..b]` of a sequence. The subslice
+    /// is a value (a list), so a mutable borrow of such a place would refer to a temporary copy.
+    fn in_subslice(&self, mut e: &'tcx hir::Expr<'tcx>) -> bool {
+        loop {
+            match e.kind {
+                ExprKind::Index(b, i, _) => {
+                    if self.list_like(self.ty_adj(b).peel_refs()) && self.range_kind(self.ty_adj(i).peel_refs()).is_some() {
+                        return true;
+                    }
+                    e = b;
+                }
+                ExprKind::Field(b, _) => e = b,
+                _ => return false,
+            }
+        }
+    }
+
     /// `&mut` of a place is the reference to it; `&mut` of a temporary value allocates a
     /// fresh mutable local holding the value (Rust's temporary) and yields its reference.
-    fn borrow_mut(&mut self, pv: PV, t: Ty<'tcx>) -> R<PV> {
+    fn borrow_mut(&mut self, e: &'tcx hir::Expr<'tcx>, pv: PV, t: Ty<'tcx>) -> R<PV> {
+        // a place in a subslice: the writes through the borrow would be lost
+        if self.in_subslice(e) {
+            return unsup("mutable borrow of a subslice");
+        }
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
             PV::Val(v) => {
                 self.alloc(t)?;
                 let tmp = self.fresh("tmp");
-                Ok(PV::Val(Tr::atom(format!("{{ let mut {} = {}; {} }}", tmp, v.at(20), tmp))))
+                Ok(PV::Val(Tr::block(format!("{{ let mut {} = {}; {} }}", tmp, v.at(20), tmp))))
             }
         }
     }
@@ -664,12 +752,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::Index(base, idx, _) => {
                 let bt = self.ty_adj(base).peel_refs();
-                if !self.list_like(bt) {
+                // a sequence indexed by a local type (`impl Index<Var> for Vec<T>`) uses that impl
+                let it = self.ty_adj(idx).peel_refs();
+                let local_index = matches!(it.kind(), ty::Adt(def, _) if def.did().is_local());
+                if !self.list_like(bt) || local_index {
                     // `base[idx]` on a local type is `*Index::index(&base, idx)`, or
                     // `*IndexMut::index_mut(&mut base, idx)` in a mutable place; the borrow of the
                     // base is its adjustment, the method resolves to the local implementation
                     let local_adt = matches!(bt.kind(), ty::Adt(def, _) if def.did().is_local());
-                    if !local_adt { return unsup(format!("indexing into `{}`", bt)) }
+                    if !local_adt && !local_index { return unsup(format!("indexing into `{}`", bt)) }
                     let did = self.typeck.type_dependent_def_id(e.hir_id).expect("overloaded indexing has a method");
                     let gargs = self.node_args(e.hir_id);
                     let argv = self.vals([base, idx])?;
@@ -677,7 +768,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let is_mut = self.tcx.trait_of_assoc(did) == self.tcx.lang_items().index_mut_trait();
                     return Ok(if is_mut { PV::Ref(r) } else { PV::Val(r) });
                 }
-                let is_range = matches!(self.ty_adj(idx).peel_refs().kind(), ty::Adt(..));
+                let is_range = self.range_kind(self.ty_adj(idx).peel_refs()).is_some();
                 let mut bpv = self.pv_adjusted(base)?;
                 // overloaded `Index(Mut)` auto-borrows the base: go back to the place
                 let mut bt_adj = self.ty_adj(base);
@@ -685,15 +776,69 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     bpv = self.deref_pv(bpv, bt_adj)?;
                     bt_adj = *inner;
                 }
-                let i = self.val(idx)?;
+                let i = match self.open_range(base, idx, &bpv)? {
+                    Some(i) => i,
+                    None => {
+                        // uRust indexes by an integer or a range `a..b`, `a..=b`; other range types
+                        // (a `RangeFrom` held in a variable, ...) have no index operation
+                        let it = self.ty_adj(idx).peel_refs();
+                        if matches!(self.range_kind(it), Some(k) if !matches!(k, RangeKind::Range | RangeKind::Inclusive)) {
+                            return unsup(format!("indexing with a range of type `{}`", it));
+                        }
+                        self.val(idx)?
+                    }
+                };
                 match bpv {
                     PV::Val(v) => Ok(PV::Val(Tr::new(format!("{}[{}]", v.at(100), i.s), 100))),
                     PV::Ref(r) if !is_range => Ok(PV::Ref(Tr::new(format!("{}[{}]", r.at(100), i.s), 100))),
-                    PV::Ref(r) => Ok(PV::Val(Tr::new(format!("(*{})[{}]", r.at(200), i.s), 100))),
+                    PV::Ref(r) => Ok(PV::Val(Tr::new(format!("(* {})[{}]", r.at(200), i.s), 100))),
                 }
             }
             _ => Ok(PV::Val(self.val_unadj(e)?)),
         }
+    }
+
+    /// A sequence index `a..`, `..b`, `..=b` or `..` written as the closed uRust range
+    /// `a .. len(base)`, `0 .. b`, `0 ..= b`, `0 .. len(base)`. The missing end repeats the base,
+    /// so only a base without side effects qualifies; `None` for every other index.
+    fn open_range(&mut self, base: &'tcx hir::Expr<'tcx>, idx: &'tcx hir::Expr<'tcx>, bpv: &PV) -> R<Option<Tr>> {
+        // `..` is the unit struct `RangeFull`, the others are struct expressions
+        let fields: &[hir::ExprField<'tcx>] = match idx.kind {
+            ExprKind::Struct(_, fields, _) => fields,
+            ExprKind::Path(_) => &[],
+            _ => return Ok(None),
+        };
+        let kind = self.range_kind(self.ty_of(idx));
+        let (from, to_incl) = match kind {
+            Some(RangeKind::From) => (true, None),
+            Some(RangeKind::To) => (false, Some(false)),
+            Some(RangeKind::ToInclusive) => (false, Some(true)),
+            Some(RangeKind::Full) => (false, None),
+            _ => return Ok(None),
+        };
+        // a path is the unit struct `..` itself, or a variable holding a range (not handled here)
+        if matches!(idx.kind, ExprKind::Path(_)) && !matches!(kind, Some(RangeKind::Full)) {
+            return Ok(None);
+        }
+        if !self.is_simple(base) { return unsup("open range index on a base with side effects") }
+        let len = || match bpv {
+            PV::Val(v) => format!("len({})", v.at(11)),
+            PV::Ref(r) => format!("len(* {})", r.at(200)),
+        };
+        let field = |s: &mut Self, name: rustc_span::Symbol| -> R<Tr> {
+            let f = fields.iter().find(|f| f.ident.name == name).expect("range field");
+            s.val(f.expr)
+        };
+        let zero = Tr::atom("0_usize");
+        Ok(Some(if from {
+            let a = field(self, sym::start)?;
+            Tr::new(format!("{} .. {}", a.at(42), len()), 41)
+        } else if let Some(incl) = to_incl {
+            let b = field(self, sym::end)?;
+            Tr::new(format!("{} {} {}", zero.s, if incl { "..=" } else { ".." }, b.at(42)), 41)
+        } else {
+            Tr::new(format!("{} .. {}", zero.s, len()), 41)
+        }))
     }
 
     /// The place denoted by an expression; must be a reference.
@@ -778,12 +923,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Block(b, label) => {
                 if label.is_some() { return unsup("labeled block") }
                 let s = self.block_seq(b.stmts, b.expr)?;
-                Ok(Tr::atom(format!("{{\n{}\n}}", s)))
+                Ok(Tr::block(format!("{{\n{}\n}}", s)))
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 let p = self.place(lhs)?;
                 let v = self.val(rhs)?;
-                Ok(Tr::new(format!("*{} = {}", p.at(200), v.at(40)), 40))
+                Ok(Tr::new(format!("* {} = {}", p.at(200), v.at(40)), 40))
             }
             ExprKind::AssignOp(op, lhs, rhs) => self.assign_op(e, op.node, lhs, rhs),
             ExprKind::Field(..) | ExprKind::Index(..) => {
@@ -794,7 +939,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if m.is_mut() {
                     let t = self.ty_adj(x);
                     let pv = self.pv_adjusted(x)?;
-                    match self.borrow_mut(pv, t)? {
+                    match self.borrow_mut(x, pv, t)? {
                         PV::Val(v) => Ok(v),
                         PV::Ref(_) => unreachable!(),
                     }
@@ -819,7 +964,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let v: R<Vec<String>> = es.iter().map(|x| self.val(x).map(|t| t.at(11))).collect();
                 Ok(Tr::atom(format!("[{}]", v?.join(", "))))
             }
-            ExprKind::Repeat(..) => unsup("array repeat expression"),
+            ExprKind::Repeat(elem, _) => {
+                // `[x; N]` with a known length: the list `replicate N x`, as for `vec![x; n]`
+                let ty::Array(_, len) = self.ty_of(e).kind() else { return unsup("array repeat expression") };
+                let Some(n) = len.try_to_target_usize(self.tcx) else { return unsup("array repeat expression with a generic length") };
+                let x = self.val(elem)?;
+                let n = Self::int_lit(n as u128, false, self.tcx.types.usize)?;
+                Ok(self.named_call("vec_from_elem", vec![x, n]))
+            }
             ExprKind::ConstBlock(..) => unsup("inline const block"),
             ExprKind::InlineAsm(..) => unsup("inline assembly"),
             ExprKind::OffsetOf(..) => unsup("offset_of"),
@@ -903,7 +1055,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok(Tr::atom(format!("\\<llangle>STR ''{}''\\<rrangle>", s)))
             }
             LitKind::Float(..) => unsup("floating-point literal"),
-            LitKind::ByteStr(..) => unsup("byte string literal"),
+            // `b"…"`: the list of its bytes (byte arrays and slices are `8 word list`)
+            LitKind::ByteStr(bs, _) => {
+                let bytes: Vec<String> = bs.as_byte_str().iter().map(|b| format!("{}_u8", b)).collect();
+                Ok(Tr::atom(format!("[{}]", bytes.join(", "))))
+            }
             LitKind::CStr(..) => unsup("C string literal"),
             _ => unsup("literal"),
         }
@@ -1000,6 +1156,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn cast(&mut self, x: &'tcx hir::Expr<'tcx>, target: Ty<'tcx>) -> R<Tr> {
         let src = self.ty_adj(x);
         let Some(tsfx) = Self::int_suffix(target) else { return unsup(format!("`as` cast to `{}`", target)) };
+        // `b as T` for `b: bool` is 1 or 0
+        if src.is_bool() {
+            let b = self.val(x)?;
+            return Ok(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", b.at(20), tsfx, tsfx), 21));
+        }
         if Self::int_suffix(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
         let v = self.val(x)?;
         // `as` binds weaker than unary operators in uRust (precedence 299)
@@ -1123,7 +1284,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut v = self.val(rhs)?;
         if lt.is_bool() {
             let tok = match op { A::BitAndAssign => "&&", A::BitOrAssign => "||", A::BitXorAssign => "!=", _ => return unsup("compound assignment on bool") };
-            return Ok(Tr::new(format!("*{} = *{} {} {}", p.at(200), p.at(200), tok, v.at(45)), 40));
+            return Ok(Tr::new(format!("* {} = * {} {} {}", p.at(200), p.at(200), tok, v.at(45)), 40));
         }
         let tok = match op {
             A::AddAssign => "+=",
@@ -1141,10 +1302,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // `x /= e` is not in uRust; desugar to `x = *x / e` (the place is evaluated twice,
                 // which is only done for places without calls).
                 if !self.is_simple(lhs) { return unsup("`/=` on a place with calls") }
-                return Ok(Tr::new(format!("*{} = *{} / {}", p.at(200), p.at(200), v.at(51)), 40));
+                return Ok(Tr::new(format!("* {} = * {} / {}", p.at(200), p.at(200), v.at(51)), 40));
             }
         };
-        Ok(Tr::new(format!("*{} {} {}", p.at(200), tok, v.at(40)), 40))
+        Ok(Tr::new(format!("* {} {} {}", p.at(200), tok, v.at(40)), 40))
     }
 
     // ------------------------------------------------------------------
@@ -1207,7 +1368,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let call = format!("{}({})", f, argv.join(", "));
                 Ok(match bind {
                     None => Tr::new(call, 999),
-                    Some(b) => Tr::atom(format!("{{ {}{} }}", b, call)),
+                    Some(b) => Tr::block(format!("{{ {}{} }}", b, call)),
                 })
             }
             _ => unsup("call target"),
@@ -1274,6 +1435,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         if !adt.is_local() { return unsup("constructor of an external type") }
         if argv.len() > 8 { return unsup("constructor with more than 8 fields") }
+        // `S()`: a constructor without fields has no `_mk` function; it is the value itself
+        if argv.is_empty() { return Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx))) }
         let n = self.fe.variant_call_name(adt, vidx);
         let a: Vec<String> = argv.into_iter().map(|t| t.at(11)).collect();
         Ok(Tr::new(format!("{}({})", n, a.join(", ")), 999))
@@ -1500,7 +1663,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Len => Some(self.named_call("len", vec![a(0)])),
             VecNew => Some(Tr::atom("[]")),
             ToVec | BoxNew => Some(a(0)),
-            Drop => Some(Tr::atom(format!("{{ let _ = {}; () }}", a(0).s))),
+            Drop => Some(Tr::block(format!("{{ let _ = {}; () }}", a(0).s))),
             RangeInclusiveNew => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
             Conversion | SliceIter if same_hol(self) => Some(a(0)),
             IntOp(op) => Some(self.named_call(op, vec![a(0), a(1)])),
@@ -1625,7 +1788,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }).collect();
             Tr::atom(format!("{} {{ {} }}", n, fs.join(", ")))
         };
-        if pre.is_empty() { Ok(core) } else { Ok(Tr::atom(format!("{{\n{}\n{}\n}}", pre.join("\n"), core.s))) }
+        if pre.is_empty() { Ok(core) } else { Ok(Tr::block(format!("{{\n{}\n{}\n}}", pre.join("\n"), core.s))) }
     }
 
     // ------------------------------------------------------------------
@@ -1650,12 +1813,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let p = self.pat(le.pat)?;
             let tb = with_prologue(&p.prologue, &self.branch(t)?);
             let eb = match el { Some(x) => self.branch(x)?, None => "()".into() };
-            if p.conds.is_empty() {
+            // uRust's `if let`, like its `while let`, takes no pattern conditions and only
+            // variables in a tuple pattern; otherwise `match e { p => t, _ => e }`
+            let tuple = matches!(le.pat.kind, PatKind::Tuple(..)) || tuple_of_non_variables(le.pat);
+            if p.conds.is_empty() && !tuple {
                 return Ok(Tr::new(format!("if let {} = {} {{\n{}\n}} else {{\n{}\n}}", p.pat, iv.at(20), tb, eb), 11));
             }
+            let guard = if p.conds.is_empty() { String::new() } else { format!(" if {}", p.conds.join(" && ")) };
             return Ok(Tr::new(format!(
-                "match {} {{\n  {} if {} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{\n{}\n}}\n}}",
-                iv.at(20), p.pat, p.conds.join(" && "), tb, eb
+                "match {} {{\n  {}{} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{\n{}\n}}\n}}",
+                iv.at(20), p.pat, guard, tb, eb
             ), 20));
         }
         if contains_let(c) { return unsup("`let` chain in `if` condition") }
@@ -1735,7 +1902,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let iv = self.scrut(le.init)?;
                     let p = self.pat(le.pat)?;
                     let body = with_prologue(&p.prologue, &self.branch(then)?);
-                    let tuple = matches!(le.pat.kind, PatKind::Tuple(..));
+                    let tuple = matches!(le.pat.kind, PatKind::Tuple(..)) || tuple_of_non_variables(le.pat);
                     if p.conds.is_empty() && !tuple {
                         return Ok(Tr::new(format!("{} {}while let {} = {} {{\n{}\n}}", FUEL, lbl, p.pat, iv.at(20), body), 11));
                     }
@@ -1839,7 +2006,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // the loop pattern
         let mut pro = vec![];
         let ps = match pat.kind {
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+            PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 if m.is_mut() {
@@ -1883,7 +2050,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tmp = self.fresh("scrut");
         let tv = Tr::atom(tmp.clone());
         let m = self.match_arms(&tv, arms)?;
-        Ok(Tr::atom(format!("{{\nlet {} = {};\nmatch {} {{\n{}\n}}\n}}", tmp, sv.at(20), tmp, m)))
+        Ok(Tr::block(format!("{{\nlet {} = {};\nmatch {} {{\n{}\n}}\n}}", tmp, sv.at(20), tmp, m)))
     }
 
     /// The arms of a uRust `match` on `v`. An arm whose pattern cannot fail but which has a
@@ -1962,7 +2129,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     _ => false,
                 },
             },
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), _, _, sub) => {
+            PatKind::Binding(bm, _, _, sub) if by_value(bm).is_some() => {
                 sub.map(|s| self.chainable(s)).unwrap_or(true)
             }
             PatKind::Or(ps) | PatKind::Tuple(ps, _) => ps.iter().all(|q| self.chainable(q)),
@@ -1991,14 +2158,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             branches.push((cond, body));
         }
         let acc = if_chain(branches);
-        Ok(Tr::atom(format!("{{\nlet {} = {};\n{}\n}}", tmp, sv.at(20), acc)))
+        Ok(Tr::block(format!("{{\nlet {} = {};\n{}\n}}", tmp, sv.at(20), acc)))
     }
 
     /// Condition + bindings for a pattern matched against a value (used for scalar matches).
     fn pat_cond(&mut self, pat: &'tcx hir::Pat<'tcx>, v: &Tr) -> R<(Option<String>, Vec<String>)> {
         match pat.kind {
             PatKind::Wild => Ok((None, vec![])),
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
+            PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 let mut binds = vec![format!("let {}{} = {};", m.prefix_str(), n, v.at(20))];
@@ -2011,7 +2178,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     None => Ok((None, binds)),
                 }
             }
-            PatKind::Binding(..) => unsup("`ref` binding"),
+            PatKind::Binding(..) => unsup("`ref mut` binding"),
             PatKind::Expr(pe) => Ok((Some(format!("{} == {}", v.at(45), self.pat_expr(pe, pat)?.at(45))), vec![])),
             PatKind::Range(lo, hi, end) => {
                 if self.ty_is_char(pat) { return unsup("range pattern on `char`") }
@@ -2108,7 +2275,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>) -> R<String> {
         match pat.kind {
             PatKind::Wild => Ok("_".into()),
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
+            PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 // binding mode after match ergonomics
                 if let Some(hir::BindingMode(hir::ByRef::Yes(_, mutbl), _)) = self.typeck.pat_binding_modes().get(hid)
                     && mutbl.is_mut()
@@ -2138,7 +2305,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     }
                 }
             }
-            PatKind::Binding(..) => unsup("`ref` binding"),
+            PatKind::Binding(..) => unsup("`ref mut` binding"),
             PatKind::Tuple(ps, ddpos) => {
                 let t = self.pat_ty(pat).peel_refs();
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
@@ -2263,7 +2430,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let l = self.locals.get(&root).cloned().expect("captured variable is a local of the enclosing body");
                     if !l.cell { continue }
                     let n = self.fresh(&format!("{}_copy", l.name));
-                    copies.push(format!("let {} = *{};", n, l.name));
+                    copies.push(format!("let {} = * {};", n, l.name));
                     self.locals.insert(root, Local { name: n, cell: false });
                     saved.push((root, l));
                 }
@@ -2282,7 +2449,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let h = self.fe.ty(self.ty_of(e));
         let tmp = self.fresh("closure");
         copies.push(format!("let {} = {};", tmp, closure.at(20)));
-        Ok(Tr::atom(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))
+        Ok(Tr::block(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))
     }
 
     /// The formals and the body of a closure.
@@ -2292,7 +2459,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut pro = vec![];
         for (i, p) in body.params.iter().enumerate() {
             match p.pat.kind {
-                PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+                PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                     let n = names::local_name(ident.as_str());
                     // closure formals carry no type in uRust: fix it in the body
                     let (pt, modelled) = self.fe.ty_modelled(self.node_ty(hid));

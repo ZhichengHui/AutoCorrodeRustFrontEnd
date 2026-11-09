@@ -78,6 +78,7 @@
 | `Vec::pop` | `vec_pop`：空时 `None`，否则去掉并返回最后一个元素 | 手写 | 同上 |
 | `<[T]>::swap` | `slice_swap`：交换两个位置，越界时 panic | 手写 | 同上 |
 | `vec![x; n]`（`alloc::vec::from_elem`） | `vec_from_elem`：`replicate n x` | 手写 | 同上 |
+| 数组重复表达式 `[x; N]`（语言构造，`N` 已知） | `vec_from_elem(x, N)` | 手写 | `BodyTr::expr`（`ExprKind::Repeat`） |
 
 丢掉的语义：容量（`with_capacity`、`reserve` 的效果、`capacity()`）和元素的内存位置。
 
