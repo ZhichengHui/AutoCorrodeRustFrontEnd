@@ -469,6 +469,11 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         fn_placeholder(fe, &mut fd, "async fn");
         return fd;
     }
+    // the C-variadic parameter `...` is not part of the signature but is bound in the body
+    if is_fn && tcx.fn_sig(did).skip_binder().c_variadic() {
+        fn_placeholder(fe, &mut fd, "C-variadic function");
+        return fd;
+    }
     if tcx.generics_of(did).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. })) {
         fn_placeholder(fe, &mut fd, "const generic parameter");
         return fd;

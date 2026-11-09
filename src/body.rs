@@ -819,7 +819,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let v: R<Vec<String>> = es.iter().map(|x| self.val(x).map(|t| t.at(11))).collect();
                 Ok(Tr::atom(format!("[{}]", v?.join(", "))))
             }
-            ExprKind::Repeat(..) => unsup("array repeat expression"),
+            ExprKind::Repeat(elem, _) => {
+                // `[x; N]` with a known length: the list `replicate N x`, as for `vec![x; n]`
+                let ty::Array(_, len) = self.ty_of(e).kind() else { return unsup("array repeat expression") };
+                let Some(n) = len.try_to_target_usize(self.tcx) else { return unsup("array repeat expression with a generic length") };
+                let x = self.val(elem)?;
+                let n = Self::int_lit(n as u128, false, self.tcx.types.usize)?;
+                Ok(self.named_call("vec_from_elem", vec![x, n]))
+            }
             ExprKind::ConstBlock(..) => unsup("inline const block"),
             ExprKind::InlineAsm(..) => unsup("inline assembly"),
             ExprKind::OffsetOf(..) => unsup("offset_of"),
@@ -903,7 +910,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok(Tr::atom(format!("\\<llangle>STR ''{}''\\<rrangle>", s)))
             }
             LitKind::Float(..) => unsup("floating-point literal"),
-            LitKind::ByteStr(..) => unsup("byte string literal"),
+            // `b"…"`: the list of its bytes (byte arrays and slices are `8 word list`)
+            LitKind::ByteStr(bs, _) => {
+                let bytes: Vec<String> = bs.as_byte_str().iter().map(|b| format!("{}_u8", b)).collect();
+                Ok(Tr::atom(format!("[{}]", bytes.join(", "))))
+            }
             LitKind::CStr(..) => unsup("C string literal"),
             _ => unsup("literal"),
         }
@@ -1033,7 +1044,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn mk_bin(op: &str, prec: u32, l: &Tr, r: &Tr) -> Tr {
         // non-atomic operands are always parenthesised: `|` is also closure and pattern syntax,
         // and explicit grouping avoids ambiguous parses
-        Tr::new(format!("{} {} {}", l.at(999), op, r.at(999)), prec)
+        // a block is atomic elsewhere, but as an operand its braces make the parse ambiguous
+        let opnd = |t: &Tr| if t.s.starts_with('{') { format!("({})", t.s) } else { t.at(999) };
+        Tr::new(format!("{} {} {}", opnd(l), op, opnd(r)), prec)
     }
 
     fn binary(&mut self, e: &'tcx hir::Expr<'tcx>, op: BinOpKind, l: &'tcx hir::Expr<'tcx>, r: &'tcx hir::Expr<'tcx>) -> R<Tr> {
@@ -1650,12 +1663,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let p = self.pat(le.pat)?;
             let tb = with_prologue(&p.prologue, &self.branch(t)?);
             let eb = match el { Some(x) => self.branch(x)?, None => "()".into() };
-            if p.conds.is_empty() {
+            // uRust's `if let`, like its `while let`, takes no pattern conditions and only
+            // variables in a tuple pattern; otherwise `match e { p => t, _ => e }`
+            let tuple = matches!(le.pat.kind, PatKind::Tuple(..));
+            if p.conds.is_empty() && !tuple {
                 return Ok(Tr::new(format!("if let {} = {} {{\n{}\n}} else {{\n{}\n}}", p.pat, iv.at(20), tb, eb), 11));
             }
+            let guard = if p.conds.is_empty() { String::new() } else { format!(" if {}", p.conds.join(" && ")) };
             return Ok(Tr::new(format!(
-                "match {} {{\n  {} if {} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{\n{}\n}}\n}}",
-                iv.at(20), p.pat, p.conds.join(" && "), tb, eb
+                "match {} {{\n  {}{} \\<Rightarrow> {{\n{}\n}},\n  _ \\<Rightarrow> {{\n{}\n}}\n}}",
+                iv.at(20), p.pat, guard, tb, eb
             ), 20));
         }
         if contains_let(c) { return unsup("`let` chain in `if` condition") }

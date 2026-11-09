@@ -2,7 +2,7 @@
 
 本文件说明前端对每类 Rust 语言构造的处理：支持的构造翻译成什么（包括用某种表示替换 Rust 语义的地方），不支持的构造输出什么占位符。标准库类型和函数的等价模型登记在 `STD_MODELS.md`，这里不重复。
 
-所有占位符由 `Frontend::placeholder` 生成，并登记到输出目录的 `PLACEHOLDERS.txt`。不支持的表达式或语句被替换成 AutoCorrode 的 `unimplemented`（执行到这里时以中止原因 `Unimplemented` 中止）；类型为 `!` 时写成 `unimplemented!("…")`，否则写成带类型标注的 `ε⟨(unimplemented (STR ''…'') :: (_, T, _, _, _, _) expression)⟩`。不支持的类型被替换成抽象类型 `unsupported_*`（`typedecl`）。函数是 `async fn`、有 const 泛型参数、参数或返回值类型（常量的类型）不受支持，或者错误无法限制在一个语句或表达式内（例如参数模式无法翻译、可变参数的类型没有模型）时，整个函数体替换成 `unimplemented!`。
+所有占位符由 `Frontend::placeholder` 生成，并登记到输出目录的 `PLACEHOLDERS.txt`。不支持的表达式或语句被替换成 AutoCorrode 的 `unimplemented`（执行到这里时以中止原因 `Unimplemented` 中止）；类型为 `!` 时写成 `unimplemented!("…")`，否则写成带类型标注的 `ε⟨(unimplemented (STR ''…'') :: (_, T, _, _, _, _) expression)⟩`。不支持的类型被替换成抽象类型 `unsupported_*`（`typedecl`）。函数是 `async fn`、C 变参函数、有 const 泛型参数、参数或返回值类型（常量的类型）不受支持，或者错误无法限制在一个语句或表达式内（例如参数模式无法翻译、可变参数的类型没有模型）时，整个函数体替换成 `unimplemented!`。
 
 ## 类型
 
@@ -28,7 +28,7 @@
 
 ## 表达式与运算
 
-- 字面量：整数按其类型写成带后缀的字面量（如 `3_u32`、`3_i32`），负数字面量（`-` 直接作用于字面量，以及模式中的负数字面量）写成 `-3_i32`，AutoCorrode 把它读成字面量本身，所以 `-128_i8` 是最小值，不会因取负而溢出；字节字面量为 `u8`，`bool` 原样；ASCII 字符写成 HOL 的 `CHR`；只含可打印 ASCII 字符且不含 `'`、`\`、`"` 的字符串写成 HOL 的 `STR`。
+- 字面量：整数按其类型写成带后缀的字面量（如 `3_u32`、`3_i32`），负数字面量（`-` 直接作用于字面量，以及模式中的负数字面量）写成 `-3_i32`，AutoCorrode 把它读成字面量本身，所以 `-128_i8` 是最小值，不会因取负而溢出；字节字面量为 `u8`，`bool` 原样；ASCII 字符写成 HOL 的 `CHR`；字节串 `b"…"` 写成其字节组成的列表（如 `[71_u8, 69_u8]`）；只含可打印 ASCII 字符且不含 `'`、`\`、`"` 的字符串写成 HOL 的 `STR`。
 - 路径：局部变量（可变局部变量读出其值）；无字段的构造子（`None`、`Ordering` 的变体、本地 ADT 的构造子）；本地的 `const`、`static` 引用其定义，外部 crate 的整数和 `bool` 常量（如 `u32::MAX`）求值成字面量。
 - 运算：整数（`i8`…`i64`、`isize`、`u8`…`u64`、`usize`）的算术、位运算、比较、移位用 uRust 的同名运算，移位量不是 `u64`/`usize` 时转换成 `u64`（有符号的移位量先按 `as` 符号扩展，负数因此成为超出位宽的大数，按 Rust 的 debug 语义溢出 panic）；`bool` 的 `&`、`|`、`^` 写成 `&&`、`||`、`!=`；`!` 作用于 `bool` 和整数时原样翻译；`-` 作用于有符号整数时翻译成 uRust 的取负（`word_uminus`，只在最小值上溢出 panic）；`char` 只支持 `==`、`!=`。有符号整数的溢出、除法（向零取整，最小值除以 `-1` 溢出）、取余（符号同被除数）、算术右移和比较（按有符号数）由 AutoCorrode 的定义决定，与 Rust 的 debug 语义一致。
 - `as` 支持有模型的整数类型（有符号、无符号，各宽度）之间的转换，写成 uRust 的 `(e) as T`：源是有符号时符号扩展，否则零扩展，再截断（AutoCorrode 的 `word_rust_cast`）；`as` 的结果优先级为 299，低于一元运算。
@@ -39,16 +39,16 @@
 - 下标：`Vec`、切片、数组写成 uRust 的列表下标，经 `&mut` 时得到指向元素的引用；以区间作下标得到子列表的值；本地类型调用其 `Index::index` 或 `IndexMut::index_mut` 实现。
 - 借用：`&mut` 一个位置得到指向它的引用；`&mut` 一个临时值时分配一个新的可变局部变量并取其引用；`&` 得到值本身。内建解引用读出引用指向的值；`Box` 的解引用是恒等；重载解引用见 `STD_MODELS.md`；数组到切片的强制转换是恒等。
 - 调用：本地函数、构造子、局部变量中的闭包见"函数与闭包"；标准库函数见 `STD_MODELS.md`，没有模型的外部函数生成外部函数模板，结果类型中有不由参数决定的类型变量时，调用处标注结果类型；`extern` 块中的函数见"条目"。返回 `!` 的标准库函数（`panic!` 等）写成 `panic!`，消息取参数中的第一个字符串字面量，没有时取函数名。参数含 `fmt::Arguments` 且返回 `()` 的标准库函数（`print!`、`println!` 等）只产生输出，调用被丢弃成 `()`，并登记为占位符。
-- 元组、数组字面量写成 uRust 的元组和列表；区间 `a..b`、`a..=b` 写成 uRust 的区间。
+- 元组、数组字面量写成 uRust 的元组和列表；长度已知的数组重复表达式 `[x; N]` 写成 `vec_from_elem(x, N_usize)`（即 `replicate N x`，与 `vec![x; n]` 的模型相同）；区间 `a..b`、`a..=b` 写成 uRust 的区间。
 - 结构体表达式：本地 struct 写成 uRust 的结构体表达式，enum 的 struct 变体写成构造子调用。书写顺序与声明顺序不同且字段表达式可能有副作用时，先按书写顺序绑定到临时变量；`..base` 先把 `base` 绑定到临时变量，再读出未写出的字段。
 - 块、`return` 原样翻译；类型标注和 rustc 插入的 `DropTemps` 不产生输出。
 - 类型为 `!` 的表达式：作为语句时标注为 `unit`，其后接 `panic!("unreachable: diverging expression completed")`；被强制转换成其他类型时标注为目标类型。`return`、`break`、`continue` 除外，它们在这两种位置上都写成语句。
 
-不支持（占位符）：浮点字面量、字节串、C 字符串、非 ASCII 字符字面量、含其他字符的字符串字面量；`i128`、`u128` 的字面量与运算；浮点数的取负；`bool`、`char` 的大小比较；其他类型之间的 `as`；函数项或构造子作为值；`static mut`；解析到 trait 声明的关联常量、泛型常量；外部类型和其他标准库类型的构造子与结构体表达式；超过 8 个字段的构造子调用和结构体表达式；带默认字段值的结构体表达式；单元素元组表达式；超过 16 个分量的元组的字段访问；其他类型的字段访问；经引用访问递归 struct 的字段；对其他类型的下标；对非可变位置的赋值或可变借用；在含调用的位置上的 `/=`；`format!` 等格式化字符串；内部可变性类型的方法；其他解引用、到 trait 对象的强制转换、其他指针强制转换；裸借用、`offset_of`、内联常量块、数组重复表达式 `[x; n]`（标准库的 `vec![x; n]` 除外）、内联汇编、`yield`/`await`、`become`、`use` 表达式。
+不支持（占位符）：浮点字面量、C 字符串、非 ASCII 字符字面量、含其他字符的字符串字面量；`i128`、`u128` 的字面量与运算；浮点数的取负；`bool`、`char` 的大小比较；其他类型之间的 `as`；函数项或构造子作为值；`static mut`；解析到 trait 声明的关联常量、泛型常量；外部类型和其他标准库类型的构造子与结构体表达式；超过 8 个字段的构造子调用和结构体表达式；带默认字段值的结构体表达式；单元素元组表达式；超过 16 个分量的元组的字段访问；其他类型的字段访问；经引用访问递归 struct 的字段；对其他类型的下标；对非可变位置的赋值或可变借用；在含调用的位置上的 `/=`；`format!` 等格式化字符串；内部可变性类型的方法；其他解引用、到 trait 对象的强制转换、其他指针强制转换；裸借用、`offset_of`、内联常量块、长度依赖泛型参数的数组重复表达式、内联汇编、`yield`/`await`、`become`、`use` 表达式。
 
 ## 控制流
 
-- `if`/`else` 原样翻译；`if let` 的模式含字面量或区间子模式时，翻译成带守卫的 `match`。
+- `if`/`else` 原样翻译；`if let` 的模式含字面量或区间子模式时翻译成带守卫的 `match`，模式是元组时翻译成 `match`（uRust 的 `if let` 只接受由变量组成的元组模式）。
 - `match`：被匹配的值是整数、`char`、`str` 或 `String`，或者所有分支的模式都只由字面量、区间、整数或 `bool` 常量、`Ordering` 变体、绑定以及它们组成的元组和或模式构成时，翻译成 `if` 链（被匹配的值先绑定到临时变量）。其他 `match` 翻译成 uRust 的 `match`：字面量和区间子模式变成守卫条件；不会失败但带条件的分支变成一个分支，在其中检查条件，不满足时匹配其余分支（都不满足时 `panic!("non-exhaustive match")`）；不会失败的分支之后的分支被省略（不可达）。
 - `while`、`loop` 翻译成 uRust 的带燃料循环 `#[fuel(urust_fuel)]`，`urust_fuel` 是 crate locale 的参数。燃料耗尽时循环结束（AutoCorrode 的 `bounded_while`）。
 - 循环的标签原样保留在翻译出的 uRust 循环上（`'l: for …`、`#[fuel(urust_fuel)] 'l: while …`、`#[fuel(urust_fuel)] 'l: loop …`、`#[fuel(urust_fuel)] 'l: while let …`），包括下面由 `while let` 和 `for` 展开成的循环。
@@ -113,8 +113,6 @@ Rust 路径的各段用 `_` 连接成一个 Isabelle 标识符。与 uRust 记�
 
 ## 已知缺陷
 
-下面的构造前端已经翻译，但生成的 theory 不被 Isabelle 接受或检查极慢。它们不是占位符，`PLACEHOLDERS.txt` 中没有记录。
+下面的构造前端已经翻译，但生成的 theory 在 Isabelle 中检查极慢。它不是占位符，`PLACEHOLDERS.txt` 中没有记录。
 
-- `if let` 的模式是由构造子组成的元组时（如 `if let (Some(a), Some(b)) = (x.pop(), y.pop())`），Isabelle 在解析生成的 `let` 模式时抛出 `exception TERM`（`abs_tr`）。与元素类型无关（`u32` 同样出错）；`while let` 的同类模式可以通过。例：`tests/crates` 中的 `algorithms__math__postfix_evaluation`、`algorithms__sorting__pigeonhole_sort`。
-- C 变参函数（`unsafe extern "C" fn f(mut ap: ...)`）的定义中，变参参数从 HOL 类型中丢失，函数体却仍以 `λap.` 绑定它，类型检查失败。例：`charon__variadics`。对 C 变参函数的调用是占位符。
 - 带守卫、各分支为元组模式的大型 `match`（如 splr 的 `AssignStack::reuse_saved_trail`，10 个分支）在 Isabelle 中检查超过 15 分钟。生成的文本本身正确。
