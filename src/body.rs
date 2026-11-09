@@ -75,6 +75,17 @@ struct Local {
     cell: bool,
 }
 
+/// The mutability of a binding that is translated by value: a by-value binding, or an immutable
+/// `ref` binding (a shared reference is represented by the value it points to). `None` for
+/// `ref mut`.
+fn by_value(bm: hir::BindingMode) -> Option<hir::Mutability> {
+    match bm {
+        hir::BindingMode(hir::ByRef::No, m) => Some(m),
+        hir::BindingMode(hir::ByRef::Yes(_, hir::Mutability::Not), _) => Some(hir::Mutability::Not),
+        hir::BindingMode(hir::ByRef::Yes(..), _) => None,
+    }
+}
+
 /// Information about a pattern translation for a uRust `match`/`if let`.
 struct PatTr {
     pat: String,
@@ -194,7 +205,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut prologue = vec![];
         for (i, p) in body.params.iter().enumerate() {
             match p.pat.kind {
-                PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+                PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                     let n = names::local_name(ident.as_str());
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
@@ -401,7 +412,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `let <pat> = <value>;` for an irrefutable pattern (one or more statements).
     fn bind_pattern(&mut self, pat: &'tcx hir::Pat<'tcx>, v: Tr) -> R<String> {
         match pat.kind {
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+            PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 // the allocator of a mutable local is chosen by its type: `[]` and `None` do not fix
@@ -426,7 +437,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut out = vec![];
         match pat.kind {
             PatKind::Wild => {}
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
+            PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 out.push(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)));
@@ -434,7 +445,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     out.extend(self.irrefutable(s, &Tr::atom(n))?);
                 }
             }
-            PatKind::Binding(..) => return unsup("`ref` binding"),
+            PatKind::Binding(..) => return unsup("`ref mut` binding"),
             PatKind::Tuple(ps, ddpos) => {
                 let t = self.pat_ty(pat).peel_refs();
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
@@ -1924,7 +1935,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // the loop pattern
         let mut pro = vec![];
         let ps = match pat.kind {
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+            PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 if m.is_mut() {
@@ -2047,7 +2058,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     _ => false,
                 },
             },
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), _, _, sub) => {
+            PatKind::Binding(bm, _, _, sub) if by_value(bm).is_some() => {
                 sub.map(|s| self.chainable(s)).unwrap_or(true)
             }
             PatKind::Or(ps) | PatKind::Tuple(ps, _) => ps.iter().all(|q| self.chainable(q)),
@@ -2083,7 +2094,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn pat_cond(&mut self, pat: &'tcx hir::Pat<'tcx>, v: &Tr) -> R<(Option<String>, Vec<String>)> {
         match pat.kind {
             PatKind::Wild => Ok((None, vec![])),
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
+            PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 let mut binds = vec![format!("let {}{} = {};", m.prefix_str(), n, v.at(20))];
@@ -2096,7 +2107,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     None => Ok((None, binds)),
                 }
             }
-            PatKind::Binding(..) => unsup("`ref` binding"),
+            PatKind::Binding(..) => unsup("`ref mut` binding"),
             PatKind::Expr(pe) => Ok((Some(format!("{} == {}", v.at(45), self.pat_expr(pe, pat)?.at(45))), vec![])),
             PatKind::Range(lo, hi, end) => {
                 if self.ty_is_char(pat) { return unsup("range pattern on `char`") }
@@ -2193,7 +2204,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>) -> R<String> {
         match pat.kind {
             PatKind::Wild => Ok("_".into()),
-            PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, sub) => {
+            PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 // binding mode after match ergonomics
                 if let Some(hir::BindingMode(hir::ByRef::Yes(_, mutbl), _)) = self.typeck.pat_binding_modes().get(hid)
                     && mutbl.is_mut()
@@ -2223,7 +2234,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     }
                 }
             }
-            PatKind::Binding(..) => unsup("`ref` binding"),
+            PatKind::Binding(..) => unsup("`ref mut` binding"),
             PatKind::Tuple(ps, ddpos) => {
                 let t = self.pat_ty(pat).peel_refs();
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
@@ -2377,7 +2388,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut pro = vec![];
         for (i, p) in body.params.iter().enumerate() {
             match p.pat.kind {
-                PatKind::Binding(hir::BindingMode(hir::ByRef::No, m), hid, ident, None) => {
+                PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                     let n = names::local_name(ident.as_str());
                     // closure formals carry no type in uRust: fix it in the body
                     let (pt, modelled) = self.fe.ty_modelled(self.node_ty(hid));
