@@ -606,11 +606,21 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// `&mut` of a place is the reference to it; `&mut` of a temporary value allocates a
     /// fresh mutable local holding the value (Rust's temporary) and yields its reference.
+    /// One of the standard range types (`a..b`, `a..`, `..b`, `..=b`, `..`, `a..=b`).
+    fn is_range_ty(&self, t: Ty<'tcx>) -> bool {
+        let ty::Adt(def, _) = t.kind() else { return false };
+        let li = self.tcx.lang_items();
+        let d = Some(def.did());
+        [li.range_struct(), li.range_from_struct(), li.range_to_struct(), li.range_to_inclusive_struct(),
+            li.range_full_struct(), li.range_inclusive_struct()]
+            .contains(&d)
+    }
+
     fn borrow_mut(&mut self, e: &'tcx hir::Expr<'tcx>, pv: PV, t: Ty<'tcx>) -> R<PV> {
         // `&mut v[a..b]`: the subslice is a value (a list), and a temporary copy of it would lose
         // the writes made through the borrow
         if let ExprKind::Index(_, idx, _) = e.kind
-            && matches!(self.ty_adj(idx).peel_refs().kind(), ty::Adt(..))
+            && self.is_range_ty(self.ty_adj(idx).peel_refs())
         {
             return unsup("mutable borrow of a subslice");
         }
@@ -688,12 +698,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::Index(base, idx, _) => {
                 let bt = self.ty_adj(base).peel_refs();
-                if !self.list_like(bt) {
+                // a sequence indexed by a local type (`impl Index<Var> for Vec<T>`) uses that impl
+                let it = self.ty_adj(idx).peel_refs();
+                let local_index = matches!(it.kind(), ty::Adt(def, _) if def.did().is_local());
+                if !self.list_like(bt) || local_index {
                     // `base[idx]` on a local type is `*Index::index(&base, idx)`, or
                     // `*IndexMut::index_mut(&mut base, idx)` in a mutable place; the borrow of the
                     // base is its adjustment, the method resolves to the local implementation
                     let local_adt = matches!(bt.kind(), ty::Adt(def, _) if def.did().is_local());
-                    if !local_adt { return unsup(format!("indexing into `{}`", bt)) }
+                    if !local_adt && !local_index { return unsup(format!("indexing into `{}`", bt)) }
                     let did = self.typeck.type_dependent_def_id(e.hir_id).expect("overloaded indexing has a method");
                     let gargs = self.node_args(e.hir_id);
                     let argv = self.vals([base, idx])?;
