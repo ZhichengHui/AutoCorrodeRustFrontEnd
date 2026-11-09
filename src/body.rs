@@ -559,7 +559,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 Adjust::Deref(_) => return unsup("pinned dereference"),
                 Adjust::Borrow(AutoBorrow::Ref(m)) => match m {
-                    AutoBorrowMutability::Mut { .. } => self.borrow_mut(pv, cur)?,
+                    AutoBorrowMutability::Mut { .. } => self.borrow_mut(e, pv, cur)?,
                     AutoBorrowMutability::Not => PV::Val(self.to_val(pv)),
                 },
                 Adjust::Borrow(_) => return unsup("raw or pinned auto-borrow"),
@@ -589,7 +589,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// `&mut` of a place is the reference to it; `&mut` of a temporary value allocates a
     /// fresh mutable local holding the value (Rust's temporary) and yields its reference.
-    fn borrow_mut(&mut self, pv: PV, t: Ty<'tcx>) -> R<PV> {
+    fn borrow_mut(&mut self, e: &'tcx hir::Expr<'tcx>, pv: PV, t: Ty<'tcx>) -> R<PV> {
+        // `&mut v[a..b]`: the subslice is a value (a list), and a temporary copy of it would lose
+        // the writes made through the borrow
+        if let ExprKind::Index(_, idx, _) = e.kind
+            && matches!(self.ty_adj(idx).peel_refs().kind(), ty::Adt(..))
+        {
+            return unsup("mutable borrow of a subslice");
+        }
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
             PV::Val(v) => {
@@ -685,7 +692,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     bpv = self.deref_pv(bpv, bt_adj)?;
                     bt_adj = *inner;
                 }
-                let i = self.val(idx)?;
+                let i = match self.open_range(base, idx, &bpv)? {
+                    Some(i) => i,
+                    None => self.val(idx)?,
+                };
                 match bpv {
                     PV::Val(v) => Ok(PV::Val(Tr::new(format!("{}[{}]", v.at(100), i.s), 100))),
                     PV::Ref(r) if !is_range => Ok(PV::Ref(Tr::new(format!("{}[{}]", r.at(100), i.s), 100))),
@@ -694,6 +704,51 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             _ => Ok(PV::Val(self.val_unadj(e)?)),
         }
+    }
+
+    /// A sequence index `a..`, `..b`, `..=b` or `..` written as the closed uRust range
+    /// `a .. len(base)`, `0 .. b`, `0 ..= b`, `0 .. len(base)`. The missing end repeats the base,
+    /// so only a base without side effects qualifies; `None` for every other index.
+    fn open_range(&mut self, base: &'tcx hir::Expr<'tcx>, idx: &'tcx hir::Expr<'tcx>, bpv: &PV) -> R<Option<Tr>> {
+        // `..` is the unit struct `RangeFull`, the others are struct expressions
+        let fields: &[hir::ExprField<'tcx>] = match idx.kind {
+            ExprKind::Struct(_, fields, _) => fields,
+            ExprKind::Path(_) => &[],
+            _ => return Ok(None),
+        };
+        let ty::Adt(def, _) = self.ty_of(idx).kind() else { return Ok(None) };
+        let li = self.tcx.lang_items();
+        let d = Some(def.did());
+        let (from, to_incl) = if d == li.range_from_struct() {
+            (true, None)
+        } else if d == li.range_to_struct() {
+            (false, Some(false))
+        } else if d == li.range_to_inclusive_struct() {
+            (false, Some(true))
+        } else if d == li.range_full_struct() {
+            (false, None)
+        } else {
+            return Ok(None);
+        };
+        if !self.is_simple(base) { return unsup("open range index on a base with side effects") }
+        let len = || match bpv {
+            PV::Val(v) => format!("len({})", v.at(11)),
+            PV::Ref(r) => format!("len(*{})", r.at(200)),
+        };
+        let field = |s: &mut Self, name: rustc_span::Symbol| -> R<Tr> {
+            let f = fields.iter().find(|f| f.ident.name == name).expect("range field");
+            s.val(f.expr)
+        };
+        let zero = Tr::atom("0_usize");
+        Ok(Some(if from {
+            let a = field(self, sym::start)?;
+            Tr::new(format!("{} .. {}", a.at(42), len()), 41)
+        } else if let Some(incl) = to_incl {
+            let b = field(self, sym::end)?;
+            Tr::new(format!("{} {} {}", zero.s, if incl { "..=" } else { ".." }, b.at(42)), 41)
+        } else {
+            Tr::new(format!("{} .. {}", zero.s, len()), 41)
+        }))
     }
 
     /// The place denoted by an expression; must be a reference.
@@ -794,7 +849,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if m.is_mut() {
                     let t = self.ty_adj(x);
                     let pv = self.pv_adjusted(x)?;
-                    match self.borrow_mut(pv, t)? {
+                    match self.borrow_mut(x, pv, t)? {
                         PV::Val(v) => Ok(v),
                         PV::Ref(_) => unreachable!(),
                     }
