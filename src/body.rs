@@ -711,7 +711,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 let i = match self.open_range(base, idx, &bpv)? {
                     Some(i) => i,
-                    None => self.val(idx)?,
+                    None => {
+                        // uRust indexes by an integer or a `Range` (`a..b`); other range types
+                        // (a `RangeFrom` held in a variable, ...) have no index operation
+                        let it = self.ty_adj(idx).peel_refs();
+                        if let ty::Adt(d, _) = it.kind()
+                            && Some(d.did()) != self.tcx.lang_items().range_struct()
+                        {
+                            return unsup(format!("indexing with a range of type `{}`", it));
+                        }
+                        self.val(idx)?
+                    }
                 };
                 match bpv {
                     PV::Val(v) => Ok(PV::Val(Tr::new(format!("{}[{}]", v.at(100), i.s), 100))),
