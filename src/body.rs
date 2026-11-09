@@ -1287,6 +1287,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         if !adt.is_local() { return unsup("constructor of an external type") }
         if argv.len() > 8 { return unsup("constructor with more than 8 fields") }
+        // `S()`: a constructor without fields has no `_mk` function; it is the value itself
+        if argv.is_empty() { return Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx))) }
         let n = self.fe.variant_call_name(adt, vidx);
         let a: Vec<String> = argv.into_iter().map(|t| t.at(11)).collect();
         Ok(Tr::new(format!("{}({})", n, a.join(", ")), 999))
