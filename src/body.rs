@@ -102,6 +102,14 @@ enum RangeKind {
 
 /// Whether `pat` contains a tuple pattern with a component other than a variable or `_`: uRust's
 /// `if let` and `while let` accept only tuples of variables.
+/// Whether `t` contains an `impl Trait` type.
+fn has_opaque(t: Ty<'_>) -> bool {
+    t.walk().any(|g| match g.kind() {
+        ty::GenericArgKind::Type(x) => matches!(x.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Opaque { .. })),
+        _ => false,
+    })
+}
+
 fn tuple_of_non_variables(pat: &hir::Pat<'_>) -> bool {
     let mut found = false;
     pat.walk(|p| {
@@ -1586,10 +1594,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn result_stated(&mut self, target: DefId, call: Tr, e: &hir::Expr<'tcx>) -> Tr {
         let t = self.ty_of(e);
         // an `impl Trait` type is not stated: its HOL type may differ from the callee's result type
-        let unstated = t.walk().any(|g| match g.kind() {
-            ty::GenericArgKind::Type(x) => matches!(x.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Opaque { .. })),
-            _ => false,
-        });
+        let unstated = has_opaque(t);
         // `e` is the call itself, not an operator expression resolved to it (e.g. an overloaded
         // index, whose type is that of the place, not of the reference `index_mut` returns)
         let is_call = matches!(e.kind, ExprKind::Call(..) | ExprKind::MethodCall(..));
