@@ -1585,9 +1585,20 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `impl<T> Static<Option<T>> for On`): the call does not determine it.
     fn result_stated(&mut self, target: DefId, call: Tr, e: &hir::Expr<'tcx>) -> Tr {
         let t = self.ty_of(e);
-        // an `impl Trait` type is not stated: its HOL type may differ from the callee's result type
-        let opaque = t.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(x) if matches!(x.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Opaque { .. }))));
-        if self.result_undetermined(target) && !t.is_never() && !opaque {
+        // an `impl Trait` type or a mutable reference is not stated: its HOL type in an expression
+        // may differ from the callee's result type (a reference returned is a `Global_Store.ref`)
+        let unstated = t.walk().any(|g| match g.kind() {
+            ty::GenericArgKind::Type(x) => match x.kind() {
+                ty::Alias(_, a) => matches!(a.kind, ty::AliasTyKind::Opaque { .. }),
+                ty::Ref(_, _, m) => m.is_mut(),
+                _ => false,
+            },
+            _ => false,
+        });
+        // `e` is the call itself, not an operator expression resolved to it (e.g. an overloaded
+        // index, whose type is that of the place, not of the reference `index_mut` returns)
+        let is_call = matches!(e.kind, ExprKind::Call(..) | ExprKind::MethodCall(..));
+        if is_call && self.result_undetermined(target) && !t.is_never() && !unstated {
             let h = self.hty(t);
             return self.typed("res", call, &h);
         }
