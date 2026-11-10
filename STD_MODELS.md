@@ -153,7 +153,7 @@
 |---|---|---|---|
 | `fmt::Formatter` | `fmt_Formatter`（输出缓冲区与 `FormattingOptions` 的 flags、width、precision） | AutoCorrode `StdLib_Fmt` | `Frontend::ty` |
 | `fmt::Error` | `fmt_Error` | AutoCorrode `StdLib_Fmt` | `Frontend::ty`、`unit_ctor` |
-| `alloc::fmt::format`（`format!`）、`Formatter` 上的 `write_fmt`（`write!(f, …)`） | 按 `core::fmt::write` 解释 `format_args!` 的展开：前端解码模板字节串，字面片段用 `fmt_write_str`/`fmt_write_char` 写出；每个占位符按它的选项新建一个 formatter，用 `rt::Argument` 构造函数所约束的格式化 trait 的 `fmt`（在参数类型上解析：本地实现直接调用，基本类型用下面的模型）写入，再把输出写到目标；某个 `fmt` 返回错误时，`write_fmt` 返回这个错误，`format` panic | 前端写法 + `StdLib_Fmt` | `fmt_call` |
+| `alloc::fmt::format`（`format!`）、`Formatter` 上的 `write_fmt`（`write!(f, …)`） | 按 `core::fmt::write` 解释 `format_args!` 的展开：前端解码模板字节串，字面片段用 `fmt_write_str`/`fmt_write_char` 写出；每个占位符按它的选项新建一个 formatter，用 `rt::Argument` 构造函数所约束的格式化 trait 的 `fmt`（在参数类型上解析，引用和 `Box` 先剥去，因为它们的实现只转发给内容：本地实现直接调用，基本类型用下面的模型）写入，再把输出写到目标；某个 `fmt` 返回错误时，`write_fmt` 返回这个错误，`format` panic | 前端写法 + `StdLib_Fmt` | `fmt_call` |
 | `Display`、`Debug`、`LowerHex`、`UpperHex`、`Octal`、`Binary` 的 `fmt`，用于无符号与有符号整数、`bool`、`char`、`str`、`String` | `fmt_<Trait>_<word|sword|bool|char|str>`，按 `core::fmt` 的实现移植（填充、对齐、宽度、精度、`+`、`#`、`0`、`x?`） | AutoCorrode `StdLib_Fmt` | `fmt_arg_call`、`std_call` |
 | `Formatter` 的 `write_str`、`write_char`、`pad`、`pad_integral`、`alternate`、`sign_plus`、`sign_minus`、`sign_aware_zero_pad`、`width`、`precision`、`fill`；`fmt::Write::write_str`/`write_char`（在 `Formatter` 上） | `fmt_<方法名>` | AutoCorrode `StdLib_Fmt` | `std_fn`/`std_call` |
 
