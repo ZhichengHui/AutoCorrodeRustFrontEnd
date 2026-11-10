@@ -38,6 +38,9 @@ impl<'tcx> DefSet<'tcx> {
 pub struct ExtType {
     pub arity: usize,
     pub comment: String,
+    /// the constructors of an enum without type arguments whose variants have no fields: the
+    /// type is declared as a datatype with these constructors
+    pub ctors: Vec<String>,
 }
 
 /// An external (or foreign) function for which a template definition is emitted.
@@ -443,7 +446,7 @@ impl<'tcx> Frontend<'tcx> {
         let name = format!("unsupported_{}", names::ident_chars(desc));
         if !self.ext_types.contains_key(&name) {
             let comment = self.placeholder(&format!("type {}", desc), None);
-            self.ext_types.insert(name.clone(), ExtType { arity, comment });
+            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![] });
         }
         name
     }
@@ -703,9 +706,29 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(format!("ext_{}", names::ident_chars(&segs.join("_"))), |n| {
             self.ext_types.contains_key(n) || self.used_type_names.contains(n)
         });
-        self.ext_types.insert(n.clone(), ExtType { arity, comment: format!("Rust: {}", self.tcx.def_path_str(did)) });
+        let ctors = match self.tcx.def_kind(did) {
+            DefKind::Enum if arity == 0 => {
+                let def = self.tcx.adt_def(did);
+                if !def.variants().is_empty() && def.variants().iter().all(|v| v.fields.is_empty()) {
+                    def.variants().iter().map(|v| format!("{}_{}", n, names::ident_chars(v.name.as_str()))).collect()
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        };
+        self.ext_types.insert(n.clone(), ExtType { arity, comment: format!("Rust: {}", self.tcx.def_path_str(did)), ctors });
         self.ext_type_ids.insert(did, n.clone());
         n
+    }
+
+    /// The constructor of the variant `vidx` of the external enum `adt` when it is declared with
+    /// its constructors (see `ExtType::ctors`).
+    pub fn ext_ctor(&mut self, adt: DefId, vidx: usize) -> Option<String> {
+        if self.tcx.def_kind(adt) != DefKind::Enum { return None }
+        let arity = self.tcx.generics_of(adt).own_counts().types;
+        let n = self.ext_type(adt, arity);
+        self.ext_types.get(&n).and_then(|t| t.ctors.get(vidx).cloned())
     }
 
     // ------------------------------------------------------------------

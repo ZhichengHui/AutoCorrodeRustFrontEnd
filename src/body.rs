@@ -1159,7 +1159,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Res::Def(DefKind::Const | DefKind::AssocConst { .. }, did) | Res::Def(DefKind::Static { .. }, did) => {
                 self.const_use(did, e)
             }
-            Res::Def(DefKind::Fn | DefKind::AssocFn, _) => unsup("function item used as a value"),
+            Res::Def(DefKind::Fn | DefKind::AssocFn, _) => self.fn_item_value(e),
             Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) => unsup("constructor used as a function value"),
             _ => unsup(format!("path `{}`", self.fe.snippet(e.span))),
         }
@@ -1190,7 +1190,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             _ => {}
         }
         if !adt.is_local() {
-            return unsup("constructor of an external type");
+            return match self.fe.ext_ctor(adt, vidx) {
+                Some(c) => Ok(Tr::atom(c)),
+                None => unsup("constructor of an external type"),
+            };
         }
         Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx)))
     }
@@ -2795,7 +2798,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Some("Option") | Some("Result") | Some("Ordering") => self.tcx.adt_def(adt).variant(vidx.into()).name.to_string(),
             Some("Box") => return parts.into_iter().next().ok_or(Unsup("box pattern".into())),
             Some(_) => return unsup("pattern on a standard library type"),
-            None if !adt.is_local() => return unsup("pattern on an external type"),
+            None if !adt.is_local() => match self.fe.ext_ctor(adt, vidx) {
+                Some(c) if parts.is_empty() => c,
+                _ => return unsup("pattern on an external type"),
+            },
             None => self.fe.variant_ctor_name(adt, vidx),
         };
         if parts.is_empty() { Ok(name) } else { Ok(format!("{}({})", name, parts.join(", "))) }
@@ -2854,6 +2860,35 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tmp = self.fresh("closure");
         copies.push(format!("let {} = {};", tmp, closure.at(20)));
         Ok(Tr::block(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))
+    }
+
+    /// A function item `f` used as a value: the closure `|a1, .., an| f(a1, .., an)` (for a
+    /// local function, or a trait method resolved to a local implementation), with its type
+    /// stated as for closures.
+    fn fn_item_value(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        let tcx = self.tcx;
+        let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
+        let gargs = tcx.instantiate_bound_regions_with_erased(gargs);
+        let (target, targs) = if self.fe.is_trait_item(did) {
+            match ty::Instance::try_resolve(tcx, self.typing_env(), did, gargs) {
+                Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) => (rd, args),
+                _ => return unsup("function item used as a value"),
+            }
+        } else {
+            (did, gargs)
+        };
+        if !(target.is_local() && self.fe.local_fn_with_body(target) && !self.derived(target)) {
+            return unsup("function item used as a value");
+        }
+        let sig = tcx.instantiate_bound_regions_with_erased(self.ty_of(e).fn_sig(tcx));
+        let ps: Vec<String> = sig.inputs().iter().map(|_| self.fresh("farg")).collect();
+        let tys: Vec<String> = sig.inputs().iter().map(|t| self.hty(*t)).collect();
+        let ret = self.hty(sig.output());
+        let call = self.local_call(target, targs, ps.iter().map(|p| Tr::atom(p.clone())).collect())?;
+        let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
+        let h = self.fe.fun_type(&tys, &ret);
+        let tmp = self.fresh("closure");
+        Ok(Tr::block(format!("{{ let {} = {} {{\n{}\n}}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, head, call.s, tmp, h)))
     }
 
     /// The formals and the body of a closure.
