@@ -1585,14 +1585,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `impl<T> Static<Option<T>> for On`): the call does not determine it.
     fn result_stated(&mut self, target: DefId, call: Tr, e: &hir::Expr<'tcx>) -> Tr {
         let t = self.ty_of(e);
-        // an `impl Trait` type or a mutable reference is not stated: its HOL type in an expression
-        // may differ from the callee's result type (a reference returned is a `Global_Store.ref`)
+        // an `impl Trait` type is not stated: its HOL type may differ from the callee's result type
         let unstated = t.walk().any(|g| match g.kind() {
-            ty::GenericArgKind::Type(x) => match x.kind() {
-                ty::Alias(_, a) => matches!(a.kind, ty::AliasTyKind::Opaque { .. }),
-                ty::Ref(_, _, m) => m.is_mut(),
-                _ => false,
-            },
+            ty::GenericArgKind::Type(x) => matches!(x.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Opaque { .. })),
             _ => false,
         });
         // `e` is the call itself, not an operator expression resolved to it (e.g. an overloaded
