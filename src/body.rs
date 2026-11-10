@@ -102,6 +102,14 @@ enum RangeKind {
 
 /// Whether `pat` contains a tuple pattern with a component other than a variable or `_`: uRust's
 /// `if let` and `while let` accept only tuples of variables.
+/// Whether `t` contains an `impl Trait` type.
+fn has_opaque(t: Ty<'_>) -> bool {
+    t.walk().any(|g| match g.kind() {
+        ty::GenericArgKind::Type(x) => matches!(x.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Opaque { .. })),
+        _ => false,
+    })
+}
+
 fn tuple_of_non_variables(pat: &hir::Pat<'_>) -> bool {
     let mut found = false;
     pat.walk(|p| {
@@ -131,6 +139,9 @@ pub struct BodyTr<'a, 'tcx> {
     owner: LocalDefId,
     /// The generic arguments of the instance being translated (`None`: the generic body itself).
     args: Option<GenericArgsRef<'tcx>>,
+    /// For a generic body: its own generic parameters, with each type parameter that occurs in no
+    /// parameter or result type replaced by `()`.
+    shown: Option<GenericArgsRef<'tcx>>,
     locals: HashMap<HirId, Local>,
     fresh: usize,
     pub calls: crate::frontend::DefSet<'tcx>,
@@ -143,12 +154,41 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     pub fn new(fe: &'a mut Frontend<'tcx>, owner: LocalDefId, args: Option<GenericArgsRef<'tcx>>) -> Self {
         let tcx = fe.tcx;
         let typeck = tcx.typeck(owner);
+        let shown = match (args, tcx.def_kind(owner)) {
+            (None, DefKind::Fn | DefKind::AssocFn) => {
+                let sig = tcx.fn_sig(owner).instantiate_identity().skip_binder();
+                // the signature's types as written and normalised (`Self::IntoIter` may be `I`)
+                let env = ty::TypingEnv::post_analysis(tcx, owner.to_def_id());
+                let in_sig: HashSet<u32> = sig
+                    .inputs_and_output
+                    .iter()
+                    .flat_map(|t| {
+                        let n = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t);
+                        [t, n]
+                    })
+                    .flat_map(|t| t.walk())
+                    .filter_map(|g| match g.kind() {
+                        ty::GenericArgKind::Type(t) => match t.kind() {
+                            ty::Param(p) => Some(p.index),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                Some(ty::GenericArgs::for_item(tcx, owner.to_def_id(), |param, _| match param.kind {
+                    ty::GenericParamDefKind::Type { .. } if !in_sig.contains(&param.index) => tcx.types.unit.into(),
+                    _ => tcx.mk_param_from_def(param),
+                }))
+            }
+            _ => None,
+        };
         BodyTr {
             fe,
             tcx,
             typeck,
             owner,
             args,
+            shown,
             locals: HashMap::new(),
             fresh: 0,
             calls: crate::frontend::DefSet::default(),
@@ -189,11 +229,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if t.is_never() {
             return Tr::new(format!("unimplemented!(\"{}\")", msg), 999);
         }
-        let h = self.fe.ty(t);
+        let h = self.hty(t);
         Tr::atom(format!(
             "\\<epsilon>\\<open>(unimplemented (STR ''{}'') :: (_, {}, _, _, _, _) expression)\\<close>",
             msg, h
         ))
+    }
+
+    /// The HOL type of the body's type `t`. A type parameter of a generic body that occurs in no
+    /// parameter or result type (e.g. one given only by turbofish) would be a type variable of the
+    /// definition's body alone, which Isabelle turns into an extra `itself` parameter of the
+    /// constant, so that no call of it type-checks: it is stated as `unit`.
+    fn hty(&mut self, t: Ty<'tcx>) -> String {
+        let t = match self.shown {
+            Some(a) => ty::EarlyBinder::bind(self.tcx, t).instantiate(self.tcx, a).skip_normalization(),
+            None => t,
+        };
+        self.fe.ty(t)
     }
 
     /// `{ let tmp = v; ⟪tmp :: h⟫ }`: the value `v` stated to have the HOL type `h`.
@@ -421,7 +473,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
                     self.declare(hid, &n, hir::Mutability::Mut)?;
-                    let ht = self.fe.ty(self.node_ty(hid));
+                    let ht = self.hty(self.node_ty(hid));
                     Ok((format!("let mut {} = \\<llangle>undefined :: {}\\<rrangle>;", n, ht), String::new()))
                 } else {
                     unsup("let without initializer and with a non-identifier pattern")
@@ -449,7 +501,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // type when the uses that would are placeholders or external, so it is annotated
                 let lt = self.node_ty(hid);
                 if m.is_mut() && matches!(lt.kind(), ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Vec" | "Option"))) {
-                    let ht = self.fe.ty(lt);
+                    let ht = self.hty(lt);
                     let tv = self.typed("init", v, &ht);
                     return Ok(format!("let mut {} = {};", n, tv.s));
                 }
@@ -594,15 +646,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // a `return`, `break` or `continue` is a statement (its block has the value `()`)
                 Adjust::NeverToAny if matches!(e.kind, ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)) => pv,
                 Adjust::NeverToAny => {
-                    let h = self.fe.ty(target);
+                    let h = self.hty(target);
                     let v = self.to_val(pv);
+                    // a panic has any type; any other expression of type `!` (e.g. a call of a
+                    // function returning `!`, whose HOL result is `unit`) is followed by a panic
+                    let v = if self.is_std_panic(e) {
+                        v
+                    } else {
+                        let u = self.never_as(v, "unit");
+                        Tr::block(format!("{{ {}; panic!(\"unreachable: diverging expression completed\") }}", u.at(11)))
+                    };
                     PV::Val(self.never_as(v, &h))
                 }
                 Adjust::Deref(DerefAdjustKind::Builtin) => self.deref_pv(pv, cur)?,
                 Adjust::Deref(DerefAdjustKind::Overloaded(_)) => {
                     // Box<T> ~ T, Vec<T> ~ [T] ~ list, String ~ str ~ String.literal
-                    let a = self.fe.ty(cur.peel_refs());
-                    let b = self.fe.ty(target.peel_refs());
+                    let a = self.hty(cur.peel_refs());
+                    let b = self.hty(target.peel_refs());
                     if a != b { return unsup(format!("overloaded dereference of `{}`", cur)) }
                     pv
                 }
@@ -698,8 +758,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::Unary(UnOp::Deref, inner) => {
                 if self.typeck.type_dependent_def_id(e.hir_id).is_some() {
-                    let a = self.fe.ty(self.ty_adj(inner).peel_refs());
-                    let b = self.fe.ty(self.ty_of(e));
+                    let a = self.hty(self.ty_adj(inner).peel_refs());
+                    let b = self.hty(self.ty_of(e));
                     if a == b { return self.pv_adjusted(inner) }
                     return unsup("overloaded dereference");
                 }
@@ -1484,7 +1544,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("call of a C-variadic function");
         }
         if self.fe.local_fn_with_body(did) && !self.fe.is_trait_item(did) {
-            return self.local_call(did, gargs, argv);
+            let call = self.local_call(did, gargs, argv)?;
+            return Ok(self.result_stated(did, call, e));
         }
         // trait methods: resolve to the implementation (in an instance, at its concrete types)
         let mut target = did;
@@ -1505,7 +1566,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => return unsup("trait method call in generic code (needs monomorphisation)"),
             };
             if target.is_local() && !self.derived(target) {
-                return self.local_call(target, targs, argv);
+                let call = self.local_call(target, targs, argv)?;
+                return Ok(self.result_stated(target, call, e));
             }
         }
         // functions declared in `extern` blocks: emit a foreign template definition
@@ -1522,37 +1584,75 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
         }
         if let Some(t) = self.std_call(did, target, &argv, arg_exprs, e)? {
-            return Ok(t);
+            return Ok(self.result_stated(target, t, e));
         }
         if target.is_local() && !self.fe.bodiless_intrinsic(target) {
             return unsup(format!("call of `{}`", self.tcx.def_path_str(target)));
         }
         let n = self.fe.ext_fun(target, false);
         let call = self.named_call(&n, argv);
-        // a type variable of the template's result that occurs in no parameter (e.g. of `into`,
-        // `collect`) is not determined by the call: the known type of the result is stated
+        Ok(self.result_stated(target, call, e))
+    }
+
+    /// The call `call` of `target`, with the known type of its result stated when a type variable
+    /// of the result occurs in no parameter (e.g. of `into`, `collect`, or a method of
+    /// `impl<T> Static<Option<T>> for On`): the call does not determine it.
+    fn result_stated(&mut self, target: DefId, call: Tr, e: &hir::Expr<'tcx>) -> Tr {
         let t = self.ty_of(e);
-        if Self::result_undetermined(self.tcx, target) && !t.is_never() {
-            let h = self.fe.ty(t);
-            return Ok(self.typed("res", call, &h));
+        // an `impl Trait` type is not stated: its HOL type may differ from the callee's result type
+        let unstated = has_opaque(t);
+        // `e` is the call itself, not an operator expression resolved to it (e.g. an overloaded
+        // index, whose type is that of the place, not of the reference `index_mut` returns)
+        let is_call = matches!(e.kind, ExprKind::Call(..) | ExprKind::MethodCall(..));
+        if is_call && self.result_undetermined(target) && !t.is_never() && !unstated {
+            let h = self.hty(t);
+            return self.typed("res", call, &h);
         }
-        Ok(call)
+        call
     }
 
     /// Does the result type of the signature of `did` contain a type parameter that occurs in no
     /// parameter type, or a projection (both are type variables of its template)?
-    fn result_undetermined(tcx: TyCtxt<'tcx>, did: DefId) -> bool {
-        let sig = tcx.fn_sig(did).instantiate_identity().skip_binder();
-        let params_of = |t: Ty<'tcx>| -> Vec<Ty<'tcx>> {
-            t.walk()
-                .filter_map(|g| match g.kind() {
-                    ty::GenericArgKind::Type(x) if matches!(x.kind(), ty::Param(_) | ty::Alias(..)) => Some(x),
-                    _ => None,
-                })
-                .collect()
-        };
-        let in_inputs: Vec<Ty<'tcx>> = sig.inputs().iter().flat_map(|t| params_of(*t)).collect();
-        params_of(sig.output()).iter().any(|x| matches!(x.kind(), ty::Alias(..)) || !in_inputs.contains(x))
+    fn result_undetermined(&self, did: DefId) -> bool {
+        let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
+        let mut in_inputs = vec![];
+        for t in sig.inputs() {
+            self.hol_params(*t, &mut in_inputs);
+        }
+        let mut out = vec![];
+        self.hol_params(sig.output(), &mut out);
+        out.iter().any(|x| matches!(x.kind(), ty::Alias(..)) || !in_inputs.contains(x))
+    }
+
+    /// The type parameters and projections in `t` that its HOL type keeps: a standard ADT modelled
+    /// by a HOL type (see `Frontend::ty`) keeps only some of its arguments, e.g. `Vec<T, A>` is
+    /// `T list`, so that the allocator `A` of an argument determines nothing; a raw pointer keeps
+    /// none.
+    fn hol_params(&self, t: Ty<'tcx>, out: &mut Vec<Ty<'tcx>>) {
+        let mut w = t.walk();
+        while let Some(g) = w.next() {
+            let ty::GenericArgKind::Type(x) = g.kind() else { continue };
+            match x.kind() {
+                ty::Param(_) | ty::Alias(..) => {
+                    w.skip_current_subtree();
+                    out.push(x);
+                }
+                // placeholder types without arguments (see `Frontend::ty`)
+                ty::RawPtr(..) | ty::FnPtr(..) | ty::Dynamic(..) => w.skip_current_subtree(),
+                ty::Adt(def, args) => {
+                    let kept = match self.fe.std_adt(def.did()) {
+                        Some("Box" | "Vec" | "Option" | "Range" | "RangeInclusive") => 1,
+                        Some("String" | "Ordering") => 0,
+                        _ => continue,
+                    };
+                    w.skip_current_subtree();
+                    for a in args.types().take(kept) {
+                        self.hol_params(a, out);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Which of the standard library functions with a uRust counterpart `did` is: by its own lang or
@@ -1867,7 +1967,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) => {
                 let n = self.fe.ext_fun(rd, false);
                 let call = self.named_call(&n, vec![Tr::atom(err.clone())]);
-                let h = self.fe.ty(e2);
+                let h = self.hty(e2);
                 self.typed("res", call, &h)
             }
             _ => return unsup("`?` with an unresolved error conversion"),
@@ -1984,7 +2084,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // the iterator is stored in a mutable local, whose storage is chosen by its type;
                 // the type is stated, as the iterator comes from polymorphic external functions
                 let iter_v = self.val(head_call)?;
-                let iter_ty = self.fe.ty(self.ty_of(head_call));
+                let iter_ty = self.hty(self.ty_of(head_call));
                 let tmp = self.fresh("iter");
                 let typed = Tr::atom(format!("\\<llangle>{} :: {}\\<rrangle>", tmp, iter_ty));
                 let init = format!("let {} = {};\n{}", tmp, iter_v.at(20), self.bind_pattern(arm.pat, typed)?);
@@ -2446,7 +2546,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // the closure runs in the monad of the enclosing function: its type is stated, as nothing
         // else fixes it when it is only passed to a polymorphic external function (placeholder
         // types are declared HOL types, so they may occur in it)
-        let h = self.fe.ty(self.ty_of(e));
+        let h = self.hty(self.ty_of(e));
         let tmp = self.fresh("closure");
         copies.push(format!("let {} = {};", tmp, closure.at(20)));
         Ok(Tr::block(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))

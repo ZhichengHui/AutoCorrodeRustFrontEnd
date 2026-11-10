@@ -607,7 +607,8 @@ impl<'tcx> Frontend<'tcx> {
                             a.push("'gv".into());
                         }
                         a.extend(targs.iter().map(|x| self.ty(*x)));
-                        if let Some(ps) = self.adt_projs.get(&did).cloned() {
+                        // a placeholder ADT is declared with the Rust type arguments only
+                        if let Some(ps) = self.adt_projs.get(&did).cloned().filter(|_| !self.opaque_adts.contains_key(&did)) {
                             for p in ps {
                                 let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args).skip_normalization();
                                 a.push(self.ty(at));
