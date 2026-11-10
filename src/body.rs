@@ -2894,7 +2894,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
         let h = self.fe.fun_type(&tys, &ret);
         let tmp = self.fresh("closure");
-        Ok(Tr::block(format!("{{ let {} = {} {{\n{}\n}}; \\<llangle>{} :: {}\\<rrangle> }}", tmp, head, call.s, tmp, h)))
+        Ok(Tr::block(format!("{{ let {} = ({} {{\n{}\n}}); \\<llangle>{} :: {}\\<rrangle> }}", tmp, head, call.s, tmp, h)))
     }
 
     /// The formals and the body of a closure.
