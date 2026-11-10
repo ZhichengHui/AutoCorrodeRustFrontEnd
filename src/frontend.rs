@@ -7,7 +7,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
-use rustc_span::{Span, sym};
+use rustc_span::{Span, Symbol, sym};
 
 use crate::names;
 
@@ -384,9 +384,27 @@ impl<'tcx> Frontend<'tcx> {
             "Range"
         } else if lang(LangItem::RangeInclusiveStruct) {
             "RangeInclusive"
+        } else if diag(Symbol::intern("Formatter")) {
+            "Formatter"
+        } else if Some(did) == self.fmt_error() {
+            "FmtError"
         } else {
             return None;
         })
+    }
+
+    /// `core::fmt::Error`: the error type of the result of `Display::fmt`.
+    pub fn fmt_error(&self) -> Option<DefId> {
+        let tcx = self.tcx;
+        let display = tcx.get_diagnostic_item(sym::Display)?;
+        let fmt = tcx.associated_items(display).in_definition_order().find(|i| i.is_fn())?.def_id;
+        match tcx.fn_sig(fmt).skip_binder().output().skip_binder().kind() {
+            ty::Adt(_, args) => match args.type_at(1).kind() {
+                ty::Adt(e, _) => Some(e.did()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Does a value of type `t` have interior mutability, i.e. does it contain an `UnsafeCell`
@@ -587,6 +605,9 @@ impl<'tcx> Frontend<'tcx> {
                     Some("Vec") => format!("{} list", paren_ty(&self.ty(targs[0]))),
                     Some("String") => "String.literal".into(),
                     Some("Ordering") => "ordering".into(),
+                    // AutoCorrode's model of `core::fmt` (`StdLib_Fmt`)
+                    Some("Formatter") => "fmt_Formatter".into(),
+                    Some("FmtError") => "fmt_Error".into(),
                     Some("Range") | Some("RangeInclusive") => {
                         format!("{} range", paren_ty(&self.ty(targs[0])))
                     }
