@@ -1680,10 +1680,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         else {
             return unsup("string formatting argument without a formatting trait");
         };
+        // the implementations for references and `Box` forward to the referent (a `Box<T>` is
+        // `T` in HOL, see `Frontend::ty`)
         let mut t = self.ty_of(x);
-        while let ty::Ref(_, inner, m) = t.kind() {
-            if m.is_mut() { return unsup("formatting a mutable reference") }
-            t = *inner;
+        loop {
+            match t.kind() {
+                ty::Ref(_, _, m) if m.is_mut() => return unsup("formatting a mutable reference"),
+                ty::Ref(_, inner, _) => t = *inner,
+                ty::Adt(d, a) if d.is_box() => t = a.type_at(0),
+                _ => break,
+            }
         }
         let Some(fmt_fn) = tcx.associated_items(tr).in_definition_order().find(|i| i.is_fn()).map(|i| i.def_id) else {
             return unsup("formatting trait without `fmt`");
