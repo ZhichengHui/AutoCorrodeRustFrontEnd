@@ -157,9 +157,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let shown = match (args, tcx.def_kind(owner)) {
             (None, DefKind::Fn | DefKind::AssocFn) => {
                 let sig = tcx.fn_sig(owner).instantiate_identity().skip_binder();
+                // the signature's types as written and normalised (`Self::IntoIter` may be `I`)
+                let env = ty::TypingEnv::post_analysis(tcx, owner.to_def_id());
                 let in_sig: HashSet<u32> = sig
                     .inputs_and_output
                     .iter()
+                    .flat_map(|t| {
+                        let n = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t);
+                        [t, n]
+                    })
                     .flat_map(|t| t.walk())
                     .filter_map(|g| match g.kind() {
                         ty::GenericArgKind::Type(t) => match t.kind() {
