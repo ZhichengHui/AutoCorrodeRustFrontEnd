@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 
 use crate::frontend::{FnKey, Frontend, Inst};
 use crate::names;

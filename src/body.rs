@@ -13,7 +13,7 @@ use rustc_ast::ast::{Label, LitKind};
 use rustc_hir as hir;
 use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::traits;
@@ -154,7 +154,6 @@ pub struct BodyTr<'a, 'tcx> {
     pub fe: &'a mut Frontend<'tcx>,
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
-    owner: LocalDefId,
     /// What is translated: the generic body itself, an instance, or a default method's copy.
     key: FnKey<'tcx>,
     locals: HashMap<HirId, Local>,
@@ -175,14 +174,12 @@ const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
 impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     pub fn new(fe: &'a mut Frontend<'tcx>, key: FnKey<'tcx>) -> Self {
         let tcx = fe.tcx;
-        let owner = key.0.expect_local();
-        let typeck = tcx.typeck(owner);
+        let typeck = tcx.typeck(key.0.expect_local());
         let fe_dicts = fe.dict_params(key);
         BodyTr {
             fe,
             tcx,
             typeck,
-            owner,
             key,
             locals: HashMap::new(),
             match_place: None,
@@ -1833,7 +1830,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a));
         }
         let i = self.fe.gen_calls.len();
-        self.fe.gen_calls.push(GenCall { caller: self.key, callee: key, kargs, dicts, args: Some(a) });
+        self.fe.gen_calls.push(GenCall { callee: key, kargs, dicts, args: Some(a) });
         Ok(Tr::new(format!("\u{1}F{}\u{2}", i), 999))
     }
 
@@ -1997,7 +1994,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let dicts = self.callee_dicts(key, kargs)?;
         self.calls.insert(key);
         let i = self.fe.gen_calls.len();
-        self.fe.gen_calls.push(GenCall { caller: self.key, callee: key, kargs, dicts, args: None });
+        self.fe.gen_calls.push(GenCall { callee: key, kargs, dicts, args: None });
         Ok(format!("\u{1}V{}\u{2}", i))
     }
 

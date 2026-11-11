@@ -49,8 +49,6 @@ impl<'tcx> DefSet<'tcx> {
 /// body. Its text is a marker (`\u{1}F<n>\u{2}`, `\u{1}V<n>\u{2}`) completed at emission, when
 /// the allocation record the callee takes, if any, is known (see `translate::alloc_sets`).
 pub struct GenCall<'tcx> {
-    /// the translation whose body has the call
-    pub caller: FnKey<'tcx>,
     pub callee: FnKey<'tcx>,
     /// the generic arguments of the item the callee's dictionary parameters are the bounds of
     pub kargs: GenericArgsRef<'tcx>,
@@ -271,16 +269,6 @@ impl<'tcx> Frontend<'tcx> {
         self.marker_ids.push(key);
         self.marker_index.insert(key, i);
         i
-    }
-
-    /// `x` (from the type-checking results of a generic body) at the concrete generic arguments
-    /// `args`, with projections normalised.
-    pub fn mono<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, args: GenericArgsRef<'tcx>, x: T) -> T {
-        let x = ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args);
-        match self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), x) {
-            Ok(n) => n,
-            Err(_) => x.skip_normalization(),
-        }
     }
 
     /// The function to call for the local item `did` at the generic arguments `args`: an instance
