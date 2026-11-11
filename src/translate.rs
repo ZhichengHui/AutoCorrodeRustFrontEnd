@@ -440,8 +440,10 @@ fn proj_tvars<'tcx>(fe: &Frontend<'tcx>, did: DefId, sig_tys: &[Ty<'tcx>]) -> Op
 /// Translate the function or constant `key` and record its definition.
 fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) {
     let fd = translate_fn(fe, key);
-    // the projections' type variables (see `proj_tvars`) are those of one definition
+    // the projections' type variables (see `proj_tvars`) and the function types of `Fn`-bounded
+    // parameters are those of one definition
     fe.proj_tvars = None;
+    fe.fn_params.clear();
     fe.fun_defs.push(fd);
 }
 
@@ -453,6 +455,11 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let name = fe.fn_name(key);
     // the dictionary parameters come first (see `crate::dict`)
     let dicts = if is_fn { fe.dict_params(key) } else { vec![] };
+    match key.1 {
+        Inst::Generic if is_fn => fe.fn_params = fe.fn_param_types(did),
+        Inst::ImplCopy(imp) => fe.fn_params = fe.fn_param_types(imp),
+        _ => {}
+    }
     let rust_path = match key.1 {
         Inst::Generic => tcx.def_path_str(did),
         Inst::Mono(args) => tcx.def_path_str_with_args(did, args),

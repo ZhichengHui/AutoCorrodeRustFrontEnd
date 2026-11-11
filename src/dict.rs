@@ -192,6 +192,41 @@ impl<'tcx> Frontend<'tcx> {
             .collect()
     }
 
+    /// The HOL function types of the type parameters of the generic item `owner` bounded by an
+    /// `Fn` trait (by index): a value of such a parameter is a function value (as a closure is),
+    /// of the type its bound states (`F: Fn(u32) -> bool` is `32 word ⇒ (.., bool, ..) function_body`).
+    pub fn fn_param_types(&mut self, owner: DefId) -> HashMap<u32, String> {
+        let tcx = self.tcx;
+        let ident = ty::GenericArgs::identity_for_item(tcx, owner);
+        let clauses: Vec<ty::Clause<'tcx>> =
+            tcx.clauses_of(owner).instantiate(tcx, ident).clauses.into_iter().map(|c| c.skip_normalization()).collect();
+        let output = tcx.lang_items().fn_once_output();
+        let mut out = HashMap::new();
+        for c in &clauses {
+            let Some(p) = c.as_trait_clause() else { continue };
+            let p = tcx.instantiate_bound_regions_with_erased(p);
+            if !self.is_fn_trait(p.def_id()) {
+                continue;
+            }
+            let ty::Param(param) = *p.self_ty().kind() else { continue };
+            let ty::Tuple(ins) = *p.trait_ref.args.type_at(1).kind() else { continue };
+            if out.contains_key(&param.index) {
+                continue;
+            }
+            let ret = clauses
+                .iter()
+                .filter_map(|c| c.as_projection_clause())
+                .map(|q| tcx.instantiate_bound_regions_with_erased(q))
+                .find(|q| Some(q.projection_term.expect_projection_def_id().into()) == output && q.self_ty() == p.self_ty())
+                .and_then(|q| q.term.as_type());
+            let Some(ret) = ret else { continue };
+            let ps: Vec<String> = ins.iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(t))).collect();
+            let r = self.ty(tcx.erase_and_anonymize_regions(ret));
+            out.insert(param.index, self.fun_type(&ps, &r));
+        }
+        out
+    }
+
     /// The datatypes of the dictionaries used, each after those of its supertraits.
     pub fn dict_decls(&mut self) -> String {
         let tcx = self.tcx;

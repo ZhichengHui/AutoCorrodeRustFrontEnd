@@ -1447,7 +1447,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let mut t = self.ty_of(callee);
                 // a closure, or a function item (whose value is the closure calling it, see
                 // `fn_item_value`), e.g. in an instance at the closure's or function's type
-                if !matches!(t.peel_refs().kind(), ty::Closure(..) | ty::FnDef(..)) {
+                // or a type parameter bounded by an `Fn` trait (see `Frontend::fn_param_types`)
+                let fn_value = match *t.peel_refs().kind() {
+                    ty::Closure(..) | ty::FnDef(..) => true,
+                    ty::Param(p) => self.fe.fn_params.contains_key(&p.index),
+                    _ => false,
+                };
+                if !fn_value {
                     return unsup("call through a generic `Fn` parameter (trait call in generic code)");
                 }
                 // the closure value is read out of the local's cell and through the references

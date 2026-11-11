@@ -144,6 +144,9 @@ pub struct Frontend<'tcx> {
     pub adt_projs: HashMap<DefId, Vec<Ty<'tcx>>>,
     /// While a datatype is declared: its projections' type variables (see `adt_projs`).
     pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
+    /// While a generic item is translated: the function types of its type parameters bounded by
+    /// `Fn` traits (see `fn_param_types`).
+    pub fn_params: HashMap<u32, String>,
 }
 
 /// The type of field `f` of an ADT at its type arguments `args`, without regions and normalised in
@@ -207,6 +210,7 @@ impl<'tcx> Frontend<'tcx> {
             alias_tvars: None,
             adt_projs: HashMap::new(),
             proj_tvars: None,
+            fn_params: HashMap::new(),
         }
     }
 
@@ -681,7 +685,10 @@ impl<'tcx> Frontend<'tcx> {
                 }
             }
             ty::Never => "unit".into(),
-            ty::Param(p) => names::tvar_name(p.name.as_str()),
+            ty::Param(p) => match self.fn_params.get(&p.index) {
+                Some(f) => f.clone(),
+                None => names::tvar_name(p.name.as_str()),
+            },
             ty::Adt(def, args) => {
                 let did = def.did();
                 let targs: Vec<Ty<'tcx>> = args.types().collect();
