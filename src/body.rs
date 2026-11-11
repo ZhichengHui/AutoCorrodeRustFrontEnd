@@ -1126,20 +1126,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if names::hol_string_ok(s) {
                     return Ok(Tr::atom(format!("\\<llangle>STR ''{}''\\<rrangle>", s)));
                 }
-                if !s.is_ascii() { return unsup("string literal with non-ASCII characters") }
                 // other ASCII characters cannot be written in `''…''`: the concatenation of the
                 // printable runs and of the other characters, each as a one-character string
-                let mut pieces = vec![];
-                let mut run = String::new();
-                for c in s.chars() {
-                    if names::hol_string_ok(&c.to_string()) {
-                        run.push(c);
-                    } else {
-                        if !run.is_empty() { pieces.push(format!("STR ''{}''", std::mem::take(&mut run))) }
-                        pieces.push(format!("String.implode [{}]", hol_char(c)?));
-                    }
-                }
-                if !run.is_empty() { pieces.push(format!("STR ''{}''", run)) }
+                let pieces: Vec<String> = hol_str_pieces(s)?
+                    .into_iter()
+                    .map(|p| match p {
+                        StrPiece::Str(r) => format!("STR ''{}''", r),
+                        StrPiece::Char(c) => format!("String.implode [{}]", c),
+                    })
+                    .collect();
                 Ok(Tr::atom(format!("\\<llangle>({})\\<rrangle>", pieces.join(" + "))))
             }
             LitKind::Float(..) => unsup("floating-point literal"),
@@ -1471,31 +1466,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// Calls of standard library functions recognised before their (`format_args!`) arguments
-    /// are translated: a function that never returns is a panic, the only diverging construct
-    /// of uRust; a function taking `fmt::Arguments` and returning `()` only produces output,
-    /// which is not modelled, so the call is dropped; any other function involving
-    /// `fmt::Arguments` formats a string.
     // ------------------------------------------------------------------
     // Formatting (`format!`, `write!`): AutoCorrode's `StdLib_Fmt`
     // ------------------------------------------------------------------
 
-    /// The formatting trait `t` (`Display`, `Debug`, `LowerHex`, `UpperHex`, `Octal`, `Binary`)
-    /// whose `fmt` has a model for primitive types.
-    fn fmt_trait(&self, t: DefId) -> Option<&'static str> {
-        let tcx = self.tcx;
-        if tcx.is_diagnostic_item(sym::Display, t) { return Some("Display") }
-        if tcx.is_diagnostic_item(sym::Debug, t) { return Some("Debug") }
-        // the other formatting traits have no diagnostic item; they are the traits of `core::fmt`
-        // that have the same `fmt` signature as `Display`
-        if !self.fe.is_std(t) || tcx.parent(t) != tcx.parent(tcx.get_diagnostic_item(sym::Display)?) { return None }
-        match tcx.item_name(t).as_str() {
-            "LowerHex" => Some("LowerHex"),
-            "UpperHex" => Some("UpperHex"),
-            "Octal" => Some("Octal"),
-            "Binary" => Some("Binary"),
-            _ => None,
-        }
+    /// The formatting trait `t`, by its name, if it is one (see `Frontend::fmt_traits`).
+    fn fmt_trait(&self, t: DefId) -> Option<&str> {
+        self.fe.fmt_traits.iter().find(|(d, _)| *d == t).map(|(_, n)| n.as_str())
     }
 
     fn is_formatter(&self, t: Ty<'tcx>) -> bool {
@@ -1514,7 +1491,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             _ => return None,
         };
         let integer = matches!(kind, "word" | "sword");
-        (matches!(tr, "Display" | "Debug") || integer).then(|| format!("fmt_{}_{}", tr, kind))
+        let modelled = match tr {
+            "Display" | "Debug" => true,
+            "LowerHex" | "UpperHex" | "Octal" | "Binary" => integer,
+            _ => false,
+        };
+        modelled.then(|| format!("fmt_{}_{}", tr, kind))
     }
 
     fn is_fmt_arguments(&self, t: Ty<'tcx>) -> bool {
@@ -1539,7 +1521,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 "{{ let mut {f} = fmt_formatter_new({FMT_DEFAULT_FLAGS}_u32, 0_u16, 0_u16);\nlet {r} = {w};\nmatch {r} {{\n  Ok(_) \\<Rightarrow> fmt_formatter_buf(* {f}),\n  Err(_) \\<Rightarrow> panic!(\"a formatting trait implementation returned an error when the underlying stream did not\")\n}}\n}}"
             ))));
         }
-        if pos == 1 && args.len() == 2 && self.is_formatter(self.ty_adj(args[0])) && self.is_formatter(self.ty_of(args[0])) {
+        if pos == 1 && args.len() == 2 && self.is_formatter(self.ty_of(args[0])) {
             let recv = self.val(args[0])?;
             let fa = self.fmt_args(args[1])?;
             let f = self.fresh("fmt");
@@ -1608,9 +1590,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// Write the expansion `fa` into the formatter (reference) `f`, like `fmt::write`: the
     /// literal pieces as they are, each placeholder by formatting its argument into a new
-    /// formatter with the placeholder's options and writing out that formatter's output. An
-    /// expression of type `fmt::Result`.
+    /// formatter with the placeholder's options and writing out that formatter's output. Every
+    /// write's error ends the output and is the result, as `?` in `fmt::write`. An expression
+    /// of type `fmt::Result`.
     fn fmt_write(&mut self, f: &str, fa: &FmtArgs<'tcx>) -> R<String> {
+        let tcx = self.tcx;
+        let bad = || Unsup("string formatting template".into());
         let mut pre = vec![];
         let mut names = vec![];
         for v in &fa.vals {
@@ -1619,85 +1604,88 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             pre.push(format!("let {} = {};", n, tv.at(20)));
             names.push(n);
         }
-        // the parts in order, then nested (an error ends the output)
-        let mut steps: Vec<(Vec<String>, Option<String>)> = vec![(vec![], None)];
+        // `rt::Argument::from_usize` (a dynamic width or precision, the constructor without a
+        // trait bound) panics when the value does not fit in `u16`, when the arguments are built
+        for &(ctor, t) in &fa.args {
+            if self.fmt_arg_trait(ctor).is_none() {
+                pre.push(format!("if {} > 65535_usize {{ panic!(\"Formatting argument out of range\") }};", names[t]));
+            }
+        }
+        // the writes in order: statements, and fallible calls (an error is the result)
+        enum Step {
+            Stmt(String),
+            Call(String),
+        }
+        let mut steps = vec![];
         let mut next = 0usize;
         for part in &fa.parts {
             match part {
                 FmtPart::Lit(s) => {
-                    let w = &mut steps.last_mut().expect("a step").0;
-                    let mut run = String::new();
-                    for c in s.chars() {
-                        if names::hol_string_ok(&c.to_string()) {
-                            run.push(c);
-                        } else {
-                            if !run.is_empty() {
-                                w.push(format!("let _ = fmt_write_str({}, \\<llangle>STR ''{}''\\<rrangle>);", f, run));
-                                run.clear();
-                            }
-                            w.push(format!("let _ = fmt_write_char({}, \\<llangle>{}\\<rrangle>);", f, hol_char(c)?));
-                        }
-                    }
-                    if !run.is_empty() {
-                        w.push(format!("let _ = fmt_write_str({}, \\<llangle>STR ''{}''\\<rrangle>);", f, run));
+                    for piece in hol_str_pieces(s)? {
+                        steps.push(Step::Call(match piece {
+                            StrPiece::Str(r) => format!("fmt_write_str({}, \\<llangle>STR ''{}''\\<rrangle>)", f, r),
+                            StrPiece::Char(c) => format!("fmt_write_char({}, \\<llangle>{}\\<rrangle>)", f, c),
+                        }));
                     }
                 }
                 FmtPart::Ph { flags, width, precision, width_arg, precision_arg, arg } => {
                     let i = arg.unwrap_or(next);
                     next = i + 1;
-                    let value_of = |j: usize| -> R<String> {
-                        let (_, t) = *fa.args.get(j).ok_or_else(|| Unsup("string formatting template".into()))?;
-                        Ok(names[t].clone())
+                    let count = |j: &Option<usize>, fixed: u16| -> R<String> {
+                        Ok(match j {
+                            Some(j) => format!("({}) as u16", names[fa.args.get(*j).ok_or_else(bad)?.1]),
+                            None => format!("{}_u16", fixed),
+                        })
                     };
-                    let w = match width_arg { Some(j) => format!("({}) as u16", value_of(*j)?), None => format!("{}_u16", width) };
-                    let p = match precision_arg { Some(j) => format!("({}) as u16", value_of(*j)?), None => format!("{}_u16", precision) };
-                    let (ctor, t) = *fa.args.get(i).ok_or_else(|| Unsup("string formatting template".into()))?;
+                    let (w, p) = (count(width_arg, *width)?, count(precision_arg, *precision)?);
+                    let (ctor, t) = *fa.args.get(i).ok_or_else(bad)?;
+                    // `rt::Argument::new_debug_noop` formats nothing
+                    if tcx.item_name(ctor).as_str() == "new_debug_noop" {
+                        continue;
+                    }
                     let sub = self.fresh("fmt_arg");
                     self.fe.need_alloc("fmt_Formatter");
                     let call = self.fmt_arg_call(ctor, fa.vals[t], &names[t], &sub)?;
-                    let st = &mut steps.last_mut().expect("a step").0;
-                    st.push(format!("let mut {} = fmt_formatter_new({}_u32, {}, {});", sub, flags, w, p));
-                    steps.last_mut().expect("a step").1 = Some(call);
-                    steps.push((vec![format!("let _ = fmt_write_str({}, fmt_formatter_buf(* {}));", f, sub)], None));
+                    steps.push(Step::Stmt(format!("let mut {} = fmt_formatter_new({}_u32, {}, {});", sub, flags, w, p)));
+                    steps.push(Step::Call(call));
+                    steps.push(Step::Call(format!("fmt_write_str({}, fmt_formatter_buf(* {}))", f, sub)));
                 }
             }
         }
         let e = self.fresh("fmt_e");
         let mut acc = "Ok(())".to_string();
-        for (stmts, call) in steps.into_iter().rev() {
-            let body = match call {
-                None => acc,
-                Some(c) => format!("match {} {{\n  Err({}) \\<Rightarrow> Err({}),\n  Ok(_) \\<Rightarrow> {{\n{}\n}}\n}}", c, e, e, acc),
+        for step in steps.into_iter().rev() {
+            acc = match step {
+                Step::Stmt(st) => format!("{}\n{}", st, acc),
+                Step::Call(c) => format!("match {} {{\n  Err({}) \\<Rightarrow> Err({}),\n  Ok(_) \\<Rightarrow> {{\n{}\n}}\n}}", c, e, e, acc),
             };
-            acc = with_prologue(&stmts, &body);
         }
         Ok(format!("{{\n{}\n}}", with_prologue(&pre, &acc)))
     }
 
+    /// The formatting trait bounding the `rt::Argument` constructor `ctor` (`None` for
+    /// `from_usize`, a count).
+    fn fmt_arg_trait(&self, ctor: DefId) -> Option<DefId> {
+        self.tcx.param_env(ctor).caller_bounds().filter_map(|c| c.as_trait_clause().map(|t| t.def_id())).find(|t| self.fmt_trait(*t).is_some())
+    }
+
     /// The call formatting the argument `x` (its value is the local `v`) into the formatter
     /// (reference) `sub`, with the trait that bounds the `rt::Argument` constructor `ctor`: the
-    /// trait's `fmt` resolved at the argument's type (an implementation for a reference forwards
-    /// to the referent).
+    /// trait's `fmt` resolved at the argument's type. The implementations of the formatting
+    /// traits for references and `Box` forward to the referent (a `Box<T>` is `T` in HOL, see
+    /// `Frontend::ty`), except `Pointer`'s, which print the address.
     fn fmt_arg_call(&mut self, ctor: DefId, x: &'tcx hir::Expr<'tcx>, v: &str, sub: &str) -> R<String> {
         let tcx = self.tcx;
-        // the bound of the constructor's type parameter that has a method (not `Sized`)
-        let Some(tr) = tcx
-            .param_env(ctor)
-            .caller_bounds()
-            .filter_map(|c| c.as_trait_clause().map(|t| t.def_id()))
-            .find(|t| tcx.associated_items(*t).in_definition_order().any(|i| i.is_fn()))
-        else {
-            return unsup("string formatting argument without a formatting trait");
-        };
-        // the implementations for references and `Box` forward to the referent (a `Box<T>` is
-        // `T` in HOL, see `Frontend::ty`)
+        let Some(tr) = self.fmt_arg_trait(ctor) else { return unsup("string formatting argument without a formatting trait") };
         let mut t = self.ty_of(x);
-        loop {
-            match t.kind() {
-                ty::Ref(_, _, m) if m.is_mut() => return unsup("formatting a mutable reference"),
-                ty::Ref(_, inner, _) => t = *inner,
-                ty::Adt(d, a) if d.is_box() => t = a.type_at(0),
-                _ => break,
+        if !tcx.is_diagnostic_item(sym::Pointer, tr) {
+            loop {
+                match t.kind() {
+                    ty::Ref(_, _, m) if m.is_mut() => return unsup("formatting a mutable reference"),
+                    ty::Ref(_, inner, _) => t = *inner,
+                    ty::Adt(d, a) if d.is_box() => t = a.type_at(0),
+                    _ => break,
+                }
             }
         }
         let Some(fmt_fn) = tcx.associated_items(tr).in_definition_order().find(|i| i.is_fn()).map(|i| i.def_id) else {
@@ -1716,6 +1704,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         unsup(format!("formatting a value of type `{}`", t))
     }
 
+    /// Calls of standard library functions recognised before their (`format_args!`) arguments
+    /// are translated: a function that never returns is a panic, the only diverging construct
+    /// of uRust; a function taking `fmt::Arguments` and returning `()` only produces output,
+    /// which is not modelled, so the call is dropped; any other function involving
+    /// `fmt::Arguments` formats a string.
     fn panic_or_print(&mut self, did: DefId, args: &'tcx [hir::Expr<'tcx>], sp: Span) -> R<Option<Tr>> {
         let tcx = self.tcx;
         if !self.fe.is_std(did) {
@@ -1948,8 +1941,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let owner = match tcx.def_kind(parent) {
             // `Into::into`, `AsRef::as_ref`, `Borrow::borrow` are their traits' only methods
             DefKind::Trait => {
-                if let Some(t) = self.fmt_trait(parent) {
-                    return Some(StdFn::FmtTrait(t));
+                if self.fmt_trait(parent).is_some() {
+                    return Some(StdFn::FmtTrait(parent));
                 }
                 // `fmt::Write::write_str`, `write_char` (on a `Formatter`, see `std_call`)
                 if tcx.is_diagnostic_item(Symbol::intern("FmtWrite"), parent) {
@@ -2079,7 +2072,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             // a method of `Formatter` (or of `fmt::Write` on a `Formatter`)
             FmtMethod(n) if self.is_formatter(self.ty_adj(arg_exprs[0])) => Some(self.named_call(n, argv.to_vec())),
             // a formatting trait's `fmt` on a primitive type
-            FmtTrait(t) => self.fmt_model(t, self.ty_adj(arg_exprs[0]).peel_refs()).map(|n| self.named_call(&n, vec![a(0), a(1)])),
+            FmtTrait(tr) => {
+                let label = self.fmt_trait(tr).map(str::to_string);
+                label.and_then(|l| self.fmt_model(&l, self.ty_adj(arg_exprs[0]).peel_refs())).map(|n| self.named_call(&n, vec![a(0), a(1)]))
+            }
             _ => None,
         };
         Ok(r)
@@ -2887,21 +2883,31 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // passed for a type parameter of a local function: the generic function calls it only
         // through its `Fn` bound (a placeholder), while the call would put the two functions in
         // one recursion group, where that type parameter is fixed
-        if let hir::Node::Expr(p) = tcx.parent_hir_node(e.hir_id) {
+        // (through `&` and temporaries; a function item passed through a local variable is not
+        // seen here)
+        let mut arg = e;
+        let mut parent = tcx.parent_hir_node(e.hir_id);
+        while let hir::Node::Expr(p) = parent
+            && matches!(p.kind, ExprKind::AddrOf(..) | ExprKind::DropTemps(_))
+        {
+            arg = p;
+            parent = tcx.parent_hir_node(p.hir_id);
+        }
+        if let hir::Node::Expr(p) = parent {
             let (callee, pos) = match p.kind {
                 ExprKind::Call(c, args) => (
                     match *self.ty_of(c).kind() { ty::FnDef(d, _) => Some(d), _ => None },
-                    args.iter().position(|a| a.hir_id == e.hir_id),
+                    args.iter().position(|a| a.hir_id == arg.hir_id),
                 ),
                 ExprKind::MethodCall(_, _, args, _) => (
                     self.typeck.type_dependent_def_id(p.hir_id),
-                    args.iter().position(|a| a.hir_id == e.hir_id).map(|i| i + 1),
+                    args.iter().position(|a| a.hir_id == arg.hir_id).map(|i| i + 1),
                 ),
                 _ => (None, None),
             };
             if let (Some(d), Some(i)) = (callee, pos)
                 && d.is_local()
-                && matches!(tcx.fn_sig(d).instantiate_identity().skip_binder().inputs().get(i).map(|t| t.kind()), Some(ty::Param(_)))
+                && matches!(tcx.fn_sig(d).instantiate_identity().skip_binder().inputs().get(i).map(|t| t.peel_refs().kind()), Some(ty::Param(_)))
             {
                 return unsup("function item passed for a type parameter of a local function");
             }
@@ -3121,7 +3127,7 @@ enum StdFn {
     /// a method of `fmt::Formatter`, by the name of its model
     FmtMethod(&'static str),
     /// the `fmt` method of a formatting trait (`Display`, `Debug`, `LowerHex`, ...)
-    FmtTrait(&'static str),
+    FmtTrait(DefId),
 }
 
 /// A lang item, or a diagnostic item by its name in the table of the standard library.
@@ -3188,6 +3194,30 @@ fn contains_let(e: &hir::Expr<'_>) -> bool {
         ExprKind::DropTemps(x) => contains_let(x),
         _ => false,
     }
+}
+
+/// A part of an ASCII string as HOL text: a run of characters printable in `STR ''…''`, or a
+/// single other character (`CHR …`).
+enum StrPiece {
+    Str(String),
+    Char(String),
+}
+
+/// The ASCII string `s` as runs printable in `STR ''…''` and other characters.
+fn hol_str_pieces(s: &str) -> R<Vec<StrPiece>> {
+    if !s.is_ascii() { return unsup("string literal with non-ASCII characters") }
+    let mut out = vec![];
+    let mut run = String::new();
+    for c in s.chars() {
+        if names::hol_string_ok(&c.to_string()) {
+            run.push(c);
+        } else {
+            if !run.is_empty() { out.push(StrPiece::Str(std::mem::take(&mut run))) }
+            out.push(StrPiece::Char(hol_char(c)?));
+        }
+    }
+    if !run.is_empty() { out.push(StrPiece::Str(run)) }
+    Ok(out)
 }
 
 fn hol_char(c: char) -> R<String> {

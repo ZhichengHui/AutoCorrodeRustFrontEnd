@@ -81,6 +81,11 @@ pub struct Frontend<'tcx> {
     /// the function items whose types `ty` is translating (a function item's signature may
     /// contain its own type, through an `impl Trait` result)
     fn_items: Vec<DefId>,
+    /// `core::fmt::Error` (see `fmt_error_of`)
+    fmt_error: Option<DefId>,
+    /// the formatting traits: the bounds of the `fmt::rt::Argument` constructors (`Display`,
+    /// `Debug`, `LowerHex`, ..., `Pointer`), with their names
+    pub fmt_traits: Vec<(DefId, String)>,
     /// the `impl Trait` types whose hidden types `ty` is translating
     opaques: Vec<DefId>,
     pub placeholders: Vec<String>,
@@ -158,6 +163,8 @@ impl<'tcx> Frontend<'tcx> {
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
             fn_items: Vec::new(),
+            fmt_error: fmt_error_of(tcx),
+            fmt_traits: fmt_traits_of(tcx),
             opaques: Vec::new(),
             placeholders: Vec::new(),
             placeholder_type_uses: 0,
@@ -396,7 +403,7 @@ impl<'tcx> Frontend<'tcx> {
             "RangeInclusive"
         } else if diag(Symbol::intern("Formatter")) {
             "Formatter"
-        } else if Some(did) == self.fmt_error() {
+        } else if Some(did) == self.fmt_error {
             "FmtError"
         } else {
             return None;
@@ -404,18 +411,6 @@ impl<'tcx> Frontend<'tcx> {
     }
 
     /// `core::fmt::Error`: the error type of the result of `Display::fmt`.
-    pub fn fmt_error(&self) -> Option<DefId> {
-        let tcx = self.tcx;
-        let display = tcx.get_diagnostic_item(sym::Display)?;
-        let fmt = tcx.associated_items(display).in_definition_order().find(|i| i.is_fn())?.def_id;
-        match tcx.fn_sig(fmt).skip_binder().output().skip_binder().kind() {
-            ty::Adt(_, args) => match args.type_at(1).kind() {
-                ty::Adt(e, _) => Some(e.did()),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
 
     /// Does a value of type `t` have interior mutability, i.e. does it contain an `UnsafeCell`
     /// that is not behind a pointer? Fields are followed with the actual type arguments; type
@@ -822,4 +817,37 @@ fn unique(base: String, taken: impl Fn(&str) -> bool) -> String {
 pub fn one_line(s: &str) -> String {
     let s: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.len() > 120 { format!("{}...", &s[..s.char_indices().nth(117).map(|x| x.0).unwrap_or(s.len())]) } else { s }
+}
+
+/// `core::fmt::Error`: the error type of the result of `Display::fmt`.
+fn fmt_error_of(tcx: TyCtxt<'_>) -> Option<DefId> {
+    let display = tcx.get_diagnostic_item(sym::Display)?;
+    let fmt = tcx.associated_items(display).in_definition_order().find(|i| i.is_fn())?.def_id;
+    match tcx.fn_sig(fmt).skip_binder().output().skip_binder().kind() {
+        ty::Adt(_, args) => match args.type_at(1).kind() {
+            ty::Adt(e, _) => Some(e.did()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The traits bounding the type parameters of the constructors of `fmt::rt::Argument` (the lang
+/// item `format_argument`), named by their item names: the formatting traits of `format_args!`.
+fn fmt_traits_of(tcx: TyCtxt<'_>) -> Vec<(DefId, String)> {
+    let Some(arg) = tcx.lang_items().get(LangItem::FormatArgument) else { return vec![] };
+    let mut out: Vec<(DefId, String)> = vec![];
+    for &imp in tcx.inherent_impls(arg) {
+        for item in tcx.associated_items(imp).in_definition_order().filter(|i| i.is_fn()) {
+            for c in tcx.param_env(item.def_id).caller_bounds() {
+                if let Some(t) = c.as_trait_clause().map(|t| t.def_id())
+                    && tcx.associated_items(t).in_definition_order().any(|i| i.is_fn())
+                    && !out.iter().any(|(d, _)| *d == t)
+                {
+                    out.push((t, tcx.item_name(t).to_string()));
+                }
+            }
+        }
+    }
+    out
 }
