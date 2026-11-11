@@ -834,6 +834,10 @@ fn emit_ext_funs(funs: &std::collections::BTreeMap<String, ExtFun>, what: &str) 
     out
 }
 
+/// Generated definitions may have type variables in their bodies only (e.g. the element type of an
+/// empty list that is only measured): `StdLib_Frontend_Models` instantiates them with `unit`.
+const GROUND: &str = "declare [[urust_ground_body_types]]\n\n";
+
 fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_text: String) {
     let c = &opts.name;
     let dir = Path::new(&opts.out_dir);
@@ -844,6 +848,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     // external / placeholder types
     let mut te = header(&format!("{}_TypesExternal_Template", c));
     te.push_str("  imports \"Micro_Rust_Std_Lib.Micro_Rust_Std_Lib\"\nbegin\n\n");
+    te.push_str(GROUND);
     te.push_str("text \\<open>Types without a uRust model. Replace these declarations by models.\\<close>\n\n");
     for (n, t) in &fe.ext_types {
         if !t.ctors.is_empty() {
@@ -863,6 +868,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
 
     let mut ty = header(&format!("{}_Types", c));
     writeln!(ty, "  imports {}_TypesExternal_Template\nbegin\n", c).unwrap();
+    ty.push_str(GROUND);
     ty.push_str(&types_text);
     ty.push_str("end\n");
 
@@ -895,7 +901,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     let mut fx = header(&format!("{}_FunsExternal_Template", c));
     writeln!(
         fx,
-        "  imports {}_Locale\nbegin\n\ntext \\<open>Functions without a definition in this crate. Replace the bodies by uRust models.\\<close>\n\ncontext {}\nbegin\n",
+        "  imports {}_Locale\nbegin\n\n{GROUND}text \\<open>Functions without a definition in this crate. Replace the bodies by uRust models.\\<close>\n\ncontext {}\nbegin\n",
         c, ctx
     )
     .unwrap();
@@ -905,7 +911,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     let mut ff = header(&format!("{}_FunsForeign_Template", c));
     writeln!(
         ff,
-        "  imports {}_Locale\nbegin\n\ntext \\<open>Functions declared in \\<^verbatim>\\<open>extern\\<close> blocks. They cannot be replaced by uRust models; their contracts must also state memory effects.\\<close>\n\ncontext {}\nbegin\n",
+        "  imports {}_Locale\nbegin\n\n{GROUND}text \\<open>Functions declared in \\<^verbatim>\\<open>extern\\<close> blocks. They cannot be replaced by uRust models; their contracts must also state memory effects.\\<close>\n\ncontext {}\nbegin\n",
         c, ctx
     )
     .unwrap();
@@ -913,7 +919,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     ff.push_str("end\n\nend\n");
 
     let mut fu = header(&format!("{}_Funs", c));
-    writeln!(fu, "  imports {}_FunsExternal_Template {}_FunsForeign_Template\nbegin\n\ncontext {}\nbegin\n", c, c, ctx).unwrap();
+    writeln!(fu, "  imports {}_FunsExternal_Template {}_FunsForeign_Template\nbegin\n\n{GROUND}context {}\nbegin\n", c, c, ctx).unwrap();
     for ic in &fe.item_comments {
         writeln!(fu, "(* {} *)", cmt(ic)).unwrap();
     }

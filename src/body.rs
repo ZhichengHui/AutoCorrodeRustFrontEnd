@@ -139,9 +139,6 @@ pub struct BodyTr<'a, 'tcx> {
     owner: LocalDefId,
     /// The generic arguments of the instance being translated (`None`: the generic body itself).
     args: Option<GenericArgsRef<'tcx>>,
-    /// For a generic body: its own generic parameters, with each type parameter that occurs in no
-    /// parameter or result type replaced by `()`.
-    shown: Option<GenericArgsRef<'tcx>>,
     locals: HashMap<HirId, Local>,
     fresh: usize,
     pub calls: crate::frontend::DefSet<'tcx>,
@@ -154,41 +151,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     pub fn new(fe: &'a mut Frontend<'tcx>, owner: LocalDefId, args: Option<GenericArgsRef<'tcx>>) -> Self {
         let tcx = fe.tcx;
         let typeck = tcx.typeck(owner);
-        let shown = match (args, tcx.def_kind(owner)) {
-            (None, DefKind::Fn | DefKind::AssocFn) => {
-                let sig = tcx.fn_sig(owner).instantiate_identity().skip_binder();
-                // the signature's types as written and normalised (`Self::IntoIter` may be `I`)
-                let env = ty::TypingEnv::post_analysis(tcx, owner.to_def_id());
-                let in_sig: HashSet<u32> = sig
-                    .inputs_and_output
-                    .iter()
-                    .flat_map(|t| {
-                        let n = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t);
-                        [t, n]
-                    })
-                    .flat_map(|t| t.walk())
-                    .filter_map(|g| match g.kind() {
-                        ty::GenericArgKind::Type(t) => match t.kind() {
-                            ty::Param(p) => Some(p.index),
-                            _ => None,
-                        },
-                        _ => None,
-                    })
-                    .collect();
-                Some(ty::GenericArgs::for_item(tcx, owner.to_def_id(), |param, _| match param.kind {
-                    ty::GenericParamDefKind::Type { .. } if !in_sig.contains(&param.index) => tcx.types.unit.into(),
-                    _ => tcx.mk_param_from_def(param),
-                }))
-            }
-            _ => None,
-        };
         BodyTr {
             fe,
             tcx,
             typeck,
             owner,
             args,
-            shown,
             locals: HashMap::new(),
             fresh: 0,
             calls: crate::frontend::DefSet::default(),
@@ -236,10 +204,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         ))
     }
 
-    /// The HOL type of the body's type `t`. A type parameter of a generic body that occurs in no
-    /// parameter or result type (e.g. one given only by turbofish) would be a type variable of the
-    /// definition's body alone, which Isabelle turns into an extra `itself` parameter of the
-    /// constant, so that no call of it type-checks: it is stated as `unit`.
+    /// The HOL type of the body's type `t`. (A type variable left only in the body, e.g. of a
+    /// type parameter given only by turbofish, is instantiated with `unit` by AutoCorrode's
+    /// `urust_ground_body_types`, see `translate::GROUND`.)
     fn hty(&mut self, t: Ty<'tcx>) -> String {
         // normalised as the signature is (`translate`): in a generic body, in the item's own typing
         // environment, which also reveals its `impl Trait` types; an instance's types are already
@@ -249,10 +216,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
                 .unwrap_or(t),
             Some(_) => t,
-        };
-        let t = match self.shown {
-            Some(a) => ty::EarlyBinder::bind(self.tcx, t).instantiate(self.tcx, a).skip_normalization(),
-            None => t,
         };
         self.fe.ty(t)
     }
@@ -1067,11 +1030,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Uint(ty::UintTy::U16) => "u16",
             ty::Uint(ty::UintTy::U32) => "u32",
             ty::Uint(ty::UintTy::U64) => "u64",
+            ty::Uint(ty::UintTy::U128) => "u128",
             ty::Uint(ty::UintTy::Usize) => "usize",
             ty::Int(ty::IntTy::I8) => "i8",
             ty::Int(ty::IntTy::I16) => "i16",
             ty::Int(ty::IntTy::I32) => "i32",
             ty::Int(ty::IntTy::I64) => "i64",
+            ty::Int(ty::IntTy::I128) => "i128",
             ty::Int(ty::IntTy::Isize) => "isize",
             _ => return None,
         })
@@ -1482,8 +1447,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The model of the formatting trait `tr`'s `fmt` for the primitive type `t` (see `StdLib_Fmt`).
     fn fmt_model(&self, tr: &str, t: Ty<'tcx>) -> Option<String> {
         let kind = match t.kind() {
-            ty::Uint(u) if *u != ty::UintTy::U128 => "word",
-            ty::Int(i) if *i != ty::IntTy::I128 => "sword",
+            ty::Uint(_) => "word",
+            ty::Int(_) => "sword",
             ty::Bool => "bool",
             ty::Char => "char",
             ty::Str => "str",
@@ -1960,8 +1925,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             DefKind::Impl { of_trait: false } => match tcx.type_of(parent).instantiate_identity().skip_normalization().kind() {
                 ty::Adt(def, _) => self.fe.std_adt(def.did())?,
                 ty::Slice(_) => "slice",
-                ty::Uint(u) if *u != ty::UintTy::U128 => "uint",
-                ty::Int(i) if *i != ty::IntTy::I128 => "int",
+                ty::Uint(_) => "uint",
+                ty::Int(_) => "int",
                 _ => return None,
             },
             _ => return None,
@@ -2099,8 +2064,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// on words only, comparing them as signed words for the signed integer types.
     fn hol_ordered(&self, t: Ty<'tcx>) -> bool {
         match t.kind() {
-            ty::Uint(u) => *u != ty::UintTy::U128,
-            ty::Int(i) => *i != ty::IntTy::I128,
+            ty::Uint(_) | ty::Int(_) => true,
             _ => false,
         }
     }
