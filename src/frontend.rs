@@ -899,8 +899,9 @@ impl<'tcx> Frontend<'tcx> {
     }
 
     /// The datatype of the external ADT `did` (named `n`), if it is an enum or a struct with only
-    /// public fields, without const parameters, whose field types all have uRust models (see
-    /// `ExtType`). Its associated types become `adt_projs`, as for local ADTs.
+    /// public fields, without const parameters, whose field types all have uRust models and contain
+    /// no `&mut` reference (see `ExtType`). Its associated types become `adt_projs`, as for local
+    /// ADTs.
     fn ext_datatype(&mut self, did: DefId, n: &str) -> Option<(Vec<String>, Vec<(String, Vec<String>)>, Vec<String>)> {
         let tcx = self.tcx;
         if !matches!(tcx.def_kind(did), DefKind::Enum | DefKind::Struct) { return None }
@@ -915,6 +916,11 @@ impl<'tcx> Frontend<'tcx> {
         let ftys: Vec<Vec<Ty<'tcx>>> =
             def.variants().iter().map(|v| v.fields.iter().map(|f| field_ty(tcx, f, own, env)).collect()).collect();
         let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
+        // a `&mut` reference in a field is a HOL type over the store's type variables `'addr`,
+        // `'gv`, which a datatype in the external types template does not have as parameters
+        if all.iter().any(|t| t.walk().any(|g| matches!(g.as_type().map(|x| x.kind()), Some(ty::Ref(_, _, m)) if m.is_mut()))) {
+            return None;
+        }
         let projs = self.projections(did, &all);
         let proj_names: Vec<String> = (0..projs.len()).map(|k| format!("'proj{}", k)).collect();
         let saved = (self.proj_tvars.take(), self.proj_env.replace(env));
