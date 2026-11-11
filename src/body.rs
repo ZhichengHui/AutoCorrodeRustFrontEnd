@@ -241,6 +241,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// definition's body alone, which Isabelle turns into an extra `itself` parameter of the
     /// constant, so that no call of it type-checks: it is stated as `unit`.
     fn hty(&mut self, t: Ty<'tcx>) -> String {
+        // normalised as the signature is (`translate`): in a generic body, in the item's own typing
+        // environment, which also reveals its `impl Trait` types; an instance's types are already
+        let t = match self.args {
+            None => self
+                .tcx
+                .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
+                .unwrap_or(t),
+            Some(_) => t,
+        };
         let t = match self.shown {
             Some(a) => ty::EarlyBinder::bind(self.tcx, t).instantiate(self.tcx, a).skip_normalization(),
             None => t,
