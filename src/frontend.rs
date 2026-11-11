@@ -81,6 +81,8 @@ pub struct Frontend<'tcx> {
     /// the function items whose types `ty` is translating (a function item's signature may
     /// contain its own type, through an `impl Trait` result)
     fn_items: Vec<DefId>,
+    /// the `impl Trait` types whose hidden types `ty` is translating
+    opaques: Vec<DefId>,
     pub placeholders: Vec<String>,
     /// Number of uses of placeholder types so far (see `ty_modelled`).
     placeholder_type_uses: usize,
@@ -156,6 +158,7 @@ impl<'tcx> Frontend<'tcx> {
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
             fn_items: Vec::new(),
+            opaques: Vec::new(),
             placeholders: Vec::new(),
             placeholder_type_uses: 0,
             fun_defs: Vec::new(),
@@ -660,6 +663,20 @@ impl<'tcx> Frontend<'tcx> {
                     if !matches!(n.kind(), ty::Alias(..)) {
                         return self.ty(n);
                     }
+                }
+                // an `impl Trait` type is its hidden type (as the compiler reveals it after type
+                // checking), also in generic code; one containing itself stays a placeholder
+                if let ty::Alias(_, a) = t.kind()
+                    && let ty::AliasTyKind::Opaque { def_id } = a.kind
+                    && !self.opaques.contains(&def_id)
+                {
+                    let hidden = ty::EarlyBinder::bind(self.tcx, self.tcx.type_of(def_id).instantiate_identity().skip_normalization())
+                        .instantiate(self.tcx, a.args)
+                        .skip_normalization();
+                    self.opaques.push(def_id);
+                    let h = self.ty(hidden);
+                    self.opaques.pop();
+                    return h;
                 }
                 match self.alias_tvars.as_mut() {
                     Some(k) => {
