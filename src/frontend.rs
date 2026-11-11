@@ -45,6 +45,21 @@ impl<'tcx> DefSet<'tcx> {
     pub fn clear(&mut self) { self.0.clear() }
 }
 
+/// A call (or, without arguments, a function value) of a local generic function in a translated
+/// body. Its text is a marker (`\u{1}F<n>\u{2}`, `\u{1}V<n>\u{2}`) completed at emission, when
+/// the allocation record the callee takes, if any, is known (see `translate::alloc_sets`).
+pub struct GenCall<'tcx> {
+    /// the translation whose body has the call
+    pub caller: FnKey<'tcx>,
+    pub callee: FnKey<'tcx>,
+    /// the generic arguments of the item the callee's dictionary parameters are the bounds of
+    pub kargs: GenericArgsRef<'tcx>,
+    /// the callee's dictionaries
+    pub dicts: Vec<String>,
+    /// the arguments (`None`: the function as a value)
+    pub args: Option<Vec<String>>,
+}
+
 /// A placeholder or external type, declared in the types template.
 #[derive(Clone)]
 pub struct ExtType {
@@ -81,6 +96,12 @@ pub struct FunDef<'tcx> {
     pub body: String,
     pub calls: DefSet<'tcx>,
     pub comments: Vec<String>,
+    /// how many of the parameters are dictionaries (they come first)
+    pub n_dicts: usize,
+    /// the type variables of projections and the function types of `Fn`-bounded parameters of the
+    /// definition (see `Frontend::proj_tvars`, `Frontend::fn_params`)
+    pub proj_ctx: Option<HashMap<ty::AliasTy<'tcx>, String>>,
+    pub fn_ctx: HashMap<u32, String>,
 }
 
 pub struct Frontend<'tcx> {
@@ -147,6 +168,11 @@ pub struct Frontend<'tcx> {
     /// While a generic item is translated: the function types of its type parameters bounded by
     /// `Fn` traits (see `fn_param_types`).
     pub fn_params: HashMap<u32, String>,
+    /// The mutable locals of types with generic parameters, by marker index (`\u{1}A<n>\u{2}`):
+    /// the translation whose body has one, its type and HOL type (see `BodyTr::alloc`).
+    pub alloc_sites: Vec<(FnKey<'tcx>, Ty<'tcx>, String)>,
+    /// The calls of local generic functions, by marker index (see `GenCall`).
+    pub gen_calls: Vec<GenCall<'tcx>>,
 }
 
 /// The type of field `f` of an ADT at its type arguments `args`, without regions and normalised in
@@ -211,6 +237,8 @@ impl<'tcx> Frontend<'tcx> {
             adt_projs: HashMap::new(),
             proj_tvars: None,
             fn_params: HashMap::new(),
+            alloc_sites: Vec::new(),
+            gen_calls: Vec::new(),
         }
     }
 
@@ -809,9 +837,14 @@ impl<'tcx> Frontend<'tcx> {
         s
     }
 
-    pub fn need_alloc(&mut self, hol_ty: &str) {
-        if !self.alloc_types.iter().any(|t| t == hol_ty) {
-            self.alloc_types.push(hol_ty.to_string());
+    /// The locale's allocator for the HOL type `hol_ty` (its index in `alloc_types`), added if new.
+    pub fn need_alloc(&mut self, hol_ty: &str) -> usize {
+        match self.alloc_types.iter().position(|t| t == hol_ty) {
+            Some(k) => k,
+            None => {
+                self.alloc_types.push(hol_ty.to_string());
+                self.alloc_types.len() - 1
+            }
         }
     }
 

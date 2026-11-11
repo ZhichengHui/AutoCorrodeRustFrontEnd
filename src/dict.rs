@@ -48,23 +48,52 @@ impl<'tcx> Frontend<'tcx> {
             .collect()
     }
 
-    /// The supertraits of `tr` (as trait references on its own generic parameters) whose
-    /// dictionaries are fields of its dictionaries.
-    pub fn dict_parents(&self, tr: DefId) -> Vec<ty::TraitRef<'tcx>> {
+    /// The supertraits of `tr` (bounds on `Self`) and the bounds of its associated types (e.g.
+    /// `<Self as IntoIterator>::IntoIter: Iterator`), as trait references on its own generic
+    /// parameters, with whether each is a supertrait.
+    fn trait_bounds(&self, tr: DefId) -> Vec<(ty::TraitRef<'tcx>, bool)> {
         let tcx = self.tcx;
-        let mut out: Vec<ty::TraitRef<'tcx>> = vec![];
-        for (c, _) in tcx.explicit_super_clauses_of(tr).skip_binder() {
+        let mut clauses: Vec<(ty::Clause<'tcx>, bool)> =
+            tcx.explicit_super_clauses_of(tr).skip_binder().iter().map(|(c, _)| (*c, true)).collect();
+        for i in tcx.associated_items(tr).in_definition_order() {
+            if matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_params.is_empty() {
+                clauses.extend(tcx.explicit_item_self_bounds(i.def_id).skip_binder().iter().map(|(c, _)| (*c, false)));
+            }
+        }
+        let mut out: Vec<(ty::TraitRef<'tcx>, bool)> = vec![];
+        for (c, sup) in clauses {
             let Some(p) = c.as_trait_clause() else { continue };
             let p = tcx.instantiate_bound_regions_with_erased(p);
-            if p.polarity != ty::ClausePolarity::Positive {
-                continue;
-            }
             let r = tcx.erase_and_anonymize_regions(p.trait_ref);
-            if self.has_dict(r.def_id) && !out.contains(&r) {
-                out.push(r);
+            if p.polarity == ty::ClausePolarity::Positive && !out.iter().any(|(q, _)| *q == r) {
+                out.push((r, sup));
             }
         }
         out
+    }
+
+    /// Does `from` reach the trait `to` through supertraits and associated type bounds?
+    fn reaches(&self, from: DefId, to: DefId, seen: &mut Vec<DefId>) -> bool {
+        if from == to {
+            return true;
+        }
+        if seen.contains(&from) {
+            return false;
+        }
+        seen.push(from);
+        self.trait_bounds(from).into_iter().any(|(r, _)| self.reaches(r.def_id, to, seen))
+    }
+
+    /// The bounds whose dictionaries are fields of the dictionaries of `tr` (see `trait_bounds`),
+    /// those by traits with dictionaries. A bound of an associated type by a trait that reaches
+    /// `tr` again (e.g. `trait Node { type Child: Node; }`) is not: the dictionary would contain
+    /// itself.
+    pub fn dict_parents(&self, tr: DefId) -> Vec<ty::TraitRef<'tcx>> {
+        self.trait_bounds(tr)
+            .into_iter()
+            .filter(|(r, sup)| (*sup || !self.reaches(r.def_id, tr, &mut vec![])) && self.has_dict(r.def_id))
+            .map(|(r, _)| r)
+            .collect()
     }
 
     /// Does a bound by `tr` take a dictionary: does it have a method field or a supertrait with a
@@ -73,13 +102,7 @@ impl<'tcx> Frontend<'tcx> {
         if self.is_fn_trait(tr) {
             return false;
         }
-        if !self.dict_methods(tr).is_empty() {
-            return true;
-        }
-        let tcx = self.tcx;
-        tcx.explicit_super_clauses_of(tr).skip_binder().iter().any(|(c, _)| {
-            c.as_trait_clause().is_some_and(|p| p.skip_binder().def_id() != tr && self.has_dict(p.skip_binder().def_id()))
-        })
+        !self.dict_methods(tr).is_empty() || !self.dict_parents(tr).is_empty()
     }
 
     /// The associated types of a trait reference that its dictionary datatype takes as type
@@ -128,8 +151,8 @@ impl<'tcx> Frontend<'tcx> {
         format!("{}_{}", self.dict_name(tr), names::ident_chars(self.tcx.item_name(m).as_str()))
     }
 
-    /// The field of the dictionaries of `tr` holding the dictionary of its `k`-th supertrait (see
-    /// `dict_parents`).
+    /// The field of the dictionaries of `tr` holding the dictionary of its `k`-th supertrait or
+    /// associated type bound (see `dict_parents`).
     pub fn dict_parent_field(&mut self, tr: DefId, k: usize) -> String {
         let p = self.dict_parents(tr)[k].def_id;
         format!("{}_super{}_{}", self.dict_name(tr), k, names::ident_chars(self.tcx.item_name(p).as_str()))

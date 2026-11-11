@@ -21,7 +21,7 @@ use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, Der
 use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
-use crate::frontend::{FnKey, Frontend, Inst};
+use crate::frontend::{FnKey, Frontend, GenCall, Inst};
 use crate::names;
 
 pub struct Unsup(pub String);
@@ -29,6 +29,16 @@ type R<T> = Result<T, Unsup>;
 
 fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
+}
+
+/// `f(args)` for the HOL term `f` of a function value and the uRust arguments `a`.
+pub fn term_call(f: &str, a: &[String]) -> String {
+    if a.len() <= 8 {
+        format!("\\<epsilon>\\<open>{}\\<close>({})", f, a.join(", "))
+    } else {
+        let wrapped: Vec<String> = a.iter().map(|x| format!("\\<lbrakk>{}\\<rbrakk>", x)).collect();
+        format!("\\<epsilon>\\<open>funcall{} ({}) {}\\<close>", a.len(), f, wrapped.join(" "))
+    }
 }
 
 /// A HOL term as an argument of an application: parenthesised unless it is a name.
@@ -258,13 +268,21 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Bind the pattern variable `hid` to the uRust local `name`; a `mut` binding is a mutable
-    /// local (a cell), which needs storage for its type.
-    fn declare(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<()> {
-        if m.is_mut() {
-            self.alloc(self.node_ty(hid))?;
-        }
+    /// local (a cell), which needs storage for its type: returns its allocator, if not the
+    /// locale's (see `alloc`).
+    fn declare(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<Option<String>> {
+        let a = if m.is_mut() { self.alloc(self.node_ty(hid))? } else { None };
         self.locals.insert(hid, Local { name: name.to_string(), cell: m.is_mut() });
-        Ok(())
+        Ok(a)
+    }
+
+    /// `let [mut] n = v;` for a binding of mutability `m` with the allocator `a` (see `alloc`):
+    /// with one from the allocation record, the cell is allocated by calling it.
+    fn let_binding(&self, n: &str, m: hir::Mutability, a: &Option<String>, v: &str) -> String {
+        match a {
+            Some(a) if m.is_mut() => format!("let {} = \\<epsilon>\\<open>{}\\<close>({});", n, a, v),
+            _ => format!("let {}{} = {};", m.prefix_str(), n, v),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -281,9 +299,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let n = names::local_name(ident.as_str());
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
-                    self.declare(hid, &n, m)?;
+                    let a = self.declare(hid, &n, m)?;
                     if m.is_mut() {
-                        prologue.push(format!("let mut {} = {};", n, n));
+                        prologue.push(self.let_binding(&n, m, &a, &n));
                     }
                 }
                 PatKind::Wild => params.push(format!("unused_{}", i)),
@@ -312,16 +330,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    fn alloc(&mut self, t: Ty<'tcx>) -> R<()> {
+    /// Storage for a mutable local of type `t`: the locale's allocator for its HOL type, which
+    /// `let mut` chooses (`None`), or for a type with generic parameters, which the locale cannot
+    /// have one for, the allocator of the body's allocation record (a marker completed at
+    /// emission, see `Frontend::alloc_sites`).
+    fn alloc(&mut self, t: Ty<'tcx>) -> R<Option<String>> {
         let (h, modelled) = self.fe.ty_modelled(t);
         if !modelled {
             return unsup(format!("mutable local of the unsupported type `{}`", t));
         }
         if t.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(x) if matches!(x.kind(), ty::Param(_)))) {
-            return unsup("mutable local of a generic type (needs a locale prism for a type parameter)");
+            let i = self.fe.alloc_sites.len();
+            self.fe.alloc_sites.push((self.key, self.tcx.erase_and_anonymize_regions(t), h));
+            return Ok(Some(format!("\u{1}A{}\u{2}", i)));
         }
         self.fe.need_alloc(&h);
-        Ok(())
+        Ok(None)
     }
 
     // ------------------------------------------------------------------
@@ -464,9 +488,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // `let x;` -- deferred initialisation: model as a mutable local.
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
-                    self.declare(hid, &n, hir::Mutability::Mut)?;
+                    let a = self.declare(hid, &n, hir::Mutability::Mut)?;
                     let ht = self.hty(self.node_ty(hid));
-                    Ok((format!("let mut {} = \\<llangle>undefined :: {}\\<rrangle>;", n, ht), String::new()))
+                    let v = format!("\\<llangle>undefined :: {}\\<rrangle>", ht);
+                    Ok((self.let_binding(&n, hir::Mutability::Mut, &a, &v), String::new()))
                 } else {
                     unsup("let without initializer and with a non-identifier pattern")
                 }
@@ -487,7 +512,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pat.kind {
             PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
+                let a = self.declare(hid, &n, m)?;
                 // the allocator of a mutable local is chosen by its type; for a list or an option the
                 // initial value (`[]`, `None`, `Vec::with_capacity(n)`, ...) may not fix the element
                 // type when the uses that would are placeholders or external, so it is annotated
@@ -495,9 +520,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if m.is_mut() && matches!(lt.kind(), ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Vec" | "Option"))) {
                     let ht = self.hty(lt);
                     let tv = self.typed("init", v, &ht);
-                    return Ok(format!("let mut {} = {};", n, tv.s));
+                    return Ok(self.let_binding(&n, m, &a, &tv.s));
                 }
-                Ok(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)))
+                Ok(self.let_binding(&n, m, &a, &v.at(20)))
             }
             PatKind::Wild => Ok(format!("let _ = {};", v.at(20))),
             _ => {
@@ -525,8 +550,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => {}
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
-                out.push(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)));
+                let a = self.declare(hid, &n, m)?;
+                out.push(self.let_binding(&n, m, &a, &v.at(20)));
                 if let Some(s) = sub {
                     out.extend(self.irrefutable(s, &Tr::atom(n))?);
                 }
@@ -758,9 +783,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
             PV::Val(v) => {
-                self.alloc(t)?;
+                let a = self.alloc(t)?;
                 let tmp = self.fresh("tmp");
-                Ok(PV::Val(Tr::block(format!("{{ let mut {} = {}; {} }}", tmp, v.at(20), tmp))))
+                let b = self.let_binding(&tmp, hir::Mutability::Mut, &a, &v.at(20));
+                Ok(PV::Val(Tr::block(format!("{{ {} {} }}", b, tmp))))
             }
         }
     }
@@ -1800,12 +1826,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let (key, kargs) = self.local_callee(did, args)?;
         let dicts = self.callee_dicts(key, kargs)?;
         self.calls.insert(key);
-        let m = self.fe.marker(key);
-        if !dicts.is_empty() {
-            return Ok(self.term_app(&format!("\u{1}H{}\u{2} {}", m, dicts.join(" ")), argv));
-        }
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
-        Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a))
+        // an instance takes neither dictionaries nor an allocation record
+        if let Inst::Mono(_) = key.1 {
+            let m = self.fe.marker(key);
+            return Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a));
+        }
+        let i = self.fe.gen_calls.len();
+        self.fe.gen_calls.push(GenCall { caller: self.key, callee: key, kargs, dicts, args: Some(a) });
+        Ok(Tr::new(format!("\u{1}F{}\u{2}", i), 999))
     }
 
     /// The function translating the local function `did` at the generic arguments `args`, with
@@ -1843,12 +1872,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `f(args)` for the HOL term `f` of a function value.
     fn term_app(&self, f: &str, argv: Vec<Tr>) -> Tr {
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
-        if a.len() <= 8 {
-            Tr::new(format!("\\<epsilon>\\<open>{}\\<close>({})", f, a.join(", ")), 999)
-        } else {
-            let wrapped: Vec<String> = a.iter().map(|x| format!("\\<lbrakk>{}\\<rbrakk>", x)).collect();
-            Tr::atom(format!("\\<epsilon>\\<open>funcall{} ({}) {}\\<close>", a.len(), f, wrapped.join(" ")))
-        }
+        Tr::new(term_call(f, &a), 999)
     }
 
     // ------------------------------------------------------------------
@@ -1911,7 +1935,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The dictionary for `r` in the dictionary `d` for the bound `p`: `d` itself, or a
     /// supertrait field of it (transitively).
     fn bound_dict(&mut self, p: ty::TraitRef<'tcx>, d: String, r: ty::TraitRef<'tcx>) -> Option<String> {
-        if p == r {
+        // compared as `select` sees `r`: normalised in the body's typing environment
+        let tcx = self.tcx;
+        let norm = |x: ty::TraitRef<'tcx>| {
+            let x = tcx.erase_and_anonymize_regions(x);
+            tcx.try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(x)).unwrap_or(x)
+        };
+        if norm(p) == norm(r) {
             return Some(d);
         }
         for (k, q) in self.fe.dict_parents(p.def_id).into_iter().enumerate() {
@@ -1966,9 +1996,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn fn_value(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<String> {
         let dicts = self.callee_dicts(key, kargs)?;
         self.calls.insert(key);
-        let m = self.fe.marker(key);
-        let h = format!("\u{1}H{}\u{2}", m);
-        Ok(if dicts.is_empty() { h } else { format!("{} {}", h, dicts.join(" ")) })
+        let i = self.fe.gen_calls.len();
+        self.fe.gen_calls.push(GenCall { caller: self.key, callee: key, kargs, dicts, args: None });
+        Ok(format!("\u{1}V{}\u{2}", i))
     }
 
     /// A call of the trait method `did` (at `gargs`) of a bound of the body: the method's field of
@@ -2630,9 +2660,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ps = match pat.kind {
             PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
+                let a = self.declare(hid, &n, m)?;
                 if m.is_mut() {
-                    pro.push(format!("let mut {} = {};", n, n));
+                    pro.push(self.let_binding(&n, m, &a, &n));
                 }
                 n
             }
@@ -2791,8 +2821,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => Ok((None, vec![])),
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
-                let mut binds = vec![format!("let {}{} = {};", m.prefix_str(), n, v.at(20))];
+                let a = self.declare(hid, &n, m)?;
+                let mut binds = vec![self.let_binding(&n, m, &a, &v.at(20))];
                 match sub {
                     Some(s) => {
                         let (c, b2) = self.pat_cond(s, v)?;
@@ -2955,9 +2985,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => Ok("_".into()),
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
+                let a = self.declare(hid, &n, m)?;
                 if m.is_mut() {
-                    pro.push(format!("let mut {} = {};", n, n));
+                    pro.push(self.let_binding(&n, m, &a, &n));
                 }
                 match sub {
                     None => Ok(n),
@@ -3182,9 +3212,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if modelled {
                         pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
                     }
-                    self.declare(hid, &n, m)?;
+                    let a = self.declare(hid, &n, m)?;
                     if m.is_mut() {
-                        pro.push(format!("let mut {} = {};", n, n));
+                        pro.push(self.let_binding(&n, m, &a, &n));
                     }
                     ps.push(n);
                 }
