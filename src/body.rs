@@ -130,6 +130,8 @@ struct PatTr {
     conds: Vec<String>,
     /// Statements to run at the start of the arm (mutable bindings).
     prologue: Vec<String>,
+    /// Those of them that bind by mutable reference (also needed by a guard).
+    refs: Vec<String>,
 }
 
 pub struct BodyTr<'a, 'tcx> {
@@ -139,10 +141,12 @@ pub struct BodyTr<'a, 'tcx> {
     owner: LocalDefId,
     /// The generic arguments of the instance being translated (`None`: the generic body itself).
     args: Option<GenericArgsRef<'tcx>>,
-    /// For a generic body: its own generic parameters, with each type parameter that occurs in no
-    /// parameter or result type replaced by `()`.
-    shown: Option<GenericArgsRef<'tcx>>,
     locals: HashMap<HirId, Local>,
+    /// the mutable reference matched by the `match`/`if let`/`while let` being translated, if
+    /// any (see `scrut_place`): patterns bind by mutable reference into it
+    match_place: Option<Tr>,
+    /// the bindings by mutable reference of the pattern being translated (see `PatTr::refs`)
+    pat_refs: Vec<String>,
     fresh: usize,
     pub calls: crate::frontend::DefSet<'tcx>,
     pub comments: Vec<String>,
@@ -154,42 +158,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     pub fn new(fe: &'a mut Frontend<'tcx>, owner: LocalDefId, args: Option<GenericArgsRef<'tcx>>) -> Self {
         let tcx = fe.tcx;
         let typeck = tcx.typeck(owner);
-        let shown = match (args, tcx.def_kind(owner)) {
-            (None, DefKind::Fn | DefKind::AssocFn) => {
-                let sig = tcx.fn_sig(owner).instantiate_identity().skip_binder();
-                // the signature's types as written and normalised (`Self::IntoIter` may be `I`)
-                let env = ty::TypingEnv::post_analysis(tcx, owner.to_def_id());
-                let in_sig: HashSet<u32> = sig
-                    .inputs_and_output
-                    .iter()
-                    .flat_map(|t| {
-                        let n = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t);
-                        [t, n]
-                    })
-                    .flat_map(|t| t.walk())
-                    .filter_map(|g| match g.kind() {
-                        ty::GenericArgKind::Type(t) => match t.kind() {
-                            ty::Param(p) => Some(p.index),
-                            _ => None,
-                        },
-                        _ => None,
-                    })
-                    .collect();
-                Some(ty::GenericArgs::for_item(tcx, owner.to_def_id(), |param, _| match param.kind {
-                    ty::GenericParamDefKind::Type { .. } if !in_sig.contains(&param.index) => tcx.types.unit.into(),
-                    _ => tcx.mk_param_from_def(param),
-                }))
-            }
-            _ => None,
-        };
         BodyTr {
             fe,
             tcx,
             typeck,
             owner,
             args,
-            shown,
             locals: HashMap::new(),
+            match_place: None,
+            pat_refs: vec![],
             fresh: 0,
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
@@ -236,10 +213,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         ))
     }
 
-    /// The HOL type of the body's type `t`. A type parameter of a generic body that occurs in no
-    /// parameter or result type (e.g. one given only by turbofish) would be a type variable of the
-    /// definition's body alone, which Isabelle turns into an extra `itself` parameter of the
-    /// constant, so that no call of it type-checks: it is stated as `unit`.
+    /// The HOL type of the body's type `t`. (A type variable left only in the body, e.g. of a
+    /// type parameter given only by turbofish, is instantiated with `unit` by AutoCorrode's
+    /// `urust_ground_body_types`, see `translate::GROUND`.)
     fn hty(&mut self, t: Ty<'tcx>) -> String {
         // normalised as the signature is (`translate`): in a generic body, in the item's own typing
         // environment, which also reveals its `impl Trait` types; an instance's types are already
@@ -249,10 +225,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
                 .unwrap_or(t),
             Some(_) => t,
-        };
-        let t = match self.shown {
-            Some(a) => ty::EarlyBinder::bind(self.tcx, t).instantiate(self.tcx, a).skip_normalization(),
-            None => t,
         };
         self.fe.ty(t)
     }
@@ -465,7 +437,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if let Some(els) = l.els {
             let init = l.init.ok_or(Unsup("let-else without initializer".into()))?;
             let iv = self.scrut(init)?;
-            let p = self.pat(l.pat)?;
+            let place = self.scrut_place(init)?;
+            let p = self.pat_at(l.pat, place)?;
             let els_s = self.block_seq(els.stmts, els.expr)?;
             if p.conds.is_empty() && p.prologue.is_empty() {
                 return Ok((format!("let {} = {} else {{ {} }};", p.pat, iv.at(20), els_s), String::new()));
@@ -526,6 +499,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Destructure an irrefutable pattern by projections. Returns `let` statements.
+    /// Is the value `pat` destructures a mutable reference (match ergonomics), so that its parts
+    /// are references focused into it (see `place_field`)?
+    fn through_mut_ref(&self, pat: &'tcx hir::Pat<'tcx>) -> bool {
+        // the implicit dereferences of match ergonomics, with the types before them
+        self.typeck
+            .pat_adjustments()
+            .get(pat.hir_id)
+            .is_some_and(|adj| adj.iter().any(|a| matches!(a.source.kind(), ty::Ref(_, _, m) if m.is_mut())))
+    }
+
     fn irrefutable(&mut self, pat: &'tcx hir::Pat<'tcx>, v: &Tr) -> R<Vec<String>> {
         let mut out = vec![];
         match pat.kind {
@@ -541,11 +524,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(..) => return unsup("`ref mut` binding"),
             PatKind::Tuple(ps, ddpos) => {
                 let t = self.pat_ty(pat).peel_refs();
+                let through_ref = self.through_mut_ref(pat);
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
                     if let Some(p) = p {
                         if n > 16 { return unsup("tuple with more than 16 components") }
-                        let proj = Tr::new(format!("{}.{}", v.at(998), k), 998);
+                        let proj = if through_ref {
+                            self.place_field(v, t, k).ok_or_else(|| Unsup("tuple component through a mutable reference".into()))?
+                        } else {
+                            Tr::new(format!("{}.{}", v.at(998), k), 998)
+                        };
                         out.extend(self.irrefutable(p, &proj)?);
                     }
                 }
@@ -555,9 +543,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let ty::Adt(def, _) = t.kind() else { return unsup("struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable struct pattern in irrefutable position") }
                 let adt = def.did();
+                let through_ref = self.through_mut_ref(pat);
                 for f in fields.iter() {
                     let fidx = self.typeck.field_index(f.hir_id).as_usize();
-                    let proj = self.field_read(adt, fidx, v)?;
+                    let proj = if through_ref {
+                        self.place_field(v, t, fidx).ok_or_else(|| Unsup("field of a recursive struct through a reference".into()))?
+                    } else {
+                        self.field_read(adt, fidx, v)?
+                    };
                     out.extend(self.irrefutable(f.pat, &proj)?);
                 }
             }
@@ -566,10 +559,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let ty::Adt(def, _) = t.kind() else { return unsup("tuple-struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable tuple-struct pattern in irrefutable position") }
                 let adt = def.did();
+                let through_ref = self.through_mut_ref(pat);
                 let n = def.non_enum_variant().fields.len();
                 for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
                     if let Some(p) = p {
-                        let proj = self.field_read(adt, k, v)?;
+                        let proj = if through_ref {
+                            self.place_field(v, t, k).ok_or_else(|| Unsup("field of a recursive struct through a reference".into()))?
+                        } else {
+                            self.field_read(adt, k, v)?
+                        };
                         out.extend(self.irrefutable(p, &proj)?);
                     }
                 }
@@ -1067,11 +1065,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Uint(ty::UintTy::U16) => "u16",
             ty::Uint(ty::UintTy::U32) => "u32",
             ty::Uint(ty::UintTy::U64) => "u64",
+            ty::Uint(ty::UintTy::U128) => "u128",
             ty::Uint(ty::UintTy::Usize) => "usize",
             ty::Int(ty::IntTy::I8) => "i8",
             ty::Int(ty::IntTy::I16) => "i16",
             ty::Int(ty::IntTy::I32) => "i32",
             ty::Int(ty::IntTy::I64) => "i64",
+            ty::Int(ty::IntTy::I128) => "i128",
             ty::Int(ty::IntTy::Isize) => "isize",
             _ => return None,
         })
@@ -1195,8 +1195,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         if !adt.is_local() {
             return match self.fe.ext_ctor(adt, vidx) {
-                Some(c) => Ok(Tr::atom(c)),
-                None => unsup("constructor of an external type"),
+                Some((c, false)) => Ok(Tr::atom(c)),
+                _ => unsup("constructor of an external type"),
             };
         }
         Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx)))
@@ -1435,7 +1435,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Res::Local(hid) => {
                 let Some(l) = self.locals.get(&hid).cloned() else { return unsup("call of unknown local") };
                 let mut t = self.ty_of(callee);
-                if !matches!(t.peel_refs().kind(), ty::Closure(..)) {
+                // a closure, or a function item (whose value is the closure calling it, see
+                // `fn_item_value`), e.g. in an instance at the closure's or function's type
+                if !matches!(t.peel_refs().kind(), ty::Closure(..) | ty::FnDef(..)) {
                     return unsup("call through a generic `Fn` parameter (trait call in generic code)");
                 }
                 // the closure value is read out of the local's cell and through the references
@@ -1482,8 +1484,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The model of the formatting trait `tr`'s `fmt` for the primitive type `t` (see `StdLib_Fmt`).
     fn fmt_model(&self, tr: &str, t: Ty<'tcx>) -> Option<String> {
         let kind = match t.kind() {
-            ty::Uint(u) if *u != ty::UintTy::U128 => "word",
-            ty::Int(i) if *i != ty::IntTy::I128 => "sword",
+            ty::Uint(_) => "word",
+            ty::Int(_) => "sword",
             ty::Bool => "bool",
             ty::Char => "char",
             ty::Str => "str",
@@ -1762,8 +1764,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => unsup("constructor of a standard library type"),
             };
         }
-        if !adt.is_local() { return unsup("constructor of an external type") }
         if argv.len() > 8 { return unsup("constructor with more than 8 fields") }
+        if !adt.is_local() {
+            // an external ADT declared with its constructors (see `ExtType::ctors`)
+            return match self.fe.ext_ctor(adt, vidx) {
+                Some((c, true)) => Ok(self.callee_app(&format!("{}_mk", c), &format!("{}_mk", c), &format!("{}_mk()", c), argv.iter().map(|a| a.at(11)).collect())),
+                _ => unsup("constructor of an external type"),
+            };
+        }
         // `S()`: a constructor without fields has no `_mk` function; it is the value itself
         if argv.is_empty() { return Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx))) }
         let n = self.fe.variant_call_name(adt, vidx);
@@ -1909,11 +1917,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // placeholder types without arguments (see `Frontend::ty`)
                 ty::RawPtr(..) | ty::FnPtr(..) | ty::Dynamic(..) => w.skip_current_subtree(),
                 ty::Adt(def, args) => {
-                    let kept = match self.fe.std_adt(def.did()) {
-                        Some("Box" | "Vec" | "Option" | "Range" | "RangeInclusive") => 1,
-                        Some("String" | "Ordering") => 0,
-                        _ => continue,
-                    };
+                    let Some(kept) = self.fe.hol_kept_args(def.did()) else { continue };
                     w.skip_current_subtree();
                     for a in args.types().take(kept) {
                         self.hol_params(a, out);
@@ -1960,8 +1964,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             DefKind::Impl { of_trait: false } => match tcx.type_of(parent).instantiate_identity().skip_normalization().kind() {
                 ty::Adt(def, _) => self.fe.std_adt(def.did())?,
                 ty::Slice(_) => "slice",
-                ty::Uint(u) if *u != ty::UintTy::U128 => "uint",
-                ty::Int(i) if *i != ty::IntTy::I128 => "int",
+                ty::Uint(_) => "uint",
+                ty::Int(_) => "int",
                 _ => return None,
             },
             _ => return None,
@@ -2099,8 +2103,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// on words only, comparing them as signed words for the signed integer types.
     fn hol_ordered(&self, t: Ty<'tcx>) -> bool {
         match t.kind() {
-            ty::Uint(u) => *u != ty::UintTy::U128,
-            ty::Int(i) => *i != ty::IntTy::I128,
+            ty::Uint(_) | ty::Int(_) => true,
             _ => false,
         }
     }
@@ -2228,7 +2231,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let c = Self::strip_drop_temps(c);
         if let ExprKind::Let(le) = c.kind {
             let iv = self.scrut(le.init)?;
-            let p = self.pat(le.pat)?;
+            let place = self.scrut_place(le.init)?;
+            let p = self.pat_at(le.pat, place)?;
             let tb = with_prologue(&p.prologue, &self.branch(t)?);
             let eb = match el { Some(x) => self.branch(x)?, None => "()".into() };
             // uRust's `if let`, like its `while let`, takes no pattern conditions and only
@@ -2318,7 +2322,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let cond = Self::strip_drop_temps(cond);
                 if let ExprKind::Let(le) = cond.kind {
                     let iv = self.scrut(le.init)?;
-                    let p = self.pat(le.pat)?;
+                    let place = self.scrut_place(le.init)?;
+                    let p = self.pat_at(le.pat, place)?;
                     let body = with_prologue(&p.prologue, &self.branch(then)?);
                     let tuple = matches!(le.pat.kind, PatKind::Tuple(..)) || tuple_of_non_variables(le.pat);
                     if p.conds.is_empty() && !tuple {
@@ -2455,6 +2460,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn match_expr(&mut self, scrut: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         let st = self.ty_adj(scrut);
         let sv = self.scrut(scrut)?;
+        let place = self.scrut_place(scrut)?;
         if self.int_like(st) || arms.iter().all(|a| self.chainable(a.pat)) {
             return self.match_chain(sv, arms);
         }
@@ -2462,12 +2468,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             .iter()
             .any(|a| Self::irrefutable_shape(a.pat) && (a.guard.is_some() || Self::has_lit(a.pat)));
         if !needs_split {
-            let m = self.match_arms(&sv, arms)?;
+            let m = self.match_arms(&sv, &place, arms)?;
             return Ok(Tr::new(format!("match {} {{\n{}\n}}", sv.at(20), m), 20));
         }
         let tmp = self.fresh("scrut");
         let tv = Tr::atom(tmp.clone());
-        let m = self.match_arms(&tv, arms)?;
+        let m = self.match_arms(&tv, &place, arms)?;
         Ok(Tr::block(format!("{{\nlet {} = {};\nmatch {} {{\n{}\n}}\n}}", tmp, sv.at(20), tmp, m)))
     }
 
@@ -2475,22 +2481,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// condition (guard or literal sub-pattern) becomes a single arm whose body tests the
     /// condition and matches the remaining arms otherwise: uRust would else generate a
     /// redundant catch-all case, which HOL rejects.
-    fn match_arms(&mut self, v: &Tr, arms: &'tcx [hir::Arm<'tcx>]) -> R<String> {
+    fn match_arms(&mut self, v: &Tr, place: &Option<Tr>, arms: &'tcx [hir::Arm<'tcx>]) -> R<String> {
         let mut out = vec![];
         for (i, arm) in arms.iter().enumerate() {
-            let p = self.pat(arm.pat)?;
+            let p = self.pat_at(arm.pat, place.clone())?;
             let mut conds = p.conds.clone();
             if let Some(g) = arm.guard {
                 if contains_let(g) {
                     return unsup("`if let` guard");
                 }
                 let gv = self.val(g)?;
-                conds.push(gv.at(44));
+                // the guard may use the bindings by mutable reference
+                conds.push(if p.refs.is_empty() { gv.at(44) } else { format!("{{ {} {} }}", p.refs.join(" "), gv.at(20)) });
             }
             let irref = Self::irrefutable_shape(arm.pat);
             if irref && !conds.is_empty() {
                 let rest = if i + 1 < arms.len() {
-                    format!("match {} {{\n{}\n}}", v.at(20), self.match_arms(v, &arms[i + 1..])?)
+                    format!("match {} {{\n{}\n}}", v.at(20), self.match_arms(v, place, &arms[i + 1..])?)
                 } else {
                     "panic!(\"non-exhaustive match\")".to_string()
                 };
@@ -2686,20 +2693,68 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn pat(&mut self, pat: &'tcx hir::Pat<'tcx>) -> R<PatTr> {
         let mut conds = vec![];
         let mut prologue = vec![];
-        let s = self.pat_rec(pat, &mut conds, &mut prologue)?;
-        Ok(PatTr { pat: s, conds, prologue })
+        let place = self.match_place.clone();
+        self.pat_refs.clear();
+        let s = self.pat_rec(pat, &mut conds, &mut prologue, place)?;
+        let refs = std::mem::take(&mut self.pat_refs);
+        Ok(PatTr { pat: s, conds, prologue, refs })
     }
 
-    fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>) -> R<String> {
+    /// `pat` matching a value behind the mutable reference `place` (see `scrut_place`).
+    fn pat_at(&mut self, pat: &'tcx hir::Pat<'tcx>, place: Option<Tr>) -> R<PatTr> {
+        self.match_place = place;
+        let r = self.pat(pat);
+        self.match_place = None;
+        r
+    }
+
+    /// The mutable reference a scrutinee `e` of type `&mut T` evaluates to, when evaluating it
+    /// again has no effect (a pattern binding by mutable reference is focused into it).
+    fn scrut_place(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
+        let simple = match e.kind {
+            ExprKind::AddrOf(_, hir::Mutability::Mut, inner) => self.is_simple(inner),
+            _ => self.is_simple(e),
+        };
+        match self.ty_adj(e).kind() {
+            ty::Ref(_, inner, m) if m.is_mut() && !inner.is_ref() && simple => Ok(Some(self.val(e)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The reference to component `k` of the value of type `t` behind the reference `r`: a field
+    /// of a local struct translated as a record, or a tuple component.
+    fn place_field(&mut self, r: &Tr, t: Ty<'tcx>, k: usize) -> Option<Tr> {
+        match t.kind() {
+            ty::Adt(def, _) if def.is_struct() && def.did().is_local() && self.fe.record_adts.contains(&def.did()) => {
+                Some(Tr::new(format!("{}.{}", r.at(99), self.fe.field_name(def.did(), 0, k)), 100))
+            }
+            ty::Tuple(ts) if ts.len() <= 16 => {
+                let lens = vec!["snd\\<^sub>L"; k].into_iter().chain(["fst\\<^sub>L"]).collect::<Vec<_>>().join(" \\<circ>\\<^sub>L ");
+                Some(Tr::new(format!("\\<llangle>focus_reference_via_lens ({})\\<rrangle>\\<^sub>1({})", lens, r.s), 999))
+            }
+            _ => None,
+        }
+    }
+
+    /// `place`: the mutable reference to the value matched by `pat`, if known (see `scrut_place`).
+    fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>, place: Option<Tr>) -> R<String> {
+        // a binding by mutable reference (`ref mut x`, or after match ergonomics): the reference
+        // focused to the matched part, bound before the arm's body; the pattern does not bind
+        if let PatKind::Binding(_, hid, ident, sub) = pat.kind
+            && let Some(hir::BindingMode(hir::ByRef::Yes(_, mutbl), _)) = self.typeck.pat_binding_modes().get(hid)
+            && mutbl.is_mut()
+        {
+            let (Some(r), None) = (place, sub) else { return unsup("binding by mutable reference (match ergonomics)") };
+            let n = names::local_name(ident.as_str());
+            self.declare(hid, &n, hir::Mutability::Not)?;
+            let b = format!("let {} = {};", n, r.at(20));
+            self.pat_refs.push(b.clone());
+            pro.push(b);
+            return Ok("_".into());
+        }
         match pat.kind {
             PatKind::Wild => Ok("_".into()),
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
-                // binding mode after match ergonomics
-                if let Some(hir::BindingMode(hir::ByRef::Yes(_, mutbl), _)) = self.typeck.pat_binding_modes().get(hid)
-                    && mutbl.is_mut()
-                {
-                    return unsup("binding by mutable reference (match ergonomics)");
-                }
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 if m.is_mut() {
@@ -2718,7 +2773,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         Ok(n)
                     }
                     Some(s) => {
-                        let inner = self.pat_rec(s, conds, pro)?;
+                        let inner = self.pat_rec(s, conds, pro, None)?;
                         Ok(format!("{} @ {}", n, if inner.contains(' ') { format!("({})", inner) } else { inner }))
                     }
                 }
@@ -2729,27 +2784,39 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 if n < 2 { return unsup("tuple pattern with fewer than 2 components") }
                 let mut parts = vec![];
-                for p in expand_dotdot(ps, ddpos, n) {
-                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro)?, None => "_".into() });
+                for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
+                    let pl = place.as_ref().and_then(|r| self.place_field(r, t, k));
+                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro, pl)?, None => "_".into() });
                 }
                 Ok(format!("({})", parts.join(", ")))
             }
             PatKind::TupleStruct(ref qp, ps, ddpos) => {
                 let (adt, vidx) = self.pat_variant(qp, pat)?;
+                let t = self.pat_ty(pat).peel_refs();
                 let n = self.tcx.adt_def(adt).variant(vidx.into()).fields.len();
                 let mut parts = vec![];
-                for p in expand_dotdot(ps, ddpos, n) {
-                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro)?, None => "_".into() });
+                for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
+                    // into `Some`: AutoCorrode's `focus_option`; into a struct: its field
+                    let pl = place.as_ref().and_then(|r| {
+                        if self.fe.std_adt(adt) == Some("Option") {
+                            Some(Tr::new(format!("\\<llangle>focus_option\\<rrangle>\\<^sub>1({})", r.s), 999))
+                        } else {
+                            self.place_field(r, t, k)
+                        }
+                    });
+                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro, pl)?, None => "_".into() });
                 }
                 self.ctor_pat(adt, vidx, parts)
             }
             PatKind::Struct(ref qp, fields, _) => {
                 let (adt, vidx) = self.pat_variant(qp, pat)?;
+                let t = self.pat_ty(pat).peel_refs();
                 let n = self.tcx.adt_def(adt).variant(vidx.into()).fields.len();
                 let mut parts = vec!["_".to_string(); n];
                 for f in fields.iter() {
                     let idx = self.typeck.field_index(f.hir_id).as_usize();
-                    parts[idx] = self.pat_rec(f.pat, conds, pro)?;
+                    let pl = place.as_ref().and_then(|r| self.place_field(r, t, idx));
+                    parts[idx] = self.pat_rec(f.pat, conds, pro, pl)?;
                 }
                 self.ctor_pat(adt, vidx, parts)
             }
@@ -2776,17 +2843,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 for p in ps.iter() {
                     let mut c2 = vec![];
                     let mut p2 = vec![];
-                    parts.push(self.pat_rec(p, &mut c2, &mut p2)?);
+                    parts.push(self.pat_rec(p, &mut c2, &mut p2, None)?);
                     if !c2.is_empty() || !p2.is_empty() { return unsup("or-pattern with literal sub-patterns or mutable bindings") }
                 }
                 Ok(parts.join(" | "))
             }
-            PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro),
+            PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro, place),
             PatKind::Slice(before, None, after) if after.is_empty() => {
                 let t = self.pat_ty(pat).peel_refs();
                 if !matches!(t.kind(), ty::Slice(_) | ty::Array(..)) { return unsup("slice pattern") }
                 let mut parts = vec![];
-                for p in before.iter() { parts.push(self.pat_rec(p, conds, pro)?); }
+                for p in before.iter() { parts.push(self.pat_rec(p, conds, pro, None)?); }
                 Ok(format!("[{}]", parts.join(", ")))
             }
             PatKind::Slice(..) => unsup("slice pattern with a rest pattern"),
@@ -2810,8 +2877,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Some("Box") => return parts.into_iter().next().ok_or(Unsup("box pattern".into())),
             Some(_) => return unsup("pattern on a standard library type"),
             None if !adt.is_local() => match self.fe.ext_ctor(adt, vidx) {
-                Some(c) if parts.is_empty() => c,
-                _ => return unsup("pattern on an external type"),
+                Some((c, _)) => c,
+                None => return unsup("pattern on an external type"),
             },
             None => self.fe.variant_ctor_name(adt, vidx),
         };
@@ -2880,38 +2947,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
         let gargs = tcx.instantiate_bound_regions_with_erased(gargs);
-        // passed for a type parameter of a local function: the generic function calls it only
-        // through its `Fn` bound (a placeholder), while the call would put the two functions in
-        // one recursion group, where that type parameter is fixed
-        // (through `&` and temporaries; a function item passed through a local variable is not
-        // seen here)
-        let mut arg = e;
-        let mut parent = tcx.parent_hir_node(e.hir_id);
-        while let hir::Node::Expr(p) = parent
-            && matches!(p.kind, ExprKind::AddrOf(..) | ExprKind::DropTemps(_))
-        {
-            arg = p;
-            parent = tcx.parent_hir_node(p.hir_id);
-        }
-        if let hir::Node::Expr(p) = parent {
-            let (callee, pos) = match p.kind {
-                ExprKind::Call(c, args) => (
-                    match *self.ty_of(c).kind() { ty::FnDef(d, _) => Some(d), _ => None },
-                    args.iter().position(|a| a.hir_id == arg.hir_id),
-                ),
-                ExprKind::MethodCall(_, _, args, _) => (
-                    self.typeck.type_dependent_def_id(p.hir_id),
-                    args.iter().position(|a| a.hir_id == arg.hir_id).map(|i| i + 1),
-                ),
-                _ => (None, None),
-            };
-            if let (Some(d), Some(i)) = (callee, pos)
-                && d.is_local()
-                && matches!(tcx.fn_sig(d).instantiate_identity().skip_binder().inputs().get(i).map(|t| t.peel_refs().kind()), Some(ty::Param(_)))
-            {
-                return unsup("function item passed for a type parameter of a local function");
-            }
-        }
         let (target, targs) = if self.fe.is_trait_item(did) {
             match ty::Instance::try_resolve(tcx, self.typing_env(), did, gargs) {
                 Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) => (rd, args),

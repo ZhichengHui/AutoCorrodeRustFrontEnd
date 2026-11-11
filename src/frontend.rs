@@ -17,7 +17,7 @@ use crate::names;
 pub type FnKey<'tcx> = (DefId, Option<GenericArgsRef<'tcx>>);
 
 /// Instances of one generic function at most; more (e.g. polymorphic recursion) are not translated.
-pub const MAX_INSTANCES: usize = 16;
+pub const MAX_INSTANCES: usize = 64;
 
 /// Insertion-ordered set of functions (DefId is not `Ord`).
 #[derive(Default, Clone)]
@@ -38,9 +38,14 @@ impl<'tcx> DefSet<'tcx> {
 pub struct ExtType {
     pub arity: usize,
     pub comment: String,
-    /// the constructors of an enum without type arguments whose variants have no fields: the
-    /// type is declared as a datatype with these constructors
-    pub ctors: Vec<String>,
+    /// For an enum, or a struct whose fields are all public, whose field types all have uRust
+    /// models: its datatype's type parameters (the type parameters, then the associated types
+    /// in its fields, see `adt_projs`), and its constructors with their field types. Otherwise
+    /// (empty) the type is declared abstractly.
+    pub ctors: Vec<(String, Vec<String>)>,
+    pub params: Vec<String>,
+    /// the external types its fields use
+    pub deps: Vec<String>,
 }
 
 /// An external (or foreign) function for which a template definition is emitted.
@@ -448,7 +453,7 @@ impl<'tcx> Frontend<'tcx> {
         let name = format!("unsupported_{}", names::ident_chars(desc));
         if !self.ext_types.contains_key(&name) {
             let comment = self.placeholder(&format!("type {}", desc), None);
-            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![] });
+            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
         }
         name
     }
@@ -569,14 +574,14 @@ impl<'tcx> Frontend<'tcx> {
                 ty::IntTy::I16 => "16 sword".into(),
                 ty::IntTy::I32 => "32 sword".into(),
                 ty::IntTy::I64 | ty::IntTy::Isize => "64 sword".into(),
-                ty::IntTy::I128 => self.placeholder_type("i128", 0),
+                ty::IntTy::I128 => "128 sword".into(),
             },
             ty::Uint(ut) => match ut {
                 ty::UintTy::U8 => "8 word".into(),
                 ty::UintTy::U16 => "16 word".into(),
                 ty::UintTy::U32 => "32 word".into(),
                 ty::UintTy::U64 | ty::UintTy::Usize => "64 word".into(),
-                ty::UintTy::U128 => self.placeholder_type("u128", 0),
+                ty::UintTy::U128 => "128 word".into(),
             },
             ty::Float(ft) => self.placeholder_type(&format!("{:?}", ft).to_lowercase(), 0),
             ty::Str => "String.literal".into(),
@@ -731,29 +736,126 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(format!("ext_{}", names::ident_chars(&segs.join("_"))), |n| {
             self.ext_types.contains_key(n) || self.used_type_names.contains(n)
         });
-        let ctors = match self.tcx.def_kind(did) {
-            DefKind::Enum if arity == 0 => {
-                let def = self.tcx.adt_def(did);
-                if !def.variants().is_empty() && def.variants().iter().all(|v| v.fields.is_empty()) {
-                    def.variants().iter().map(|v| format!("{}_{}", n, names::ident_chars(v.name.as_str()))).collect()
-                } else {
-                    vec![]
-                }
-            }
-            _ => vec![],
-        };
-        self.ext_types.insert(n.clone(), ExtType { arity, comment: format!("Rust: {}", self.tcx.def_path_str(did)), ctors });
+        let comment = format!("Rust: {}", self.tcx.def_path_str(did));
+        self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
         self.ext_type_ids.insert(did, n.clone());
+        if let Some((params, ctors, deps)) = self.ext_datatype(did, &n) {
+            let t = self.ext_types.get_mut(&n).expect("registered above");
+            (t.params, t.ctors, t.deps) = (params, ctors, deps);
+        }
         n
     }
 
-    /// The constructor of the variant `vidx` of the external enum `adt` when it is declared with
-    /// its constructors (see `ExtType::ctors`).
-    pub fn ext_ctor(&mut self, adt: DefId, vidx: usize) -> Option<String> {
-        if self.tcx.def_kind(adt) != DefKind::Enum { return None }
+    /// The datatype of the external ADT `did` (named `n`), if it is an enum or a struct with only
+    /// public fields, without const parameters, whose field types all have uRust models (see
+    /// `ExtType`). Its associated types become `adt_projs`, as for local ADTs.
+    fn ext_datatype(&mut self, did: DefId, n: &str) -> Option<(Vec<String>, Vec<(String, Vec<String>)>, Vec<String>)> {
+        let tcx = self.tcx;
+        if !matches!(tcx.def_kind(did), DefKind::Enum | DefKind::Struct) { return None }
+        let def = tcx.adt_def(did);
+        if def.variants().is_empty() || (def.is_struct() && !def.non_enum_variant().fields.iter().all(|f| f.vis.is_public())) {
+            return None;
+        }
+        if tcx.generics_of(did).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. })) {
+            return None;
+        }
+        let (own, env) = (ty::GenericArgs::identity_for_item(tcx, did), ty::TypingEnv::post_analysis(tcx, did));
+        let ftys: Vec<Vec<Ty<'tcx>>> =
+            def.variants().iter().map(|v| v.fields.iter().map(|f| field_ty(tcx, f, own, env)).collect()).collect();
+        let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
+        let projs = self.projections(did, &all);
+        let proj_names: Vec<String> = (0..projs.len()).map(|k| format!("'proj{}", k)).collect();
+        let saved = self.proj_tvars.take();
+        self.proj_tvars = Some(
+            projs
+                .iter()
+                .zip(proj_names.iter())
+                .map(|(p, v)| match p.kind() {
+                    ty::Alias(_, a) => (*a, v.clone()),
+                    _ => unreachable!("projections are aliases"),
+                })
+                .collect(),
+        );
+        // modelled, checked without recording anything first
+        let modelled = all.iter().all(|t| self.ty_dry(*t).1);
+        let result = modelled.then(|| {
+            let ctors: Vec<(String, Vec<String>)> = def
+                .variants()
+                .iter()
+                .zip(&ftys)
+                .map(|(v, ts)| {
+                    let c = if def.is_struct() { format!("make_{}", n) } else { format!("{}_{}", n, names::ident_chars(v.name.as_str())) };
+                    (c, ts.iter().map(|t| self.ty(*t)).collect())
+                })
+                .collect();
+            let mut deps = vec![];
+            for t in &all {
+                for g in t.walk() {
+                    if let Some(ty::Adt(d, _)) = g.as_type().map(|x| x.kind())
+                        && let Some(m) = self.ext_type_ids.get(&d.did())
+                        && m != n
+                        && !deps.contains(m)
+                    {
+                        deps.push(m.clone());
+                    }
+                }
+            }
+            let mut params: Vec<String> = own.types().map(|t| self.ty(t)).collect();
+            params.extend(proj_names.iter().cloned());
+            (params, ctors, deps)
+        });
+        self.proj_tvars = saved;
+        if result.is_some() && !projs.is_empty() {
+            self.adt_projs.insert(did, projs);
+        }
+        result
+    }
+
+    /// Register the external ADTs occurring in `tys`: whether such a datatype takes associated
+    /// types as parameters (`adt_projs`) must be known before the projections of types using it
+    /// are computed (see `projections`).
+    pub fn register_ext_adts(&mut self, tys: &[Ty<'tcx>]) {
+        for &t in tys {
+            let mut w = t.walk();
+            while let Some(g) = w.next() {
+                let Some(x) = g.as_type() else { continue };
+                match x.kind() {
+                    // parts without a HOL counterpart (see `ty`)
+                    ty::Alias(..) | ty::RawPtr(..) | ty::FnPtr(..) | ty::Dynamic(..) => w.skip_current_subtree(),
+                    ty::Adt(d, a) => match self.hol_kept_args(d.did()) {
+                        Some(k) => {
+                            w.skip_current_subtree();
+                            let kept: Vec<Ty<'tcx>> = a.types().take(k).collect();
+                            self.register_ext_adts(&kept);
+                        }
+                        None if !d.did().is_local() && self.std_adt(d.did()).is_none() => {
+                            self.ext_type(d.did(), a.types().count());
+                        }
+                        None => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// For a standard ADT modelled by a HOL type that keeps only its first type arguments (see
+    /// `ty`), how many it keeps (e.g. `Vec<T, A>` is `T list`).
+    pub fn hol_kept_args(&self, did: DefId) -> Option<usize> {
+        match self.std_adt(did)? {
+            "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" => Some(1),
+            "String" | "Ordering" | "Formatter" | "FmtError" => Some(0),
+            _ => None,
+        }
+    }
+
+    /// The constructor of the variant `vidx` of the external ADT `adt` when it is declared with
+    /// its constructors (see `ExtType::ctors`), and whether the variant has fields.
+    pub fn ext_ctor(&mut self, adt: DefId, vidx: usize) -> Option<(String, bool)> {
+        if !matches!(self.tcx.def_kind(adt), DefKind::Enum | DefKind::Struct) { return None }
         let arity = self.tcx.generics_of(adt).own_counts().types;
         let n = self.ext_type(adt, arity);
-        self.ext_types.get(&n).and_then(|t| t.ctors.get(vidx).cloned())
+        self.ext_types.get(&n).and_then(|t| t.ctors.get(vidx)).map(|(c, fs)| (c.clone(), !fs.is_empty()))
     }
 
     // ------------------------------------------------------------------

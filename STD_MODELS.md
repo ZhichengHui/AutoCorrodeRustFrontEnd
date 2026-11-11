@@ -20,7 +20,8 @@
 |---|---|---|
 | `u8`…`u64`、`usize` | `N word`（`usize` 为 `64 word`） | 假设 64 位平台；溢出按 debug 构建的语义 panic |
 | `i8`…`i64`、`isize` | `N sword`（`'l signed word`，`isize` 为 `64 sword`） | 同上；运算由 AutoCorrode `Numeric_Types` 定义，溢出、除法、取余、移位、比较、取负均按 Rust 的 debug 语义 |
-| `i128`、`u128`、`f32`、`f64` | 无模型：占位类型，登记为占位符 | |
+| `i128`、`u128` | `128 sword`、`128 word` | 同上 |
+| `f32`、`f64` | 无模型：占位类型，登记为占位符 | |
 | `bool` | `bool` | |
 | `char` | HOL `char` | HOL `char` 只有 256 个值；非 ASCII 的字面量登记为占位符，其他来源的非 ASCII 字符无法表示 |
 | `str` | `String.literal` | 只能表示 ASCII；非 ASCII 字面量登记为占位符 |

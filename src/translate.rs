@@ -210,6 +210,8 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     // groups come after the ADTs they use
     for comp in &adt_sccs {
         for &d in comp {
+            // external ADTs in the fields first: their datatypes may take associated types too
+            fe.register_ext_adts(&fields[&d]);
             let ps = fe.projections(d, &fields[&d]);
             if !ps.is_empty() {
                 fe.adt_projs.insert(d, ps);
@@ -330,6 +332,17 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
         self.tcx
     }
 
+    // a mutable local (or parameter) of a type with generic parameters needs a locale prism for
+    // that type, which only an instance has
+    fn visit_pat(&mut self, p: &'tcx hir::Pat<'tcx>) {
+        if let hir::PatKind::Binding(hir::BindingMode(_, hir::Mutability::Mut), ..) = p.kind
+            && self.typeck.pat_ty(p).has_param()
+        {
+            self.dependent = true;
+        }
+        intravisit::walk_pat(self, p);
+    }
+
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
         if let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) {
             self.call(did, self.typeck.node_args(e.hir_id));
@@ -346,7 +359,8 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
 }
 
 /// The generic functions translated per instance: trait default methods, and generic functions
-/// with a call depending on their generic parameters, directly or through other such functions.
+/// with a call depending on their generic parameters or a mutable local of a generic type,
+/// directly or through other such functions.
 fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefId]) -> HashSet<DefId> {
     let tcx = fe.tcx;
     let mut mono: HashSet<DefId> = default_methods.iter().copied().collect();
@@ -436,6 +450,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         };
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
         if key.1.is_none() {
+            fe.register_ext_adts(&tys);
             fe.proj_tvars = proj_tvars(fe, did, &tys);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");
@@ -834,6 +849,10 @@ fn emit_ext_funs(funs: &std::collections::BTreeMap<String, ExtFun>, what: &str) 
     out
 }
 
+/// Generated definitions may have type variables in their bodies only (e.g. the element type of an
+/// empty list that is only measured): `StdLib_Frontend_Models` instantiates them with `unit`.
+const GROUND: &str = "declare [[urust_ground_body_types]]\n\n";
+
 fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_text: String) {
     let c = &opts.name;
     let dir = Path::new(&opts.out_dir);
@@ -844,10 +863,11 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     // external / placeholder types
     let mut te = header(&format!("{}_TypesExternal_Template", c));
     te.push_str("  imports \"Micro_Rust_Std_Lib.Micro_Rust_Std_Lib\"\nbegin\n\n");
+    te.push_str(GROUND);
     te.push_str("text \\<open>Types without a uRust model. Replace these declarations by models.\\<close>\n\n");
     for (n, t) in &fe.ext_types {
         if !t.ctors.is_empty() {
-            writeln!(te, "(* {} *)\ndatatype {} = {}\n", cmt(&t.comment), n, t.ctors.join(" | ")).unwrap();
+            continue;
         } else if t.arity == 0 {
             writeln!(te, "(* {} *)\ntypedecl {}\n", cmt(&t.comment), n).unwrap();
         } else {
@@ -859,10 +879,40 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
             writeln!(te, "(* {} *)\ndatatype ({}) {} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
         }
     }
+    // the external ADTs declared with their constructors (see `ExtType::ctors`), each after the
+    // ones its fields use; types using each other are one datatype declaration
+    let mut left: Vec<&String> = fe.ext_types.iter().filter(|(_, t)| !t.ctors.is_empty()).map(|(n, _)| n).collect();
+    let mut mks = String::new();
+    while !left.is_empty() {
+        let ready: Vec<&String> =
+            left.iter().copied().filter(|n| fe.ext_types[*n].deps.iter().all(|d| !left.contains(&d))).collect();
+        let group = if ready.is_empty() { left.clone() } else { vec![ready[0]] };
+        let mut decls = vec![];
+        for n in &group {
+            let t = &fe.ext_types[*n];
+            let head = if t.params.is_empty() { (*n).clone() } else { format!("({}) {}", t.params.join(", "), n) };
+            let ctors: Vec<String> = t
+                .ctors
+                .iter()
+                .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
+                .collect();
+            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
+            decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            for (c, fs) in &t.ctors {
+                if !fs.is_empty() {
+                    mks.push_str(&ctor_fun(&format!("{}_mk", c), c, fs, &head));
+                }
+            }
+        }
+        writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+        left.retain(|n| !group.contains(n));
+    }
+    te.push_str(&mks);
     te.push_str("end\n");
 
     let mut ty = header(&format!("{}_Types", c));
     writeln!(ty, "  imports {}_TypesExternal_Template\nbegin\n", c).unwrap();
+    ty.push_str(GROUND);
     ty.push_str(&types_text);
     ty.push_str("end\n");
 
@@ -895,7 +945,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     let mut fx = header(&format!("{}_FunsExternal_Template", c));
     writeln!(
         fx,
-        "  imports {}_Locale\nbegin\n\ntext \\<open>Functions without a definition in this crate. Replace the bodies by uRust models.\\<close>\n\ncontext {}\nbegin\n",
+        "  imports {}_Locale\nbegin\n\n{GROUND}text \\<open>Functions without a definition in this crate. Replace the bodies by uRust models.\\<close>\n\ncontext {}\nbegin\n",
         c, ctx
     )
     .unwrap();
@@ -905,7 +955,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     let mut ff = header(&format!("{}_FunsForeign_Template", c));
     writeln!(
         ff,
-        "  imports {}_Locale\nbegin\n\ntext \\<open>Functions declared in \\<^verbatim>\\<open>extern\\<close> blocks. They cannot be replaced by uRust models; their contracts must also state memory effects.\\<close>\n\ncontext {}\nbegin\n",
+        "  imports {}_Locale\nbegin\n\n{GROUND}text \\<open>Functions declared in \\<^verbatim>\\<open>extern\\<close> blocks. They cannot be replaced by uRust models; their contracts must also state memory effects.\\<close>\n\ncontext {}\nbegin\n",
         c, ctx
     )
     .unwrap();
@@ -913,7 +963,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     ff.push_str("end\n\nend\n");
 
     let mut fu = header(&format!("{}_Funs", c));
-    writeln!(fu, "  imports {}_FunsExternal_Template {}_FunsForeign_Template\nbegin\n\ncontext {}\nbegin\n", c, c, ctx).unwrap();
+    writeln!(fu, "  imports {}_FunsExternal_Template {}_FunsForeign_Template\nbegin\n\n{GROUND}context {}\nbegin\n", c, c, ctx).unwrap();
     for ic in &fe.item_comments {
         writeln!(fu, "(* {} *)", cmt(ic)).unwrap();
     }
