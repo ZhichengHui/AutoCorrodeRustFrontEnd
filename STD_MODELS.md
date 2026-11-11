@@ -148,6 +148,22 @@
 
 丢掉的语义：`process::exit` 和 `abort` 不是 panic；panic 消息中的格式化参数。
 
+### 格式化（`format!`、`write!`）
+| Rust | 模型 | 来源 | 位置 |
+|---|---|---|---|
+| `fmt::Formatter` | `fmt_Formatter`（输出缓冲区与 `FormattingOptions` 的 flags、width、precision） | AutoCorrode `StdLib_Fmt` | `Frontend::ty` |
+| `fmt::Error` | `fmt_Error` | AutoCorrode `StdLib_Fmt` | `Frontend::ty`、`unit_ctor` |
+| `alloc::fmt::format`（`format!`）、`Formatter` 上的 `write_fmt`（`write!(f, …)`） | 按 `core::fmt::write` 解释 `format_args!` 的展开：前端解码模板字节串，字面片段用 `fmt_write_str`/`fmt_write_char` 写出；每个占位符按它的选项新建一个 formatter，用 `rt::Argument` 构造函数所约束的格式化 trait 的 `fmt`（在参数类型上解析，引用和 `Box` 先剥去，因为它们的实现只转发给内容：本地实现直接调用，基本类型用下面的模型）写入，再把输出写到目标；每次写入（字面片段、格式化、写回输出）的错误都结束输出并作为结果，与 `fmt::write` 中的 `?` 相同，`format` 遇到错误时 panic；动态宽度或精度（`rt::Argument::from_usize`）大于 `u16::MAX` 时在构造参数时 panic；`rt::Argument::new_debug_noop` 不输出任何内容；格式化 trait 是 `rt::Argument` 构造函数的约束（`Frontend::fmt_traits`），其中 `Pointer` 对引用的实现打印地址，不剥去引用（没有模型） | 前端写法 + `StdLib_Fmt` | `fmt_call` |
+| `Display`、`Debug`、`LowerHex`、`UpperHex`、`Octal`、`Binary` 的 `fmt`，用于无符号与有符号整数、`bool`、`char`、`str`、`String` | `fmt_<Trait>_<word|sword|bool|char|str>`，按 `core::fmt` 的实现移植（填充、对齐、宽度、精度、`+`、`#`、`0`、`x?`） | AutoCorrode `StdLib_Fmt` | `fmt_arg_call`、`std_call` |
+| `Formatter` 的 `write_str`、`write_char`、`pad`、`pad_integral`、`alternate`、`sign_plus`、`sign_minus`、`sign_aware_zero_pad`、`width`、`precision`、`fill`；`fmt::Write::write_str`/`write_char`（在 `Formatter` 上） | `fmt_<方法名>` | AutoCorrode `StdLib_Fmt` | `std_fn`/`std_call` |
+
+与 Rust 的差别：字符串是 `String.literal`，只能表示 ASCII，输出中出现非 ASCII 字符时模型中止；目标是 `fmt::Write` 的其他实现（例如 `String`、`io::Write`）时没有模型。没有模型（登记为占位符）：浮点数、指针等其他类型的格式化，派生的 `Debug`，泛型参数类型的值的格式化，作为值传递的 `fmt::Arguments`。
+
+### 恒等形状的函数
+| Rust | 模型 | 来源 | 位置 |
+|---|---|---|---|
+| 形如 `fn<T>(T) -> T`、类型参数没有带方法的约束的标准库函数（`hint::must_use`、`convert::identity`、`hint::black_box`） | 恒等 | 前端写法 | `std_call`（`identity_shaped`） |
+
 ### 内存
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|

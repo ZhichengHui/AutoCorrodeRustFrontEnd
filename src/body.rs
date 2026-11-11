@@ -241,6 +241,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// definition's body alone, which Isabelle turns into an extra `itself` parameter of the
     /// constant, so that no call of it type-checks: it is stated as `unit`.
     fn hty(&mut self, t: Ty<'tcx>) -> String {
+        // normalised as the signature is (`translate`): in a generic body, in the item's own typing
+        // environment, which also reveals its `impl Trait` types; an instance's types are already
+        let t = match self.args {
+            None => self
+                .tcx
+                .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
+                .unwrap_or(t),
+            Some(_) => t,
+        };
         let t = match self.shown {
             Some(a) => ty::EarlyBinder::bind(self.tcx, t).instantiate(self.tcx, a).skip_normalization(),
             None => t,
@@ -930,6 +939,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 };
                 let gargs = self.node_args(e.hir_id);
                 let arg_exprs: Vec<&'tcx hir::Expr<'tcx>> = std::iter::once(recv).chain(args).collect();
+                if let Some(t) = self.fmt_call(did, &arg_exprs, e)? {
+                    return Ok(t);
+                }
                 let argv = self.vals(arg_exprs.iter().copied())?;
                 self.call_def(did, gargs, argv, &arg_exprs, e)
             }
@@ -1111,8 +1123,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             LitKind::Char(c) => Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char(*c)?))),
             LitKind::Str(s, _) => {
                 let s = s.as_str();
-                if !names::hol_string_ok(s) { return unsup("string literal with non-ASCII or special characters") }
-                Ok(Tr::atom(format!("\\<llangle>STR ''{}''\\<rrangle>", s)))
+                if names::hol_string_ok(s) {
+                    return Ok(Tr::atom(format!("\\<llangle>STR ''{}''\\<rrangle>", s)));
+                }
+                // other ASCII characters cannot be written in `''…''`: the concatenation of the
+                // printable runs and of the other characters, each as a one-character string
+                let pieces: Vec<String> = hol_str_pieces(s)?
+                    .into_iter()
+                    .map(|p| match p {
+                        StrPiece::Str(r) => format!("STR ''{}''", r),
+                        StrPiece::Char(c) => format!("String.implode [{}]", c),
+                    })
+                    .collect();
+                Ok(Tr::atom(format!("\\<llangle>({})\\<rrangle>", pieces.join(" + "))))
             }
             LitKind::Float(..) => unsup("floating-point literal"),
             // `b"…"`: the list of its bytes (byte arrays and slices are `8 word list`)
@@ -1140,7 +1163,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Res::Def(DefKind::Const | DefKind::AssocConst { .. }, did) | Res::Def(DefKind::Static { .. }, did) => {
                 self.const_use(did, e)
             }
-            Res::Def(DefKind::Fn | DefKind::AssocFn, _) => unsup("function item used as a value"),
+            Res::Def(DefKind::Fn | DefKind::AssocFn, _) => self.fn_item_value(e),
             Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) => unsup("constructor used as a function value"),
             _ => unsup(format!("path `{}`", self.fe.snippet(e.span))),
         }
@@ -1163,6 +1186,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         self.opaque_adt(adt)?;
         match self.fe.std_adt(adt) {
             Some("Option") => return Ok(Tr::atom("None")),
+            Some("FmtError") => return Ok(Tr::atom("fmt_Error")),
             Some("Ordering") => {
                 let v = self.tcx.adt_def(adt).variant(vidx.into()).name.to_string();
                 return Ok(Tr::atom(format!("Ordering::{}", v)));
@@ -1170,7 +1194,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             _ => {}
         }
         if !adt.is_local() {
-            return unsup("constructor of an external type");
+            return match self.fe.ext_ctor(adt, vidx) {
+                Some(c) => Ok(Tr::atom(c)),
+                None => unsup("constructor of an external type"),
+            };
         }
         Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx)))
     }
@@ -1379,6 +1406,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let res = self.typeck.qpath_res(qp, callee.hir_id);
         match res {
             Res::Def(DefKind::Fn | DefKind::AssocFn, did) => {
+                let arg_refs: Vec<&'tcx hir::Expr<'tcx>> = args.iter().collect();
+                if let Some(t) = self.fmt_call(did, &arg_refs, e)? {
+                    return Ok(t);
+                }
                 if let Some(t) = self.panic_or_print(did, args, e.span)? {
                     return Ok(t);
                 }
@@ -1433,6 +1464,244 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             _ => unsup("call target"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Formatting (`format!`, `write!`): AutoCorrode's `StdLib_Fmt`
+    // ------------------------------------------------------------------
+
+    /// The formatting trait `t`, by its name, if it is one (see `Frontend::fmt_traits`).
+    fn fmt_trait(&self, t: DefId) -> Option<&str> {
+        self.fe.fmt_traits.iter().find(|(d, _)| *d == t).map(|(_, n)| n.as_str())
+    }
+
+    fn is_formatter(&self, t: Ty<'tcx>) -> bool {
+        matches!(t.peel_refs().kind(), ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("Formatter"))
+    }
+
+    /// The model of the formatting trait `tr`'s `fmt` for the primitive type `t` (see `StdLib_Fmt`).
+    fn fmt_model(&self, tr: &str, t: Ty<'tcx>) -> Option<String> {
+        let kind = match t.kind() {
+            ty::Uint(u) if *u != ty::UintTy::U128 => "word",
+            ty::Int(i) if *i != ty::IntTy::I128 => "sword",
+            ty::Bool => "bool",
+            ty::Char => "char",
+            ty::Str => "str",
+            ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String") => "str",
+            _ => return None,
+        };
+        let integer = matches!(kind, "word" | "sword");
+        let modelled = match tr {
+            "Display" | "Debug" => true,
+            "LowerHex" | "UpperHex" | "Octal" | "Binary" => integer,
+            _ => false,
+        };
+        modelled.then(|| format!("fmt_{}_{}", tr, kind))
+    }
+
+    fn is_fmt_arguments(&self, t: Ty<'tcx>) -> bool {
+        matches!(t.kind(), ty::Adt(d, _) if self.tcx.is_lang_item(d.did(), LangItem::FormatArguments))
+    }
+
+    /// A call of a standard library function that writes out a `format_args!` expansion:
+    /// `alloc::fmt::format` (the `String` it returns, `format!`) and `write_fmt` on a
+    /// `Formatter` (`write!(f, …)`, into the formatter).
+    fn fmt_call(&mut self, did: DefId, args: &[&'tcx hir::Expr<'tcx>], e: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
+        if !self.fe.is_std(did) { return Ok(None) }
+        let Some(pos) = args.iter().position(|a| self.is_fmt_arguments(self.ty_of(a))) else { return Ok(None) };
+        let out = self.ty_of(e);
+        if pos == 0 && args.len() == 1 && matches!(out.kind(), ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String")) {
+            let fa = self.fmt_args(args[0])?;
+            let f = self.fresh("fmt");
+            self.fe.need_alloc("fmt_Formatter");
+            let w = self.fmt_write(&f, &fa)?;
+            let r = self.fresh("fmt_r");
+            // `alloc::fmt::format` expects the result: an error is a panic
+            return Ok(Some(Tr::block(format!(
+                "{{ let mut {f} = fmt_formatter_new({FMT_DEFAULT_FLAGS}_u32, 0_u16, 0_u16);\nlet {r} = {w};\nmatch {r} {{\n  Ok(_) \\<Rightarrow> fmt_formatter_buf(* {f}),\n  Err(_) \\<Rightarrow> panic!(\"a formatting trait implementation returned an error when the underlying stream did not\")\n}}\n}}"
+            ))));
+        }
+        if pos == 1 && args.len() == 2 && self.is_formatter(self.ty_of(args[0])) {
+            let recv = self.val(args[0])?;
+            let fa = self.fmt_args(args[1])?;
+            let f = self.fresh("fmt");
+            let w = self.fmt_write(&f, &fa)?;
+            return Ok(Some(Tr::block(format!("{{ let {} = {};\n{} }}", f, recv.at(20), w))));
+        }
+        Ok(None)
+    }
+
+    /// The parts of a `format_args!` expansion `e`: `fmt::Arguments::from_str(lit)`, or
+    /// `{ super let args = (&a, ..); super let args = [rt::Argument::new_display(args.0), ..];
+    /// unsafe { fmt::Arguments::new(template, &args) } }`.
+    fn fmt_args(&self, e: &'tcx hir::Expr<'tcx>) -> R<FmtArgs<'tcx>> {
+        let tcx = self.tcx;
+        let e = Self::strip_drop_temps(e);
+        let callee_of = |c: &'tcx hir::Expr<'tcx>| match *self.ty_of(c).kind() {
+            ty::FnDef(d, _) => Some(d),
+            _ => None,
+        };
+        let on_lang_type = |d: DefId, l: LangItem| {
+            tcx.impl_of_assoc(d).is_some_and(|i| matches!(tcx.type_of(i).instantiate_identity().skip_normalization().kind(), ty::Adt(a, _) if tcx.is_lang_item(a.did(), l)))
+        };
+        match e.kind {
+            // a template without placeholders
+            ExprKind::Call(c, [lit]) if callee_of(c).is_some_and(|d| on_lang_type(d, LangItem::FormatArguments)) => {
+                let ExprKind::Lit(l) = lit.kind else { return unsup("string formatting (format!)") };
+                let LitKind::Str(s, _) = l.node else { return unsup("string formatting (format!)") };
+                Ok(FmtArgs { vals: vec![], args: vec![], parts: vec![FmtPart::Lit(s.to_string())] })
+            }
+            ExprKind::Block(b, _) => {
+                let ([l1, l2], Some(inner)) = (b.stmts, b.expr) else { return unsup("string formatting (format!)") };
+                let (StmtKind::Let(l1), StmtKind::Let(l2)) = (l1.kind, l2.kind) else { return unsup("string formatting (format!)") };
+                let (Some(ExprKind::Tup(es)), Some(ExprKind::Array(items))) = (l1.init.map(|x| x.kind), l2.init.map(|x| x.kind)) else {
+                    return unsup("string formatting (format!)");
+                };
+                let vals: Vec<&'tcx hir::Expr<'tcx>> = es
+                    .iter()
+                    .map(|x| match x.kind {
+                        ExprKind::AddrOf(_, hir::Mutability::Not, y) => y,
+                        _ => x,
+                    })
+                    .collect();
+                let mut args = vec![];
+                for it in items {
+                    let ExprKind::Call(c, [fld]) = it.kind else { return unsup("string formatting (format!)") };
+                    let Some(ctor) = callee_of(c).filter(|d| on_lang_type(*d, LangItem::FormatArgument)) else {
+                        return unsup("string formatting (format!)");
+                    };
+                    let ExprKind::Field(..) = fld.kind else { return unsup("string formatting (format!)") };
+                    args.push((ctor, self.typeck.field_index(fld.hir_id).as_usize()));
+                }
+                let ExprKind::Block(ub, _) = Self::strip_drop_temps(inner).kind else { return unsup("string formatting (format!)") };
+                let Some(ExprKind::Call(c, [tmpl, _])) = ub.expr.map(|x| x.kind) else { return unsup("string formatting (format!)") };
+                // `fmt::Arguments::new(template, &args)`
+                if !callee_of(c).is_some_and(|d| on_lang_type(d, LangItem::FormatArguments)) {
+                    return unsup("string formatting (format!)");
+                }
+                let ExprKind::Lit(l) = tmpl.kind else { return unsup("string formatting (format!)") };
+                let LitKind::ByteStr(bs, _) = l.node else { return unsup("string formatting (format!)") };
+                let parts = decode_fmt_template(bs.as_byte_str()).ok_or_else(|| Unsup("string formatting template".into()))?;
+                Ok(FmtArgs { vals, args, parts })
+            }
+            _ => unsup("string formatting (format!)"),
+        }
+    }
+
+    /// Write the expansion `fa` into the formatter (reference) `f`, like `fmt::write`: the
+    /// literal pieces as they are, each placeholder by formatting its argument into a new
+    /// formatter with the placeholder's options and writing out that formatter's output. Every
+    /// write's error ends the output and is the result, as `?` in `fmt::write`. An expression
+    /// of type `fmt::Result`.
+    fn fmt_write(&mut self, f: &str, fa: &FmtArgs<'tcx>) -> R<String> {
+        let tcx = self.tcx;
+        let bad = || Unsup("string formatting template".into());
+        let mut pre = vec![];
+        let mut names = vec![];
+        for v in &fa.vals {
+            let n = self.fresh("fa");
+            let tv = self.val(v)?;
+            pre.push(format!("let {} = {};", n, tv.at(20)));
+            names.push(n);
+        }
+        // `rt::Argument::from_usize` (a dynamic width or precision, the constructor without a
+        // trait bound) panics when the value does not fit in `u16`, when the arguments are built
+        for &(ctor, t) in &fa.args {
+            if self.fmt_arg_trait(ctor).is_none() {
+                pre.push(format!("if {} > 65535_usize {{ panic!(\"Formatting argument out of range\") }};", names[t]));
+            }
+        }
+        // the writes in order: statements, and fallible calls (an error is the result)
+        enum Step {
+            Stmt(String),
+            Call(String),
+        }
+        let mut steps = vec![];
+        let mut next = 0usize;
+        for part in &fa.parts {
+            match part {
+                FmtPart::Lit(s) => {
+                    for piece in hol_str_pieces(s)? {
+                        steps.push(Step::Call(match piece {
+                            StrPiece::Str(r) => format!("fmt_write_str({}, \\<llangle>STR ''{}''\\<rrangle>)", f, r),
+                            StrPiece::Char(c) => format!("fmt_write_char({}, \\<llangle>{}\\<rrangle>)", f, c),
+                        }));
+                    }
+                }
+                FmtPart::Ph { flags, width, precision, width_arg, precision_arg, arg } => {
+                    let i = arg.unwrap_or(next);
+                    next = i + 1;
+                    let count = |j: &Option<usize>, fixed: u16| -> R<String> {
+                        Ok(match j {
+                            Some(j) => format!("({}) as u16", names[fa.args.get(*j).ok_or_else(bad)?.1]),
+                            None => format!("{}_u16", fixed),
+                        })
+                    };
+                    let (w, p) = (count(width_arg, *width)?, count(precision_arg, *precision)?);
+                    let (ctor, t) = *fa.args.get(i).ok_or_else(bad)?;
+                    // `rt::Argument::new_debug_noop` formats nothing
+                    if tcx.item_name(ctor).as_str() == "new_debug_noop" {
+                        continue;
+                    }
+                    let sub = self.fresh("fmt_arg");
+                    self.fe.need_alloc("fmt_Formatter");
+                    let call = self.fmt_arg_call(ctor, fa.vals[t], &names[t], &sub)?;
+                    steps.push(Step::Stmt(format!("let mut {} = fmt_formatter_new({}_u32, {}, {});", sub, flags, w, p)));
+                    steps.push(Step::Call(call));
+                    steps.push(Step::Call(format!("fmt_write_str({}, fmt_formatter_buf(* {}))", f, sub)));
+                }
+            }
+        }
+        let e = self.fresh("fmt_e");
+        let mut acc = "Ok(())".to_string();
+        for step in steps.into_iter().rev() {
+            acc = match step {
+                Step::Stmt(st) => format!("{}\n{}", st, acc),
+                Step::Call(c) => format!("match {} {{\n  Err({}) \\<Rightarrow> Err({}),\n  Ok(_) \\<Rightarrow> {{\n{}\n}}\n}}", c, e, e, acc),
+            };
+        }
+        Ok(format!("{{\n{}\n}}", with_prologue(&pre, &acc)))
+    }
+
+    /// The formatting trait bounding the `rt::Argument` constructor `ctor` (`None` for
+    /// `from_usize`, a count).
+    fn fmt_arg_trait(&self, ctor: DefId) -> Option<DefId> {
+        self.tcx.param_env(ctor).caller_bounds().filter_map(|c| c.as_trait_clause().map(|t| t.def_id())).find(|t| self.fmt_trait(*t).is_some())
+    }
+
+    /// The call formatting the argument `x` (its value is the local `v`) into the formatter
+    /// (reference) `sub`, with the trait that bounds the `rt::Argument` constructor `ctor`: the
+    /// trait's `fmt` resolved at the argument's type. The implementations of the formatting
+    /// traits for references and `Box` forward to the referent (a `Box<T>` is `T` in HOL, see
+    /// `Frontend::ty`), except `Pointer`'s, which print the address.
+    fn fmt_arg_call(&mut self, ctor: DefId, x: &'tcx hir::Expr<'tcx>, v: &str, sub: &str) -> R<String> {
+        let tcx = self.tcx;
+        let Some(tr) = self.fmt_arg_trait(ctor) else { return unsup("string formatting argument without a formatting trait") };
+        let mut t = self.ty_of(x);
+        if !tcx.is_diagnostic_item(sym::Pointer, tr) {
+            loop {
+                match t.kind() {
+                    ty::Ref(_, _, m) if m.is_mut() => return unsup("formatting a mutable reference"),
+                    ty::Ref(_, inner, _) => t = *inner,
+                    ty::Adt(d, a) if d.is_box() => t = a.type_at(0),
+                    _ => break,
+                }
+            }
+        }
+        let Some(fmt_fn) = tcx.associated_items(tr).in_definition_order().find(|i| i.is_fn()).map(|i| i.def_id) else {
+            return unsup("formatting trait without `fmt`");
+        };
+        if let Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) =
+            ty::Instance::try_resolve(tcx, self.typing_env(), fmt_fn, tcx.mk_args(&[t.into()]))
+        {
+            if rd.is_local() && self.fe.local_fn_with_body(rd) && !self.derived(rd) {
+                return Ok(self.local_call(rd, rargs, vec![Tr::atom(v), Tr::atom(sub)])?.s);
+            }
+            if self.fe.is_std(rd) && let Some(n) = self.fmt_trait(tr).and_then(|l| self.fmt_model(l, t)) {
+                return Ok(format!("{}({}, {})", n, v, sub));
+            }
+        }
+        unsup(format!("formatting a value of type `{}`", t))
     }
 
     /// Calls of standard library functions recognised before their (`format_args!`) arguments
@@ -1672,6 +1941,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let owner = match tcx.def_kind(parent) {
             // `Into::into`, `AsRef::as_ref`, `Borrow::borrow` are their traits' only methods
             DefKind::Trait => {
+                if self.fmt_trait(parent).is_some() {
+                    return Some(StdFn::FmtTrait(parent));
+                }
+                // `fmt::Write::write_str`, `write_char` (on a `Formatter`, see `std_call`)
+                if tcx.is_diagnostic_item(Symbol::intern("FmtWrite"), parent) {
+                    return match tcx.item_name(did).as_str() {
+                        "write_str" => Some(StdFn::FmtMethod("fmt_write_str")),
+                        "write_char" => Some(StdFn::FmtMethod("fmt_write_char")),
+                        _ => None,
+                    };
+                }
                 return [sym::Into, sym::AsRef, sym::Borrow]
                     .into_iter()
                     .any(|t| tcx.is_diagnostic_item(t, parent))
@@ -1708,6 +1988,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("uint" | "int", "saturating_sub") => IntOp("saturating_sub"),
             ("uint" | "int", "div_ceil") => IntOp("div_ceil"),
             ("int", "wrapping_add_unsigned") => IntOp("wrapping_add_unsigned"),
+            // the models of AutoCorrode's `StdLib_Fmt`
+            ("Formatter", "write_str") => FmtMethod("fmt_write_str"),
+            ("Formatter", "write_char") => FmtMethod("fmt_write_char"),
+            ("Formatter", "pad") => FmtMethod("fmt_pad"),
+            ("Formatter", "pad_integral") => FmtMethod("fmt_pad_integral"),
+            ("Formatter", "alternate") => FmtMethod("fmt_alternate"),
+            ("Formatter", "sign_plus") => FmtMethod("fmt_sign_plus"),
+            ("Formatter", "sign_minus") => FmtMethod("fmt_sign_minus"),
+            ("Formatter", "sign_aware_zero_pad") => FmtMethod("fmt_sign_aware_zero_pad"),
+            ("Formatter", "width") => FmtMethod("fmt_width"),
+            ("Formatter", "precision") => FmtMethod("fmt_precision"),
+            ("Formatter", "fill") => FmtMethod("fmt_fill"),
             _ => return None,
         })
     }
@@ -1723,6 +2015,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // the table covers standard library functions and derived methods
         if !(self.fe.is_std(target) || self.derived(target)) {
             return Ok(None);
+        }
+        // `fn<T>(x: T) -> T` without bounds (`hint::must_use`, `convert::identity`,
+        // `hint::black_box`): the identity
+        if self.fe.is_std(target) && argv.len() == 1 && self.identity_shaped(target) {
+            return Ok(Some(argv[0].clone()));
         }
         let Some(f) = self.std_fn(orig) else { return Ok(None) };
         let a = |i: usize| -> Tr { argv[i].clone() };
@@ -1772,9 +2069,30 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             VecPop => Some(self.named_call("vec_pop", vec![a(0)])),
             SliceSwap => Some(self.named_call("slice_swap", vec![a(0), a(1), a(2)])),
             VecFromElem => Some(self.named_call("vec_from_elem", vec![a(0), a(1)])),
+            // a method of `Formatter` (or of `fmt::Write` on a `Formatter`)
+            FmtMethod(n) if self.is_formatter(self.ty_adj(arg_exprs[0])) => Some(self.named_call(n, argv.to_vec())),
+            // a formatting trait's `fmt` on a primitive type
+            FmtTrait(tr) => {
+                let label = self.fmt_trait(tr).map(str::to_string);
+                label.and_then(|l| self.fmt_model(&l, self.ty_adj(arg_exprs[0]).peel_refs())).map(|n| self.named_call(&n, vec![a(0), a(1)]))
+            }
             _ => None,
         };
         Ok(r)
+    }
+
+    /// Is `did` a function `fn<T>(T) -> T` whose type parameter has no bound with methods? Its
+    /// only total implementation returns its argument.
+    fn identity_shaped(&self, did: DefId) -> bool {
+        let tcx = self.tcx;
+        let sig = tcx.fn_sig(did).instantiate_identity().skip_binder();
+        let [i] = sig.inputs() else { return false };
+        matches!(i.kind(), ty::Param(_))
+            && sig.output() == *i
+            && tcx.generics_of(did).own_counts().types == 1
+            && tcx.param_env(did).caller_bounds().all(|c| {
+                c.as_trait_clause().is_none_or(|t| tcx.associated_items(t.def_id()).in_definition_order().next().is_none())
+            })
     }
 
     /// Does AutoCorrode's `cmp` apply to the HOL type of `t` (see `Frontend::ty`)? It is defined
@@ -2491,7 +2809,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Some("Option") | Some("Result") | Some("Ordering") => self.tcx.adt_def(adt).variant(vidx.into()).name.to_string(),
             Some("Box") => return parts.into_iter().next().ok_or(Unsup("box pattern".into())),
             Some(_) => return unsup("pattern on a standard library type"),
-            None if !adt.is_local() => return unsup("pattern on an external type"),
+            None if !adt.is_local() => match self.fe.ext_ctor(adt, vidx) {
+                Some(c) if parts.is_empty() => c,
+                _ => return unsup("pattern on an external type"),
+            },
             None => self.fe.variant_ctor_name(adt, vidx),
         };
         if parts.is_empty() { Ok(name) } else { Ok(format!("{}({})", name, parts.join(", "))) }
@@ -2550,6 +2871,67 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tmp = self.fresh("closure");
         copies.push(format!("let {} = {};", tmp, closure.at(20)));
         Ok(Tr::block(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))
+    }
+
+    /// A function item `f` used as a value: the closure `|a1, .., an| f(a1, .., an)` (for a
+    /// local function, or a trait method resolved to a local implementation), with its type
+    /// stated as for closures.
+    fn fn_item_value(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        let tcx = self.tcx;
+        let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
+        let gargs = tcx.instantiate_bound_regions_with_erased(gargs);
+        // passed for a type parameter of a local function: the generic function calls it only
+        // through its `Fn` bound (a placeholder), while the call would put the two functions in
+        // one recursion group, where that type parameter is fixed
+        // (through `&` and temporaries; a function item passed through a local variable is not
+        // seen here)
+        let mut arg = e;
+        let mut parent = tcx.parent_hir_node(e.hir_id);
+        while let hir::Node::Expr(p) = parent
+            && matches!(p.kind, ExprKind::AddrOf(..) | ExprKind::DropTemps(_))
+        {
+            arg = p;
+            parent = tcx.parent_hir_node(p.hir_id);
+        }
+        if let hir::Node::Expr(p) = parent {
+            let (callee, pos) = match p.kind {
+                ExprKind::Call(c, args) => (
+                    match *self.ty_of(c).kind() { ty::FnDef(d, _) => Some(d), _ => None },
+                    args.iter().position(|a| a.hir_id == arg.hir_id),
+                ),
+                ExprKind::MethodCall(_, _, args, _) => (
+                    self.typeck.type_dependent_def_id(p.hir_id),
+                    args.iter().position(|a| a.hir_id == arg.hir_id).map(|i| i + 1),
+                ),
+                _ => (None, None),
+            };
+            if let (Some(d), Some(i)) = (callee, pos)
+                && d.is_local()
+                && matches!(tcx.fn_sig(d).instantiate_identity().skip_binder().inputs().get(i).map(|t| t.peel_refs().kind()), Some(ty::Param(_)))
+            {
+                return unsup("function item passed for a type parameter of a local function");
+            }
+        }
+        let (target, targs) = if self.fe.is_trait_item(did) {
+            match ty::Instance::try_resolve(tcx, self.typing_env(), did, gargs) {
+                Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) => (rd, args),
+                _ => return unsup("function item used as a value"),
+            }
+        } else {
+            (did, gargs)
+        };
+        if !(target.is_local() && self.fe.local_fn_with_body(target) && !self.derived(target)) {
+            return unsup("function item used as a value");
+        }
+        let sig = tcx.instantiate_bound_regions_with_erased(self.ty_of(e).fn_sig(tcx));
+        let ps: Vec<String> = sig.inputs().iter().map(|_| self.fresh("farg")).collect();
+        let tys: Vec<String> = sig.inputs().iter().map(|t| self.hty(*t)).collect();
+        let ret = self.hty(sig.output());
+        let call = self.local_call(target, targs, ps.iter().map(|p| Tr::atom(p.clone())).collect())?;
+        let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
+        let h = self.fe.fun_type(&tys, &ret);
+        let tmp = self.fresh("closure");
+        Ok(Tr::block(format!("{{ let {} = ( {} {{\n{}\n}}); \\<llangle>{} :: {}\\<rrangle> }}", tmp, head, call.s, tmp, h)))
     }
 
     /// The formals and the body of a closure.
@@ -2638,6 +3020,74 @@ impl<'a, 'tcx> Visitor<'tcx> for CaptureMutation<'a, 'tcx> {
     }
 }
 
+/// The flags of `fmt::FormattingOptions::new()`: fill `' '`, alignment unknown.
+const FMT_DEFAULT_FLAGS: u32 = ' ' as u32 | (3 << 29);
+
+/// A `format_args!` expansion (see `BodyTr::fmt_args`): the values formatted (each evaluated
+/// once, in order), the `rt::Argument`s (constructor, index of the value) and the template.
+struct FmtArgs<'tcx> {
+    vals: Vec<&'tcx hir::Expr<'tcx>>,
+    args: Vec<(DefId, usize)>,
+    parts: Vec<FmtPart>,
+}
+
+/// A part of a `fmt::Arguments` template (see `core::fmt::Arguments`).
+enum FmtPart {
+    Lit(String),
+    /// a placeholder: its options, the `rt::Argument`s giving a dynamic width or precision, and
+    /// the `rt::Argument` formatted (`None`: the next one)
+    Ph { flags: u32, width: u16, precision: u16, width_arg: Option<usize>, precision_arg: Option<usize>, arg: Option<usize> },
+}
+
+/// Decode a `fmt::Arguments` template (the byte encoding of `core::fmt::Arguments`, read as
+/// `core::fmt::write` reads it).
+fn decode_fmt_template(b: &[u8]) -> Option<Vec<FmtPart>> {
+    let mut parts = vec![];
+    let mut i = 0usize;
+    let u16_at = |i: usize| -> Option<u16> { Some(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?])) };
+    loop {
+        let n = *b.get(i)?;
+        i += 1;
+        if n == 0 {
+            return Some(parts);
+        } else if n < 0x80 {
+            parts.push(FmtPart::Lit(std::str::from_utf8(b.get(i..i + n as usize)?).ok()?.to_string()));
+            i += n as usize;
+        } else if n == 0x80 {
+            let len = u16_at(i)? as usize;
+            i += 2;
+            parts.push(FmtPart::Lit(std::str::from_utf8(b.get(i..i + len)?).ok()?.to_string()));
+            i += len;
+        } else if n == 0xC0 {
+            parts.push(FmtPart::Ph { flags: FMT_DEFAULT_FLAGS, width: 0, precision: 0, width_arg: None, precision_arg: None, arg: None });
+        } else if n > 0xC0 {
+            let mut flags = FMT_DEFAULT_FLAGS;
+            let (mut width, mut precision, mut arg) = (0u16, 0u16, None);
+            if n & 1 != 0 {
+                flags = u32::from_le_bytes([*b.get(i)?, *b.get(i + 1)?, *b.get(i + 2)?, *b.get(i + 3)?]);
+                i += 4;
+            }
+            if n & 2 != 0 {
+                width = u16_at(i)?;
+                i += 2;
+            }
+            if n & 4 != 0 {
+                precision = u16_at(i)?;
+                i += 2;
+            }
+            if n & 8 != 0 {
+                arg = Some(u16_at(i)? as usize);
+                i += 2;
+            }
+            let width_arg = (n & 16 != 0).then_some(width as usize);
+            let precision_arg = (n & 32 != 0).then_some(precision as usize);
+            parts.push(FmtPart::Ph { flags, width, precision, width_arg, precision_arg, arg });
+        } else {
+            return None;
+        }
+    }
+}
+
 /// The standard library functions with a uRust counterpart (see `std_call`).
 #[derive(Clone, Copy, PartialEq)]
 enum StdFn {
@@ -2674,6 +3124,10 @@ enum StdFn {
     SliceSwap,
     /// an operation of integers, by its AutoCorrode name
     IntOp(&'static str),
+    /// a method of `fmt::Formatter`, by the name of its model
+    FmtMethod(&'static str),
+    /// the `fmt` method of a formatting trait (`Display`, `Debug`, `LowerHex`, ...)
+    FmtTrait(DefId),
 }
 
 /// A lang item, or a diagnostic item by its name in the table of the standard library.
@@ -2740,6 +3194,30 @@ fn contains_let(e: &hir::Expr<'_>) -> bool {
         ExprKind::DropTemps(x) => contains_let(x),
         _ => false,
     }
+}
+
+/// A part of an ASCII string as HOL text: a run of characters printable in `STR ''…''`, or a
+/// single other character (`CHR …`).
+enum StrPiece {
+    Str(String),
+    Char(String),
+}
+
+/// The ASCII string `s` as runs printable in `STR ''…''` and other characters.
+fn hol_str_pieces(s: &str) -> R<Vec<StrPiece>> {
+    if !s.is_ascii() { return unsup("string literal with non-ASCII characters") }
+    let mut out = vec![];
+    let mut run = String::new();
+    for c in s.chars() {
+        if names::hol_string_ok(&c.to_string()) {
+            run.push(c);
+        } else {
+            if !run.is_empty() { out.push(StrPiece::Str(std::mem::take(&mut run))) }
+            out.push(StrPiece::Char(hol_char(c)?));
+        }
+    }
+    if !run.is_empty() { out.push(StrPiece::Str(run)) }
+    Ok(out)
 }
 
 fn hol_char(c: char) -> R<String> {

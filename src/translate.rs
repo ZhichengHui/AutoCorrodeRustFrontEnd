@@ -846,7 +846,9 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     te.push_str("  imports \"Micro_Rust_Std_Lib.Micro_Rust_Std_Lib\"\nbegin\n\n");
     te.push_str("text \\<open>Types without a uRust model. Replace these declarations by models.\\<close>\n\n");
     for (n, t) in &fe.ext_types {
-        if t.arity == 0 {
+        if !t.ctors.is_empty() {
+            writeln!(te, "(* {} *)\ndatatype {} = {}\n", cmt(&t.comment), n, t.ctors.join(" | ")).unwrap();
+        } else if t.arity == 0 {
             writeln!(te, "(* {} *)\ntypedecl {}\n", cmt(&t.comment), n).unwrap();
         } else {
             // a one-constructor datatype (a BNF): recursive types may be nested through it. It holds

@@ -7,7 +7,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
-use rustc_span::{Span, sym};
+use rustc_span::{Span, Symbol, sym};
 
 use crate::names;
 
@@ -38,6 +38,9 @@ impl<'tcx> DefSet<'tcx> {
 pub struct ExtType {
     pub arity: usize,
     pub comment: String,
+    /// the constructors of an enum without type arguments whose variants have no fields: the
+    /// type is declared as a datatype with these constructors
+    pub ctors: Vec<String>,
 }
 
 /// An external (or foreign) function for which a template definition is emitted.
@@ -75,6 +78,16 @@ pub struct Frontend<'tcx> {
     ext_type_ids: HashMap<DefId, String>,
     pub foreign_funs: BTreeMap<String, ExtFun>,
     pub alloc_types: Vec<String>,
+    /// the function items whose types `ty` is translating (a function item's signature may
+    /// contain its own type, through an `impl Trait` result)
+    fn_items: Vec<DefId>,
+    /// `core::fmt::Error` (see `fmt_error_of`)
+    fmt_error: Option<DefId>,
+    /// the formatting traits: the bounds of the `fmt::rt::Argument` constructors (`Display`,
+    /// `Debug`, `LowerHex`, ..., `Pointer`), with their names
+    pub fmt_traits: Vec<(DefId, String)>,
+    /// the `impl Trait` types whose hidden types `ty` is translating
+    opaques: Vec<DefId>,
     pub placeholders: Vec<String>,
     /// Number of uses of placeholder types so far (see `ty_modelled`).
     placeholder_type_uses: usize,
@@ -149,6 +162,10 @@ impl<'tcx> Frontend<'tcx> {
             ext_type_ids: HashMap::new(),
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
+            fn_items: Vec::new(),
+            fmt_error: fmt_error_of(tcx),
+            fmt_traits: fmt_traits_of(tcx),
+            opaques: Vec::new(),
             placeholders: Vec::new(),
             placeholder_type_uses: 0,
             fun_defs: Vec::new(),
@@ -384,10 +401,16 @@ impl<'tcx> Frontend<'tcx> {
             "Range"
         } else if lang(LangItem::RangeInclusiveStruct) {
             "RangeInclusive"
+        } else if diag(Symbol::intern("Formatter")) {
+            "Formatter"
+        } else if Some(did) == self.fmt_error {
+            "FmtError"
         } else {
             return None;
         })
     }
+
+    /// `core::fmt::Error`: the error type of the result of `Display::fmt`.
 
     /// Does a value of type `t` have interior mutability, i.e. does it contain an `UnsafeCell`
     /// that is not behind a pointer? Fields are followed with the actual type arguments; type
@@ -425,7 +448,7 @@ impl<'tcx> Frontend<'tcx> {
         let name = format!("unsupported_{}", names::ident_chars(desc));
         if !self.ext_types.contains_key(&name) {
             let comment = self.placeholder(&format!("type {}", desc), None);
-            self.ext_types.insert(name.clone(), ExtType { arity, comment });
+            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![] });
         }
         name
     }
@@ -587,6 +610,9 @@ impl<'tcx> Frontend<'tcx> {
                     Some("Vec") => format!("{} list", paren_ty(&self.ty(targs[0]))),
                     Some("String") => "String.literal".into(),
                     Some("Ordering") => "ordering".into(),
+                    // AutoCorrode's model of `core::fmt` (`StdLib_Fmt`)
+                    Some("Formatter") => "fmt_Formatter".into(),
+                    Some("FmtError") => "fmt_Error".into(),
                     Some("Range") | Some("RangeInclusive") => {
                         format!("{} range", paren_ty(&self.ty(targs[0])))
                     }
@@ -633,6 +659,20 @@ impl<'tcx> Frontend<'tcx> {
                         return self.ty(n);
                     }
                 }
+                // an `impl Trait` type is its hidden type (as the compiler reveals it after type
+                // checking), also in generic code; one containing itself stays a placeholder
+                if let ty::Alias(_, a) = t.kind()
+                    && let ty::AliasTyKind::Opaque { def_id } = a.kind
+                    && !self.opaques.contains(&def_id)
+                {
+                    let hidden = ty::EarlyBinder::bind(self.tcx, self.tcx.type_of(def_id).instantiate_identity().skip_normalization())
+                        .instantiate(self.tcx, a.args)
+                        .skip_normalization();
+                    self.opaques.push(def_id);
+                    let h = self.ty(hidden);
+                    self.opaques.pop();
+                    return h;
+                }
                 match self.alias_tvars.as_mut() {
                     Some(k) => {
                         *k += 1;
@@ -652,7 +692,16 @@ impl<'tcx> Frontend<'tcx> {
                 let ret = self.ty(sig.output());
                 self.fun_type(&params, &ret)
             }
-            ty::FnDef(..) => self.placeholder_type("fn_item", 0),
+            // a function item is used as the closure calling it (see `BodyTr::fn_item_value`)
+            ty::FnDef(did, _) => {
+                if self.fn_items.contains(did) { return self.placeholder_type("recursive fn_item", 0) }
+                self.fn_items.push(*did);
+                let sig = self.tcx.instantiate_bound_regions_with_erased(t.fn_sig(self.tcx));
+                let params: Vec<String> = sig.inputs().iter().map(|t| self.ty(*t)).collect();
+                let ret = self.ty(sig.output());
+                self.fn_items.pop();
+                self.fun_type(&params, &ret)
+            }
             _ => self.placeholder_type(&format!("{}", t), 0),
         }
     }
@@ -682,9 +731,29 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(format!("ext_{}", names::ident_chars(&segs.join("_"))), |n| {
             self.ext_types.contains_key(n) || self.used_type_names.contains(n)
         });
-        self.ext_types.insert(n.clone(), ExtType { arity, comment: format!("Rust: {}", self.tcx.def_path_str(did)) });
+        let ctors = match self.tcx.def_kind(did) {
+            DefKind::Enum if arity == 0 => {
+                let def = self.tcx.adt_def(did);
+                if !def.variants().is_empty() && def.variants().iter().all(|v| v.fields.is_empty()) {
+                    def.variants().iter().map(|v| format!("{}_{}", n, names::ident_chars(v.name.as_str()))).collect()
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        };
+        self.ext_types.insert(n.clone(), ExtType { arity, comment: format!("Rust: {}", self.tcx.def_path_str(did)), ctors });
         self.ext_type_ids.insert(did, n.clone());
         n
+    }
+
+    /// The constructor of the variant `vidx` of the external enum `adt` when it is declared with
+    /// its constructors (see `ExtType::ctors`).
+    pub fn ext_ctor(&mut self, adt: DefId, vidx: usize) -> Option<String> {
+        if self.tcx.def_kind(adt) != DefKind::Enum { return None }
+        let arity = self.tcx.generics_of(adt).own_counts().types;
+        let n = self.ext_type(adt, arity);
+        self.ext_types.get(&n).and_then(|t| t.ctors.get(vidx).cloned())
     }
 
     // ------------------------------------------------------------------
@@ -748,4 +817,37 @@ fn unique(base: String, taken: impl Fn(&str) -> bool) -> String {
 pub fn one_line(s: &str) -> String {
     let s: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.len() > 120 { format!("{}...", &s[..s.char_indices().nth(117).map(|x| x.0).unwrap_or(s.len())]) } else { s }
+}
+
+/// `core::fmt::Error`: the error type of the result of `Display::fmt`.
+fn fmt_error_of(tcx: TyCtxt<'_>) -> Option<DefId> {
+    let display = tcx.get_diagnostic_item(sym::Display)?;
+    let fmt = tcx.associated_items(display).in_definition_order().find(|i| i.is_fn())?.def_id;
+    match tcx.fn_sig(fmt).skip_binder().output().skip_binder().kind() {
+        ty::Adt(_, args) => match args.type_at(1).kind() {
+            ty::Adt(e, _) => Some(e.did()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The traits bounding the type parameters of the constructors of `fmt::rt::Argument` (the lang
+/// item `format_argument`), named by their item names: the formatting traits of `format_args!`.
+fn fmt_traits_of(tcx: TyCtxt<'_>) -> Vec<(DefId, String)> {
+    let Some(arg) = tcx.lang_items().get(LangItem::FormatArgument) else { return vec![] };
+    let mut out: Vec<(DefId, String)> = vec![];
+    for &imp in tcx.inherent_impls(arg) {
+        for item in tcx.associated_items(imp).in_definition_order().filter(|i| i.is_fn()) {
+            for c in tcx.param_env(item.def_id).caller_bounds() {
+                if let Some(t) = c.as_trait_clause().map(|t| t.def_id())
+                    && tcx.associated_items(t).in_definition_order().any(|i| i.is_fn())
+                    && !out.iter().any(|(d, _)| *d == t)
+                {
+                    out.push((t, tcx.item_name(t).to_string()));
+                }
+            }
+        }
+    }
+    out
 }
