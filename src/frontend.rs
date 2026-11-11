@@ -811,6 +811,22 @@ impl<'tcx> Frontend<'tcx> {
         result
     }
 
+    /// Register the external ADTs occurring in `tys`: whether such a datatype takes associated
+    /// types as parameters (`adt_projs`) must be known before the projections of types using it
+    /// are computed (see `projections`).
+    pub fn register_ext_adts(&mut self, tys: &[Ty<'tcx>]) {
+        for t in tys {
+            for g in t.walk() {
+                if let Some(ty::Adt(d, a)) = g.as_type().map(|x| x.kind())
+                    && !d.did().is_local()
+                    && self.std_adt(d.did()).is_none()
+                {
+                    self.ext_type(d.did(), a.types().count());
+                }
+            }
+        }
+    }
+
     /// The constructor of the variant `vidx` of the external ADT `adt` when it is declared with
     /// its constructors (see `ExtType::ctors`), and whether the variant has fields.
     pub fn ext_ctor(&mut self, adt: DefId, vidx: usize) -> Option<(String, bool)> {

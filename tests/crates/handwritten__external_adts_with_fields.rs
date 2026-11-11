@@ -11,3 +11,7 @@ pub fn cow(s: &[u8]) -> Cow<'_, [u8]> { Cow::Borrowed(s) }
 pub fn cow_len(c: Cow<'_, [u8]>) -> usize { match c { Cow::Borrowed(b) => b.len(), Cow::Owned(v) => v.len() } }
 pub fn ip(a: Ipv4Addr) -> IpAddr { IpAddr::V4(a) }
 pub fn eq(a: u32, b: u32) -> u32 { assert_eq!(a, b); a }
+// a generic local struct with a field of an external type whose datatype takes an associated type
+pub struct Filename<'a, T: ToOwned + ?Sized>(pub Cow<'a, T>);
+pub fn borrowed<'a, T: ToOwned + ?Sized>(t: &'a T) -> Filename<'a, T> { Filename(Cow::Borrowed(t)) }
+pub fn name_len(f: &Filename<'_, str>) -> usize { match &f.0 { Cow::Borrowed(s) => s.len(), Cow::Owned(s) => s.len() } }

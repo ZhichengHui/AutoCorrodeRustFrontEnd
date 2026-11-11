@@ -210,6 +210,8 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     // groups come after the ADTs they use
     for comp in &adt_sccs {
         for &d in comp {
+            // external ADTs in the fields first: their datatypes may take associated types too
+            fe.register_ext_adts(&fields[&d]);
             let ps = fe.projections(d, &fields[&d]);
             if !ps.is_empty() {
                 fe.adt_projs.insert(d, ps);
@@ -448,6 +450,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         };
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
         if key.1.is_none() {
+            fe.register_ext_adts(&tys);
             fe.proj_tvars = proj_tvars(fe, did, &tys);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");

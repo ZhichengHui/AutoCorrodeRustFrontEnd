@@ -130,6 +130,8 @@ struct PatTr {
     conds: Vec<String>,
     /// Statements to run at the start of the arm (mutable bindings).
     prologue: Vec<String>,
+    /// Those of them that bind by mutable reference (also needed by a guard).
+    refs: Vec<String>,
 }
 
 pub struct BodyTr<'a, 'tcx> {
@@ -143,6 +145,8 @@ pub struct BodyTr<'a, 'tcx> {
     /// the mutable reference matched by the `match`/`if let`/`while let` being translated, if
     /// any (see `scrut_place`): patterns bind by mutable reference into it
     match_place: Option<Tr>,
+    /// the bindings by mutable reference of the pattern being translated (see `PatTr::refs`)
+    pat_refs: Vec<String>,
     fresh: usize,
     pub calls: crate::frontend::DefSet<'tcx>,
     pub comments: Vec<String>,
@@ -162,6 +166,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             args,
             locals: HashMap::new(),
             match_place: None,
+            pat_refs: vec![],
             fresh: 0,
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
@@ -2490,7 +2495,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     return unsup("`if let` guard");
                 }
                 let gv = self.val(g)?;
-                conds.push(gv.at(44));
+                // the guard may use the bindings by mutable reference
+                conds.push(if p.refs.is_empty() { gv.at(44) } else { format!("{{ {} {} }}", p.refs.join(" "), gv.at(20)) });
             }
             let irref = Self::irrefutable_shape(arm.pat);
             if irref && !conds.is_empty() {
@@ -2692,8 +2698,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let mut conds = vec![];
         let mut prologue = vec![];
         let place = self.match_place.clone();
+        self.pat_refs.clear();
         let s = self.pat_rec(pat, &mut conds, &mut prologue, place)?;
-        Ok(PatTr { pat: s, conds, prologue })
+        let refs = std::mem::take(&mut self.pat_refs);
+        Ok(PatTr { pat: s, conds, prologue, refs })
     }
 
     /// `pat` matching a value behind the mutable reference `place` (see `scrut_place`).
@@ -2743,7 +2751,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let (Some(r), None) = (place, sub) else { return unsup("binding by mutable reference (match ergonomics)") };
             let n = names::local_name(ident.as_str());
             self.declare(hid, &n, hir::Mutability::Not)?;
-            pro.push(format!("let {} = {};", n, r.at(20)));
+            let b = format!("let {} = {};", n, r.at(20));
+            self.pat_refs.push(b.clone());
+            pro.push(b);
             return Ok("_".into());
         }
         match pat.kind {
