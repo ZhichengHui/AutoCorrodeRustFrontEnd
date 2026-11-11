@@ -815,15 +815,37 @@ impl<'tcx> Frontend<'tcx> {
     /// types as parameters (`adt_projs`) must be known before the projections of types using it
     /// are computed (see `projections`).
     pub fn register_ext_adts(&mut self, tys: &[Ty<'tcx>]) {
-        for t in tys {
-            for g in t.walk() {
-                if let Some(ty::Adt(d, a)) = g.as_type().map(|x| x.kind())
-                    && !d.did().is_local()
-                    && self.std_adt(d.did()).is_none()
-                {
-                    self.ext_type(d.did(), a.types().count());
+        for &t in tys {
+            let mut w = t.walk();
+            while let Some(g) = w.next() {
+                let Some(x) = g.as_type() else { continue };
+                match x.kind() {
+                    // parts without a HOL counterpart (see `ty`)
+                    ty::Alias(..) | ty::RawPtr(..) | ty::FnPtr(..) | ty::Dynamic(..) => w.skip_current_subtree(),
+                    ty::Adt(d, a) => match self.hol_kept_args(d.did()) {
+                        Some(k) => {
+                            w.skip_current_subtree();
+                            let kept: Vec<Ty<'tcx>> = a.types().take(k).collect();
+                            self.register_ext_adts(&kept);
+                        }
+                        None if !d.did().is_local() && self.std_adt(d.did()).is_none() => {
+                            self.ext_type(d.did(), a.types().count());
+                        }
+                        None => {}
+                    },
+                    _ => {}
                 }
             }
+        }
+    }
+
+    /// For a standard ADT modelled by a HOL type that keeps only its first type arguments (see
+    /// `ty`), how many it keeps (e.g. `Vec<T, A>` is `T list`).
+    pub fn hol_kept_args(&self, did: DefId) -> Option<usize> {
+        match self.std_adt(did)? {
+            "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" => Some(1),
+            "String" | "Ordering" | "Formatter" | "FmtError" => Some(0),
+            _ => None,
         }
     }
 

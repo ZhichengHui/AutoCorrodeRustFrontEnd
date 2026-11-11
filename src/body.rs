@@ -1917,11 +1917,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // placeholder types without arguments (see `Frontend::ty`)
                 ty::RawPtr(..) | ty::FnPtr(..) | ty::Dynamic(..) => w.skip_current_subtree(),
                 ty::Adt(def, args) => {
-                    let kept = match self.fe.std_adt(def.did()) {
-                        Some("Box" | "Vec" | "Option" | "Range" | "RangeInclusive") => 1,
-                        Some("String" | "Ordering") => 0,
-                        _ => continue,
-                    };
+                    let Some(kept) = self.fe.hol_kept_args(def.did()) else { continue };
                     w.skip_current_subtree();
                     for a in args.types().take(kept) {
                         self.hol_params(a, out);
