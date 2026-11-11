@@ -13,6 +13,7 @@ extern crate rustc_middle;
 extern crate rustc_span;
 
 mod body;
+mod dict;
 mod frontend;
 mod names;
 mod translate;

@@ -148,6 +148,22 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     for &d in &bodies {
         translate_item(&mut fe, (d, Inst::Generic));
     }
+    // each local implementation's copies of the default methods it does not override (its
+    // dictionaries' fields)
+    for id in items.free_items() {
+        let imp = id.owner_id.to_def_id();
+        if !matches!(tcx.def_kind(imp), DefKind::Impl { of_trait: true }) || tcx.is_automatically_derived(imp) {
+            continue;
+        }
+        let tr = tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization().def_id;
+        let implementors = tcx.impl_item_implementor_ids(imp);
+        let fields = fe.dict_methods(tr);
+        for &m in &default_methods {
+            if tcx.trait_of_assoc(m) == Some(tr) && fields.contains(&m) && !implementors.contains_key(&m) {
+                fe.impl_copy(m, imp);
+            }
+        }
+    }
     // instances called from the translated bodies, and from those instances
     while let Some(key) = fe.pending.pop() {
         translate_item(&mut fe, key);
@@ -159,6 +175,7 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     }
 
     let funs_text = emit_funs(&mut fe);
+    let types_text = types_text + &fe.dict_decls();
     write_all(&mut fe, opts, types_text, funs_text);
 }
 
@@ -434,6 +451,8 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let ld: LocalDefId = did.expect_local();
     let is_fn = matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn);
     let name = fe.fn_name(key);
+    // the dictionary parameters come first (see `crate::dict`)
+    let dicts = if is_fn { fe.dict_params(key) } else { vec![] };
     let rust_path = match key.1 {
         Inst::Generic => tcx.def_path_str(did),
         Inst::Mono(args) => tcx.def_path_str_with_args(did, args),
@@ -445,12 +464,24 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         // typing environment (e.g. `<Iter<T> as Iterator>::Item` through the impl)
         let at = |t: Ty<'tcx>| fe.at_key(key, t);
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
-        if key.1 == Inst::Generic {
+        if !matches!(key.1, Inst::Mono(_)) {
             fe.register_ext_adts(&tys);
-            fe.proj_tvars = proj_tvars(fe, did, &tys);
+            // the associated types of the dictionaries' slots are type variables too
+            let env = fe.inst_env(key);
+            let mut all = tys.clone();
+            for (r, _) in &dicts {
+                all.extend(fe.dict_slots(*r).into_iter().map(|t| {
+                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
+                }));
+            }
+            let owner = match key.1 { Inst::ImplCopy(imp) => imp, _ => did };
+            fe.proj_tvars = proj_tvars(fe, owner, &all);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");
-        (ins.iter().map(|t| fe.ty_modelled(*t)).collect(), fe.ty_modelled(*out))
+        let env = fe.inst_env(key);
+        let mut ps: Vec<(String, bool)> = dicts.iter().map(|(r, _)| (fe.dict_type(*r, env), true)).collect();
+        ps.extend(ins.iter().map(|t| fe.ty_modelled(*t)));
+        (ps, fe.ty_modelled(*out))
     } else {
         (vec![], fe.ty_modelled(tcx.type_of(did).instantiate_identity().skip_normalization()))
     };
@@ -516,7 +547,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let comments = std::mem::take(&mut bt.comments);
     match res {
         Ok((params, text)) => {
-            fd.params = params;
+            fd.params = dicts.iter().map(|(_, n)| n.clone()).chain(params).collect();
             fd.body = text;
             fd.calls = calls;
             fd.comments = comments;

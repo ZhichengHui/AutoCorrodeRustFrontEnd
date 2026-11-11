@@ -16,6 +16,7 @@ use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
+use rustc_middle::traits;
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
 use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
@@ -28,6 +29,11 @@ type R<T> = Result<T, Unsup>;
 
 fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
+}
+
+/// A HOL term as an argument of an application: parenthesised unless it is a name.
+fn paren_term(t: &str) -> String {
+    if t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '\u{1}' || c == '\u{2}') { t.to_string() } else { format!("({})", t) }
 }
 
 /// The label of a loop as it precedes the uRust loop (`'l: `), or nothing.
@@ -150,6 +156,8 @@ pub struct BodyTr<'a, 'tcx> {
     fresh: usize,
     pub calls: crate::frontend::DefSet<'tcx>,
     pub comments: Vec<String>,
+    /// the dictionary parameters of the body (see `Frontend::dict_params`)
+    dicts: Vec<(ty::TraitRef<'tcx>, String)>,
 }
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
@@ -159,6 +167,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = fe.tcx;
         let owner = key.0.expect_local();
         let typeck = tcx.typeck(owner);
+        let fe_dicts = fe.dict_params(key);
         BodyTr {
             fe,
             tcx,
@@ -171,6 +180,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             fresh: 0,
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
+            dicts: fe_dicts,
         }
     }
 
@@ -1781,15 +1791,197 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// A call of the local function `did` at the generic arguments `args`.
     fn local_call(&mut self, did: DefId, args: GenericArgsRef<'tcx>, argv: Vec<Tr>) -> R<Tr> {
+        let (key, kargs) = self.local_callee(did, args)?;
+        let dicts = self.callee_dicts(key, kargs)?;
+        self.calls.insert(key);
+        let m = self.fe.marker(key);
+        if !dicts.is_empty() {
+            return Ok(self.term_app(&format!("\u{1}H{}\u{2} {}", m, dicts.join(" ")), argv));
+        }
+        let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
+        Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a))
+    }
+
+    /// The function translating the local function `did` at the generic arguments `args`, with
+    /// the generic arguments of the item its dictionary parameters are the bounds of (see
+    /// `Frontend::dict_params`): an instance, the item itself, or for a default method that the
+    /// implementation of a type with generic parameters does not override, the method's copy for
+    /// that implementation.
+    fn local_callee(&mut self, did: DefId, args: GenericArgsRef<'tcx>) -> R<(FnKey<'tcx>, GenericArgsRef<'tcx>)> {
         let Some(key) = self.fe.callee(did, args) else {
             return unsup(format!("more than {} instances of a generic function", crate::frontend::MAX_INSTANCES));
         };
-        // a default method is generic over `Self`: only its instances are translated
-        if self.fe.is_trait_item(did) && key.1 == Inst::Generic { return unsup("call of a trait default method") }
+        if !(self.fe.is_trait_item(did) && key.1 == Inst::Generic) {
+            return Ok((key, args));
+        }
+        let tcx = self.tcx;
+        let tr = tcx.trait_of_assoc(did).expect("a default method is a trait item");
+        let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&args[..tcx.generics_of(tr).count()]));
+        match self.select(r)? {
+            traits::ImplSource::UserDefined(d) if d.impl_def_id.is_local() && !tcx.is_automatically_derived(d.impl_def_id) => {
+                Ok((self.fe.impl_copy(did, d.impl_def_id), d.args))
+            }
+            _ => unsup("call of a trait default method"),
+        }
+    }
+
+    /// The candidate implementing the trait reference `r` in the body's typing environment.
+    fn select(&self, r: ty::TraitRef<'tcx>) -> R<&'tcx traits::ImplSource<'tcx, ()>> {
+        let tcx = self.tcx;
+        let env = self.typing_env();
+        let r = tcx.erase_and_anonymize_regions(r);
+        let r = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(r)).unwrap_or(r);
+        tcx.codegen_select_candidate(env.as_query_input(r)).map_err(|_| Unsup(format!("implementation of `{}`", r)))
+    }
+
+    /// `f(args)` for the HOL term `f` of a function value.
+    fn term_app(&self, f: &str, argv: Vec<Tr>) -> Tr {
+        let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
+        if a.len() <= 8 {
+            Tr::new(format!("\\<epsilon>\\<open>{}\\<close>({})", f, a.join(", ")), 999)
+        } else {
+            let wrapped: Vec<String> = a.iter().map(|x| format!("\\<lbrakk>{}\\<rbrakk>", x)).collect();
+            Tr::atom(format!("\\<epsilon>\\<open>funcall{} ({}) {}\\<close>", a.len(), f, wrapped.join(" ")))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Dictionaries (see `crate::dict`)
+    // ------------------------------------------------------------------
+
+    /// The dictionaries `key` takes (see `Frontend::dict_params`), for its bounds at the generic
+    /// arguments `kargs` of their item.
+    fn callee_dicts(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<Vec<String>> {
+        let bounds: Vec<ty::TraitRef<'tcx>> = self.fe.dict_params(key).into_iter().map(|(r, _)| r).collect();
+        let mut out = vec![];
+        for b in bounds {
+            let r = ty::EarlyBinder::bind(self.tcx, b).instantiate(self.tcx, kargs).skip_normalization();
+            out.push(paren_term(&self.dict_term(r)?));
+        }
+        Ok(out)
+    }
+
+    /// The dictionary for the trait reference `r` in the body: one of the body's dictionary
+    /// parameters (or a supertrait's in one), or an implementation's.
+    fn dict_term(&mut self, r: ty::TraitRef<'tcx>) -> R<String> {
+        match self.select(r)? {
+            traits::ImplSource::UserDefined(d) => self.impl_dict(d.impl_def_id, d.args),
+            traits::ImplSource::Param(_) => {
+                let r = self.tcx.erase_and_anonymize_regions(r);
+                let ps = self.dicts.clone();
+                ps.into_iter()
+                    .find_map(|(p, n)| self.bound_dict(p, n, r))
+                    .ok_or_else(|| Unsup(format!("bound `{}` without a dictionary", r)))
+            }
+            traits::ImplSource::Builtin(..) => self.builtin_dict(r),
+        }
+    }
+
+    /// The dictionary of a built-in implementation: `Clone` of a `Copy` type (copying), or a trait
+    /// without methods of its own (e.g. `Copy`: its supertraits' dictionaries).
+    fn builtin_dict(&mut self, r: ty::TraitRef<'tcx>) -> R<String> {
+        let tcx = self.tcx;
+        let unsupported = || unsup(format!("dictionary of the built-in implementation of `{}`", r));
+        let copy = tcx.type_is_copy_modulo_regions(self.typing_env(), r.self_ty());
+        let mut fields = vec![];
+        for m in self.fe.dict_methods(r.def_id) {
+            if !(tcx.is_lang_item(r.def_id, LangItem::Clone) && copy) {
+                return unsupported();
+            }
+            fields.push(match tcx.item_name(m).as_str() {
+                "clone" => "(\\<lambda>x. FunctionBody (literal x))".to_string(),
+                "clone_from" => "(\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>)".to_string(),
+                _ => return unsupported(),
+            });
+        }
+        for p in self.fe.dict_parents(r.def_id) {
+            let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
+            fields.push(paren_term(&self.dict_term(p)?));
+        }
+        let name = self.fe.dict_name(r.def_id);
+        Ok(if fields.is_empty() { name } else { format!("{} {}", name, fields.join(" ")) })
+    }
+
+    /// The dictionary for `r` in the dictionary `d` for the bound `p`: `d` itself, or a
+    /// supertrait field of it (transitively).
+    fn bound_dict(&mut self, p: ty::TraitRef<'tcx>, d: String, r: ty::TraitRef<'tcx>) -> Option<String> {
+        if p == r {
+            return Some(d);
+        }
+        for (k, q) in self.fe.dict_parents(p.def_id).into_iter().enumerate() {
+            let q = ty::EarlyBinder::bind(self.tcx, q).instantiate(self.tcx, p.args).skip_normalization();
+            let f = self.fe.dict_parent_field(p.def_id, k);
+            if let Some(t) = self.bound_dict(q, format!("{} {}", f, paren_term(&d)), r) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// The dictionary of the implementation `imp` at the generic arguments `args`: its methods
+    /// (a local implementation's translated methods or default-method copies, an external one's
+    /// templates), then the dictionaries of the trait's supertraits.
+    fn impl_dict(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
+        let tcx = self.tcx;
+        if imp.is_local() && tcx.is_automatically_derived(imp) {
+            return unsup("dictionary of a derived implementation");
+        }
+        let r = tcx.impl_trait_ref(imp).instantiate(tcx, args).skip_normalization();
+        let tr = r.def_id;
+        let name = self.fe.dict_name(tr);
+        let implementors = tcx.impl_item_implementor_ids(imp);
+        let mut fields = vec![];
+        for m in self.fe.dict_methods(tr) {
+            let f = match implementors.get(&m) {
+                Some(&im) if imp.is_local() => {
+                    let iargs = ty::GenericArgs::for_item(tcx, im, |p, _| {
+                        if (p.index as usize) < args.len() { args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
+                    });
+                    self.fn_value((im, Inst::Generic), iargs)?
+                }
+                Some(&im) => self.fe.ext_fun(im, false),
+                None if imp.is_local() && m.is_local() => {
+                    let key = self.fe.impl_copy(m, imp);
+                    self.fn_value(key, args)?
+                }
+                None => self.fe.ext_fun(m, false),
+            };
+            fields.push(paren_term(&f));
+        }
+        for p in self.fe.dict_parents(tr) {
+            let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
+            fields.push(paren_term(&self.dict_term(p)?));
+        }
+        Ok(if fields.is_empty() { name } else { format!("{} {}", name, fields.join(" ")) })
+    }
+
+    /// The local function `key` as a HOL function value, applied to its dictionaries for its
+    /// bounds at the generic arguments `kargs` of their item.
+    fn fn_value(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<String> {
+        let dicts = self.callee_dicts(key, kargs)?;
         self.calls.insert(key);
         let m = self.fe.marker(key);
-        let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
-        Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a))
+        let h = format!("\u{1}H{}\u{2}", m);
+        Ok(if dicts.is_empty() { h } else { format!("{} {}", h, dicts.join(" ")) })
+    }
+
+    /// A call of the trait method `did` (at `gargs`) of a bound of the body: the method's field of
+    /// the bound's dictionary.
+    fn dict_call(&mut self, did: DefId, gargs: GenericArgsRef<'tcx>, argv: Vec<Tr>, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        let tcx = self.tcx;
+        let c = tcx.generics_of(did).own_counts();
+        if c.types > 0 || c.consts > 0 {
+            return unsup("call of a trait method with generic parameters of its own in generic code (a dictionary field cannot be polymorphic)");
+        }
+        let tr = tcx.trait_of_assoc(did).expect("a trait method");
+        let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&gargs[..tcx.generics_of(tr).count()]));
+        if !self.fe.has_dict(tr) {
+            return unsup("trait method call in generic code (a trait without dictionaries)");
+        }
+        let d = self.dict_term(r)?;
+        let f = self.fe.dict_field(tr, did);
+        let call = self.term_app(&format!("{} {}", f, paren_term(&d)), argv);
+        Ok(self.result_stated(did, call, e))
     }
 
     fn callee_app(&self, callee: &str, hol: &str, zero: &str, a: Vec<String>) -> Tr {
@@ -1840,7 +2032,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         return unsup(format!("call of `{}`", self.tcx.def_path_str(did)));
                     }
                 },
-                _ => return unsup("trait method call in generic code (needs monomorphisation)"),
+                // a method of a bound of a generic body: no implementation is known
+                _ => return self.dict_call(did, gargs, argv, e),
             };
             if target.is_local() && !self.derived(target) {
                 let call = self.local_call(target, targs, argv)?;

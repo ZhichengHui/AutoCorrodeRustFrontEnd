@@ -120,6 +120,9 @@ pub struct Frontend<'tcx> {
     instance_names: HashMap<(DefId, GenericArgsRef<'tcx>), String>,
     /// names of the copies of default methods, by (method, implementation)
     copy_names: HashMap<(DefId, DefId), String>,
+    /// the traits whose dictionaries are used, in order, with their datatypes' names
+    pub dict_traits: Vec<DefId>,
+    pub dict_names: HashMap<DefId, String>,
     instances_per_fn: HashMap<DefId, usize>,
     /// Instances named but not yet translated.
     pub pending: Vec<FnKey<'tcx>>,
@@ -194,6 +197,8 @@ impl<'tcx> Frontend<'tcx> {
             mono_fns: HashSet::new(),
             instance_names: HashMap::new(),
             copy_names: HashMap::new(),
+            dict_traits: Vec::new(),
+            dict_names: HashMap::new(),
             instances_per_fn: HashMap::new(),
             pending: Vec::new(),
             opaque_adts: HashMap::new(),
@@ -389,6 +394,14 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(names::global_name(&self.path_segments(did)), |n| self.used_names.contains(n));
         self.used_names.insert(n.clone());
         self.names.insert(did, n.clone());
+        n
+    }
+
+    /// `base` made unique among the HOL names of constants and types, and reserved.
+    pub fn unique_global(&mut self, base: String) -> String {
+        let n = unique(base, |n| self.used_names.contains(n) || self.used_type_names.contains(n));
+        self.used_names.insert(n.clone());
+        self.used_type_names.insert(n.clone());
         n
     }
 
