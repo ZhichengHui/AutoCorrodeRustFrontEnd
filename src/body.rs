@@ -1386,7 +1386,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn structural_eq(&mut self, e: &'tcx hir::Expr<'tcx>) -> bool {
         let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return true };
         let args = self.node_args(e.hir_id);
-        match ty::Instance::try_resolve(self.tcx, self.typing_env(), did, args) {
+        match self.resolve_instance(did, args) {
             Ok(Some(inst)) => {
                 // derived impls, and the std impls (Option, tuples, references, str, slices)
                 let rd = inst.def_id();
@@ -1752,7 +1752,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("formatting trait without `fmt`");
         };
         if let Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) =
-            ty::Instance::try_resolve(tcx, self.typing_env(), fmt_fn, tcx.mk_args(&[t.into()]))
+            self.resolve_instance(fmt_fn, tcx.mk_args(&[t.into()]))
         {
             if rd.is_local() && self.fe.local_fn_with_body(rd) && !self.derived(rd) {
                 return Ok(self.local_call(rd, rargs, vec![Tr::atom(v), Tr::atom(sub)])?.s);
@@ -1867,12 +1867,29 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         let tcx = self.tcx;
         let tr = tcx.trait_of_assoc(did).expect("a default method is a trait item");
+        // only the methods that are dictionary fields have copies (see `translate::run`)
+        if !self.fe.dict_methods(tr).contains(&did) {
+            return unsup("call of a trait default method with generic parameters of its own");
+        }
         let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&args[..tcx.generics_of(tr).count()]));
         match self.select(r)? {
             traits::ImplSource::UserDefined(d) if d.impl_def_id.is_local() && !tcx.is_automatically_derived(d.impl_def_id) => {
                 Ok((self.fe.impl_copy(did, d.impl_def_id), d.args))
             }
             _ => unsup("call of a trait default method"),
+        }
+    }
+
+    /// `Instance::try_resolve` in the body's typing environment, with the `impl Trait` types in
+    /// `args` revealed (see `select`); arguments that do not normalise there (rustc would abort)
+    /// resolve to nothing.
+    fn resolve_instance(&self, did: DefId, args: GenericArgsRef<'tcx>) -> Result<Option<ty::Instance<'tcx>>, rustc_span::ErrorGuaranteed> {
+        let tcx = self.tcx;
+        let env = self.typing_env();
+        let args = tcx.erase_and_anonymize_regions(args.fold_with(&mut RevealOpaque(tcx)));
+        match tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(args)) {
+            Ok(args) => ty::Instance::try_resolve(tcx, env, did, args),
+            Err(_) => Ok(None),
         }
     }
 
@@ -2074,7 +2091,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // trait methods: resolve to the implementation (in an instance, at its concrete types)
         let mut target = did;
         if self.tcx.trait_of_assoc(did).is_some() {
-            let targs = match ty::Instance::try_resolve(self.tcx, self.typing_env(), did, gargs) {
+            let targs = match self.resolve_instance(did, gargs) {
                 Ok(Some(inst)) => match inst.def {
                     ty::InstanceKind::Item(rd) => {
                         target = rd;
@@ -2530,7 +2547,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some(from_fn) = self.tcx.lang_items().get(LangItem::FromFn) else { return unsup("`?` with an error conversion") };
         let args = self.tcx.mk_args(&[e2.into(), e1.into()]);
         let err = self.fresh("err");
-        let conv = match ty::Instance::try_resolve(self.tcx, self.typing_env(), from_fn, args) {
+        let conv = match self.resolve_instance(from_fn, args) {
             Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) if self.fe.local_fn_with_body(rd) => {
                 self.local_call(rd, rargs, vec![Tr::atom(err.clone())])?
             }
@@ -3196,7 +3213,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
         let gargs = tcx.instantiate_bound_regions_with_erased(gargs);
         let (target, targs) = if self.fe.is_trait_item(did) {
-            match ty::Instance::try_resolve(tcx, self.typing_env(), did, gargs) {
+            match self.resolve_instance(did, gargs) {
                 Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) => (rd, args),
                 _ => return unsup("function item used as a value"),
             }

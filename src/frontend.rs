@@ -537,7 +537,13 @@ impl<'tcx> Frontend<'tcx> {
                     return false;
                 }
                 seen.push(t);
-                def.all_fields().any(|f| self.has_cell(field_ty(tcx, f, args, env), env, seen))
+                // a field that does not normalise (e.g. a projection on an `impl Trait` type, which
+                // the environment does not reveal) stays a projection, which has none
+                def.all_fields().any(|f| {
+                    let t = f.ty(tcx, args);
+                    let t = tcx.try_normalize_erasing_regions(env, t).unwrap_or_else(|_| t.skip_normalization());
+                    self.has_cell(tcx.erase_and_anonymize_regions(t), env, seen)
+                })
             }
             ty::Tuple(ts) => ts.iter().any(|a| self.has_cell(a, env, seen)),
             ty::Array(a, _) | ty::Slice(a) => self.has_cell(*a, env, seen),
