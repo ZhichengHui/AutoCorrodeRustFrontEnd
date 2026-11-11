@@ -78,6 +78,9 @@ pub struct Frontend<'tcx> {
     ext_type_ids: HashMap<DefId, String>,
     pub foreign_funs: BTreeMap<String, ExtFun>,
     pub alloc_types: Vec<String>,
+    /// the function items whose types `ty` is translating (a function item's signature may
+    /// contain its own type, through an `impl Trait` result)
+    fn_items: Vec<DefId>,
     pub placeholders: Vec<String>,
     /// Number of uses of placeholder types so far (see `ty_modelled`).
     placeholder_type_uses: usize,
@@ -152,6 +155,7 @@ impl<'tcx> Frontend<'tcx> {
             ext_type_ids: HashMap::new(),
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
+            fn_items: Vec::new(),
             placeholders: Vec::new(),
             placeholder_type_uses: 0,
             fun_defs: Vec::new(),
@@ -676,7 +680,16 @@ impl<'tcx> Frontend<'tcx> {
                 let ret = self.ty(sig.output());
                 self.fun_type(&params, &ret)
             }
-            ty::FnDef(..) => self.placeholder_type("fn_item", 0),
+            // a function item is used as the closure calling it (see `BodyTr::fn_item_value`)
+            ty::FnDef(did, _) => {
+                if self.fn_items.contains(did) { return self.placeholder_type("recursive fn_item", 0) }
+                self.fn_items.push(*did);
+                let sig = self.tcx.instantiate_bound_regions_with_erased(t.fn_sig(self.tcx));
+                let params: Vec<String> = sig.inputs().iter().map(|t| self.ty(*t)).collect();
+                let ret = self.ty(sig.output());
+                self.fn_items.pop();
+                self.fun_type(&params, &ret)
+            }
             _ => self.placeholder_type(&format!("{}", t), 0),
         }
     }

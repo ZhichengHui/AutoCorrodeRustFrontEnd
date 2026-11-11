@@ -2875,6 +2875,28 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
         let gargs = tcx.instantiate_bound_regions_with_erased(gargs);
+        // passed for a type parameter of a local function: the generic function calls it only
+        // through its `Fn` bound (a placeholder), while the call would put the two functions in
+        // one recursion group, where that type parameter is fixed
+        if let hir::Node::Expr(p) = tcx.parent_hir_node(e.hir_id) {
+            let (callee, pos) = match p.kind {
+                ExprKind::Call(c, args) => (
+                    match *self.ty_of(c).kind() { ty::FnDef(d, _) => Some(d), _ => None },
+                    args.iter().position(|a| a.hir_id == e.hir_id),
+                ),
+                ExprKind::MethodCall(_, _, args, _) => (
+                    self.typeck.type_dependent_def_id(p.hir_id),
+                    args.iter().position(|a| a.hir_id == e.hir_id).map(|i| i + 1),
+                ),
+                _ => (None, None),
+            };
+            if let (Some(d), Some(i)) = (callee, pos)
+                && d.is_local()
+                && matches!(tcx.fn_sig(d).instantiate_identity().skip_binder().inputs().get(i).map(|t| t.kind()), Some(ty::Param(_)))
+            {
+                return unsup("function item passed for a type parameter of a local function");
+            }
+        }
         let (target, targs) = if self.fe.is_trait_item(did) {
             match ty::Instance::try_resolve(tcx, self.typing_env(), did, gargs) {
                 Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) => (rd, args),
