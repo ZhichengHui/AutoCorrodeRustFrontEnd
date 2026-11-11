@@ -1160,8 +1160,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         if !adt.is_local() {
             return match self.fe.ext_ctor(adt, vidx) {
-                Some(c) => Ok(Tr::atom(c)),
-                None => unsup("constructor of an external type"),
+                Some((c, false)) => Ok(Tr::atom(c)),
+                _ => unsup("constructor of an external type"),
             };
         }
         Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx)))
@@ -1729,8 +1729,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => unsup("constructor of a standard library type"),
             };
         }
-        if !adt.is_local() { return unsup("constructor of an external type") }
         if argv.len() > 8 { return unsup("constructor with more than 8 fields") }
+        if !adt.is_local() {
+            // an external ADT declared with its constructors (see `ExtType::ctors`)
+            return match self.fe.ext_ctor(adt, vidx) {
+                Some((c, true)) => Ok(self.callee_app(&format!("{}_mk", c), &format!("{}_mk", c), &format!("{}_mk()", c), argv.iter().map(|a| a.at(11)).collect())),
+                _ => unsup("constructor of an external type"),
+            };
+        }
         // `S()`: a constructor without fields has no `_mk` function; it is the value itself
         if argv.is_empty() { return Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx))) }
         let n = self.fe.variant_call_name(adt, vidx);
@@ -2776,8 +2782,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Some("Box") => return parts.into_iter().next().ok_or(Unsup("box pattern".into())),
             Some(_) => return unsup("pattern on a standard library type"),
             None if !adt.is_local() => match self.fe.ext_ctor(adt, vidx) {
-                Some(c) if parts.is_empty() => c,
-                _ => return unsup("pattern on an external type"),
+                Some((c, _)) => c,
+                None => return unsup("pattern on an external type"),
             },
             None => self.fe.variant_ctor_name(adt, vidx),
         };

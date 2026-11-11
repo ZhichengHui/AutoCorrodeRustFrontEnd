@@ -864,7 +864,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     te.push_str("text \\<open>Types without a uRust model. Replace these declarations by models.\\<close>\n\n");
     for (n, t) in &fe.ext_types {
         if !t.ctors.is_empty() {
-            writeln!(te, "(* {} *)\ndatatype {} = {}\n", cmt(&t.comment), n, t.ctors.join(" | ")).unwrap();
+            continue;
         } else if t.arity == 0 {
             writeln!(te, "(* {} *)\ntypedecl {}\n", cmt(&t.comment), n).unwrap();
         } else {
@@ -876,6 +876,35 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
             writeln!(te, "(* {} *)\ndatatype ({}) {} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
         }
     }
+    // the external ADTs declared with their constructors (see `ExtType::ctors`), each after the
+    // ones its fields use; types using each other are one datatype declaration
+    let mut left: Vec<&String> = fe.ext_types.iter().filter(|(_, t)| !t.ctors.is_empty()).map(|(n, _)| n).collect();
+    let mut mks = String::new();
+    while !left.is_empty() {
+        let ready: Vec<&String> =
+            left.iter().copied().filter(|n| fe.ext_types[*n].deps.iter().all(|d| !left.contains(&d))).collect();
+        let group = if ready.is_empty() { left.clone() } else { vec![ready[0]] };
+        let mut decls = vec![];
+        for n in &group {
+            let t = &fe.ext_types[*n];
+            let head = if t.params.is_empty() { (*n).clone() } else { format!("({}) {}", t.params.join(", "), n) };
+            let ctors: Vec<String> = t
+                .ctors
+                .iter()
+                .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
+                .collect();
+            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
+            decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            for (c, fs) in &t.ctors {
+                if !fs.is_empty() {
+                    mks.push_str(&ctor_fun(&format!("{}_mk", c), c, fs, &head));
+                }
+            }
+        }
+        writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+        left.retain(|n| !group.contains(n));
+    }
+    te.push_str(&mks);
     te.push_str("end\n");
 
     let mut ty = header(&format!("{}_Types", c));
