@@ -140,6 +140,9 @@ pub struct BodyTr<'a, 'tcx> {
     /// The generic arguments of the instance being translated (`None`: the generic body itself).
     args: Option<GenericArgsRef<'tcx>>,
     locals: HashMap<HirId, Local>,
+    /// the mutable reference matched by the `match`/`if let`/`while let` being translated, if
+    /// any (see `scrut_place`): patterns bind by mutable reference into it
+    match_place: Option<Tr>,
     fresh: usize,
     pub calls: crate::frontend::DefSet<'tcx>,
     pub comments: Vec<String>,
@@ -158,6 +161,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             owner,
             args,
             locals: HashMap::new(),
+            match_place: None,
             fresh: 0,
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
@@ -428,7 +432,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if let Some(els) = l.els {
             let init = l.init.ok_or(Unsup("let-else without initializer".into()))?;
             let iv = self.scrut(init)?;
-            let p = self.pat(l.pat)?;
+            let place = self.scrut_place(init)?;
+            let p = self.pat_at(l.pat, place)?;
             let els_s = self.block_seq(els.stmts, els.expr)?;
             if p.conds.is_empty() && p.prologue.is_empty() {
                 return Ok((format!("let {} = {} else {{ {} }};", p.pat, iv.at(20), els_s), String::new()));
@@ -2200,7 +2205,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let c = Self::strip_drop_temps(c);
         if let ExprKind::Let(le) = c.kind {
             let iv = self.scrut(le.init)?;
-            let p = self.pat(le.pat)?;
+            let place = self.scrut_place(le.init)?;
+            let p = self.pat_at(le.pat, place)?;
             let tb = with_prologue(&p.prologue, &self.branch(t)?);
             let eb = match el { Some(x) => self.branch(x)?, None => "()".into() };
             // uRust's `if let`, like its `while let`, takes no pattern conditions and only
@@ -2290,7 +2296,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let cond = Self::strip_drop_temps(cond);
                 if let ExprKind::Let(le) = cond.kind {
                     let iv = self.scrut(le.init)?;
-                    let p = self.pat(le.pat)?;
+                    let place = self.scrut_place(le.init)?;
+                    let p = self.pat_at(le.pat, place)?;
                     let body = with_prologue(&p.prologue, &self.branch(then)?);
                     let tuple = matches!(le.pat.kind, PatKind::Tuple(..)) || tuple_of_non_variables(le.pat);
                     if p.conds.is_empty() && !tuple {
@@ -2427,6 +2434,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn match_expr(&mut self, scrut: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         let st = self.ty_adj(scrut);
         let sv = self.scrut(scrut)?;
+        let place = self.scrut_place(scrut)?;
         if self.int_like(st) || arms.iter().all(|a| self.chainable(a.pat)) {
             return self.match_chain(sv, arms);
         }
@@ -2434,12 +2442,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             .iter()
             .any(|a| Self::irrefutable_shape(a.pat) && (a.guard.is_some() || Self::has_lit(a.pat)));
         if !needs_split {
-            let m = self.match_arms(&sv, arms)?;
+            let m = self.match_arms(&sv, &place, arms)?;
             return Ok(Tr::new(format!("match {} {{\n{}\n}}", sv.at(20), m), 20));
         }
         let tmp = self.fresh("scrut");
         let tv = Tr::atom(tmp.clone());
-        let m = self.match_arms(&tv, arms)?;
+        let m = self.match_arms(&tv, &place, arms)?;
         Ok(Tr::block(format!("{{\nlet {} = {};\nmatch {} {{\n{}\n}}\n}}", tmp, sv.at(20), tmp, m)))
     }
 
@@ -2447,10 +2455,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// condition (guard or literal sub-pattern) becomes a single arm whose body tests the
     /// condition and matches the remaining arms otherwise: uRust would else generate a
     /// redundant catch-all case, which HOL rejects.
-    fn match_arms(&mut self, v: &Tr, arms: &'tcx [hir::Arm<'tcx>]) -> R<String> {
+    fn match_arms(&mut self, v: &Tr, place: &Option<Tr>, arms: &'tcx [hir::Arm<'tcx>]) -> R<String> {
         let mut out = vec![];
         for (i, arm) in arms.iter().enumerate() {
-            let p = self.pat(arm.pat)?;
+            let p = self.pat_at(arm.pat, place.clone())?;
             let mut conds = p.conds.clone();
             if let Some(g) = arm.guard {
                 if contains_let(g) {
@@ -2462,7 +2470,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let irref = Self::irrefutable_shape(arm.pat);
             if irref && !conds.is_empty() {
                 let rest = if i + 1 < arms.len() {
-                    format!("match {} {{\n{}\n}}", v.at(20), self.match_arms(v, &arms[i + 1..])?)
+                    format!("match {} {{\n{}\n}}", v.at(20), self.match_arms(v, place, &arms[i + 1..])?)
                 } else {
                     "panic!(\"non-exhaustive match\")".to_string()
                 };
@@ -2658,20 +2666,64 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn pat(&mut self, pat: &'tcx hir::Pat<'tcx>) -> R<PatTr> {
         let mut conds = vec![];
         let mut prologue = vec![];
-        let s = self.pat_rec(pat, &mut conds, &mut prologue)?;
+        let place = self.match_place.clone();
+        let s = self.pat_rec(pat, &mut conds, &mut prologue, place)?;
         Ok(PatTr { pat: s, conds, prologue })
     }
 
-    fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>) -> R<String> {
+    /// `pat` matching a value behind the mutable reference `place` (see `scrut_place`).
+    fn pat_at(&mut self, pat: &'tcx hir::Pat<'tcx>, place: Option<Tr>) -> R<PatTr> {
+        self.match_place = place;
+        let r = self.pat(pat);
+        self.match_place = None;
+        r
+    }
+
+    /// The mutable reference a scrutinee `e` of type `&mut T` evaluates to, when evaluating it
+    /// again has no effect (a pattern binding by mutable reference is focused into it).
+    fn scrut_place(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
+        let simple = match e.kind {
+            ExprKind::AddrOf(_, hir::Mutability::Mut, inner) => self.is_simple(inner),
+            _ => self.is_simple(e),
+        };
+        match self.ty_adj(e).kind() {
+            ty::Ref(_, inner, m) if m.is_mut() && !inner.is_ref() && simple => Ok(Some(self.val(e)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The reference to component `k` of the value of type `t` behind the reference `r`: a field
+    /// of a local struct translated as a record, or a tuple component.
+    fn place_field(&mut self, r: &Tr, t: Ty<'tcx>, k: usize) -> Option<Tr> {
+        match t.kind() {
+            ty::Adt(def, _) if def.is_struct() && def.did().is_local() && self.fe.record_adts.contains(&def.did()) => {
+                Some(Tr::new(format!("{}.{}", r.at(99), self.fe.field_name(def.did(), 0, k)), 100))
+            }
+            ty::Tuple(ts) if ts.len() <= 16 => {
+                let lens = vec!["snd\\<^sub>L"; k].into_iter().chain(["fst\\<^sub>L"]).collect::<Vec<_>>().join(" \\<circ>\\<^sub>L ");
+                Some(Tr::new(format!("\\<llangle>focus_reference_via_lens ({})\\<rrangle>\\<^sub>1({})", lens, r.s), 999))
+            }
+            _ => None,
+        }
+    }
+
+    /// `place`: the mutable reference to the value matched by `pat`, if known (see `scrut_place`).
+    fn pat_rec(&mut self, pat: &'tcx hir::Pat<'tcx>, conds: &mut Vec<String>, pro: &mut Vec<String>, place: Option<Tr>) -> R<String> {
+        // a binding by mutable reference (`ref mut x`, or after match ergonomics): the reference
+        // focused to the matched part, bound before the arm's body; the pattern does not bind
+        if let PatKind::Binding(_, hid, ident, sub) = pat.kind
+            && let Some(hir::BindingMode(hir::ByRef::Yes(_, mutbl), _)) = self.typeck.pat_binding_modes().get(hid)
+            && mutbl.is_mut()
+        {
+            let (Some(r), None) = (place, sub) else { return unsup("binding by mutable reference (match ergonomics)") };
+            let n = names::local_name(ident.as_str());
+            self.declare(hid, &n, hir::Mutability::Not)?;
+            pro.push(format!("let {} = {};", n, r.at(20)));
+            return Ok("_".into());
+        }
         match pat.kind {
             PatKind::Wild => Ok("_".into()),
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
-                // binding mode after match ergonomics
-                if let Some(hir::BindingMode(hir::ByRef::Yes(_, mutbl), _)) = self.typeck.pat_binding_modes().get(hid)
-                    && mutbl.is_mut()
-                {
-                    return unsup("binding by mutable reference (match ergonomics)");
-                }
                 let n = names::local_name(ident.as_str());
                 self.declare(hid, &n, m)?;
                 if m.is_mut() {
@@ -2690,7 +2742,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         Ok(n)
                     }
                     Some(s) => {
-                        let inner = self.pat_rec(s, conds, pro)?;
+                        let inner = self.pat_rec(s, conds, pro, None)?;
                         Ok(format!("{} @ {}", n, if inner.contains(' ') { format!("({})", inner) } else { inner }))
                     }
                 }
@@ -2701,27 +2753,39 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 if n < 2 { return unsup("tuple pattern with fewer than 2 components") }
                 let mut parts = vec![];
-                for p in expand_dotdot(ps, ddpos, n) {
-                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro)?, None => "_".into() });
+                for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
+                    let pl = place.as_ref().and_then(|r| self.place_field(r, t, k));
+                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro, pl)?, None => "_".into() });
                 }
                 Ok(format!("({})", parts.join(", ")))
             }
             PatKind::TupleStruct(ref qp, ps, ddpos) => {
                 let (adt, vidx) = self.pat_variant(qp, pat)?;
+                let t = self.pat_ty(pat).peel_refs();
                 let n = self.tcx.adt_def(adt).variant(vidx.into()).fields.len();
                 let mut parts = vec![];
-                for p in expand_dotdot(ps, ddpos, n) {
-                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro)?, None => "_".into() });
+                for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
+                    // into `Some`: AutoCorrode's `focus_option`; into a struct: its field
+                    let pl = place.as_ref().and_then(|r| {
+                        if self.fe.std_adt(adt) == Some("Option") {
+                            Some(Tr::new(format!("\\<llangle>focus_option\\<rrangle>\\<^sub>1({})", r.s), 999))
+                        } else {
+                            self.place_field(r, t, k)
+                        }
+                    });
+                    parts.push(match p { Some(p) => self.pat_rec(p, conds, pro, pl)?, None => "_".into() });
                 }
                 self.ctor_pat(adt, vidx, parts)
             }
             PatKind::Struct(ref qp, fields, _) => {
                 let (adt, vidx) = self.pat_variant(qp, pat)?;
+                let t = self.pat_ty(pat).peel_refs();
                 let n = self.tcx.adt_def(adt).variant(vidx.into()).fields.len();
                 let mut parts = vec!["_".to_string(); n];
                 for f in fields.iter() {
                     let idx = self.typeck.field_index(f.hir_id).as_usize();
-                    parts[idx] = self.pat_rec(f.pat, conds, pro)?;
+                    let pl = place.as_ref().and_then(|r| self.place_field(r, t, idx));
+                    parts[idx] = self.pat_rec(f.pat, conds, pro, pl)?;
                 }
                 self.ctor_pat(adt, vidx, parts)
             }
@@ -2748,17 +2812,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 for p in ps.iter() {
                     let mut c2 = vec![];
                     let mut p2 = vec![];
-                    parts.push(self.pat_rec(p, &mut c2, &mut p2)?);
+                    parts.push(self.pat_rec(p, &mut c2, &mut p2, None)?);
                     if !c2.is_empty() || !p2.is_empty() { return unsup("or-pattern with literal sub-patterns or mutable bindings") }
                 }
                 Ok(parts.join(" | "))
             }
-            PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro),
+            PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_rec(p, conds, pro, place),
             PatKind::Slice(before, None, after) if after.is_empty() => {
                 let t = self.pat_ty(pat).peel_refs();
                 if !matches!(t.kind(), ty::Slice(_) | ty::Array(..)) { return unsup("slice pattern") }
                 let mut parts = vec![];
-                for p in before.iter() { parts.push(self.pat_rec(p, conds, pro)?); }
+                for p in before.iter() { parts.push(self.pat_rec(p, conds, pro, None)?); }
                 Ok(format!("[{}]", parts.join(", ")))
             }
             PatKind::Slice(..) => unsup("slice pattern with a rest pattern"),
