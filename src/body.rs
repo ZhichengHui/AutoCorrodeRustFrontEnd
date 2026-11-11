@@ -494,6 +494,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Destructure an irrefutable pattern by projections. Returns `let` statements.
+    /// Is the value `pat` destructures a mutable reference (match ergonomics), so that its parts
+    /// are references focused into it (see `place_field`)?
+    fn through_mut_ref(&self, pat: &'tcx hir::Pat<'tcx>) -> bool {
+        // the implicit dereferences of match ergonomics, with the types before them
+        self.typeck
+            .pat_adjustments()
+            .get(pat.hir_id)
+            .is_some_and(|adj| adj.iter().any(|a| matches!(a.source.kind(), ty::Ref(_, _, m) if m.is_mut())))
+    }
+
     fn irrefutable(&mut self, pat: &'tcx hir::Pat<'tcx>, v: &Tr) -> R<Vec<String>> {
         let mut out = vec![];
         match pat.kind {
@@ -509,11 +519,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(..) => return unsup("`ref mut` binding"),
             PatKind::Tuple(ps, ddpos) => {
                 let t = self.pat_ty(pat).peel_refs();
+                let through_ref = self.through_mut_ref(pat);
                 let n = match t.kind() { ty::Tuple(ts) => ts.len(), _ => ps.len() };
                 for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
                     if let Some(p) = p {
                         if n > 16 { return unsup("tuple with more than 16 components") }
-                        let proj = Tr::new(format!("{}.{}", v.at(998), k), 998);
+                        let proj = if through_ref {
+                            self.place_field(v, t, k).ok_or_else(|| Unsup("tuple component through a mutable reference".into()))?
+                        } else {
+                            Tr::new(format!("{}.{}", v.at(998), k), 998)
+                        };
                         out.extend(self.irrefutable(p, &proj)?);
                     }
                 }
@@ -523,9 +538,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let ty::Adt(def, _) = t.kind() else { return unsup("struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable struct pattern in irrefutable position") }
                 let adt = def.did();
+                let through_ref = self.through_mut_ref(pat);
                 for f in fields.iter() {
                     let fidx = self.typeck.field_index(f.hir_id).as_usize();
-                    let proj = self.field_read(adt, fidx, v)?;
+                    let proj = if through_ref {
+                        self.place_field(v, t, fidx).ok_or_else(|| Unsup("field of a recursive struct through a reference".into()))?
+                    } else {
+                        self.field_read(adt, fidx, v)?
+                    };
                     out.extend(self.irrefutable(f.pat, &proj)?);
                 }
             }
@@ -534,10 +554,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let ty::Adt(def, _) = t.kind() else { return unsup("tuple-struct pattern on non-ADT") };
                 if !def.is_struct() || !def.did().is_local() { return unsup("refutable tuple-struct pattern in irrefutable position") }
                 let adt = def.did();
+                let through_ref = self.through_mut_ref(pat);
                 let n = def.non_enum_variant().fields.len();
                 for (k, p) in expand_dotdot(ps, ddpos, n).into_iter().enumerate() {
                     if let Some(p) = p {
-                        let proj = self.field_read(adt, k, v)?;
+                        let proj = if through_ref {
+                            self.place_field(v, t, k).ok_or_else(|| Unsup("field of a recursive struct through a reference".into()))?
+                        } else {
+                            self.field_read(adt, k, v)?
+                        };
                         out.extend(self.irrefutable(p, &proj)?);
                     }
                 }
