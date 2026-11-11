@@ -17,7 +17,7 @@ use crate::names;
 pub type FnKey<'tcx> = (DefId, Option<GenericArgsRef<'tcx>>);
 
 /// Instances of one generic function at most; more (e.g. polymorphic recursion) are not translated.
-pub const MAX_INSTANCES: usize = 16;
+pub const MAX_INSTANCES: usize = 64;
 
 /// Insertion-ordered set of functions (DefId is not `Ord`).
 #[derive(Default, Clone)]

@@ -330,6 +330,17 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
         self.tcx
     }
 
+    // a mutable local (or parameter) of a type with generic parameters needs a locale prism for
+    // that type, which only an instance has
+    fn visit_pat(&mut self, p: &'tcx hir::Pat<'tcx>) {
+        if let hir::PatKind::Binding(hir::BindingMode(_, hir::Mutability::Mut), ..) = p.kind
+            && self.typeck.pat_ty(p).has_param()
+        {
+            self.dependent = true;
+        }
+        intravisit::walk_pat(self, p);
+    }
+
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
         if let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) {
             self.call(did, self.typeck.node_args(e.hir_id));
@@ -346,7 +357,8 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
 }
 
 /// The generic functions translated per instance: trait default methods, and generic functions
-/// with a call depending on their generic parameters, directly or through other such functions.
+/// with a call depending on their generic parameters or a mutable local of a generic type,
+/// directly or through other such functions.
 fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefId]) -> HashSet<DefId> {
     let tcx = fe.tcx;
     let mut mono: HashSet<DefId> = default_methods.iter().copied().collect();

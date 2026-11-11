@@ -1400,7 +1400,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Res::Local(hid) => {
                 let Some(l) = self.locals.get(&hid).cloned() else { return unsup("call of unknown local") };
                 let mut t = self.ty_of(callee);
-                if !matches!(t.peel_refs().kind(), ty::Closure(..)) {
+                // a closure, or a function item (whose value is the closure calling it, see
+                // `fn_item_value`), e.g. in an instance at the closure's or function's type
+                if !matches!(t.peel_refs().kind(), ty::Closure(..) | ty::FnDef(..)) {
                     return unsup("call through a generic `Fn` parameter (trait call in generic code)");
                 }
                 // the closure value is read out of the local's cell and through the references
@@ -2844,38 +2846,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
         let gargs = tcx.instantiate_bound_regions_with_erased(gargs);
-        // passed for a type parameter of a local function: the generic function calls it only
-        // through its `Fn` bound (a placeholder), while the call would put the two functions in
-        // one recursion group, where that type parameter is fixed
-        // (through `&` and temporaries; a function item passed through a local variable is not
-        // seen here)
-        let mut arg = e;
-        let mut parent = tcx.parent_hir_node(e.hir_id);
-        while let hir::Node::Expr(p) = parent
-            && matches!(p.kind, ExprKind::AddrOf(..) | ExprKind::DropTemps(_))
-        {
-            arg = p;
-            parent = tcx.parent_hir_node(p.hir_id);
-        }
-        if let hir::Node::Expr(p) = parent {
-            let (callee, pos) = match p.kind {
-                ExprKind::Call(c, args) => (
-                    match *self.ty_of(c).kind() { ty::FnDef(d, _) => Some(d), _ => None },
-                    args.iter().position(|a| a.hir_id == arg.hir_id),
-                ),
-                ExprKind::MethodCall(_, _, args, _) => (
-                    self.typeck.type_dependent_def_id(p.hir_id),
-                    args.iter().position(|a| a.hir_id == arg.hir_id).map(|i| i + 1),
-                ),
-                _ => (None, None),
-            };
-            if let (Some(d), Some(i)) = (callee, pos)
-                && d.is_local()
-                && matches!(tcx.fn_sig(d).instantiate_identity().skip_binder().inputs().get(i).map(|t| t.peel_refs().kind()), Some(ty::Param(_)))
-            {
-                return unsup("function item passed for a type parameter of a local function");
-            }
-        }
         let (target, targs) = if self.fe.is_trait_item(did) {
             match ty::Instance::try_resolve(tcx, self.typing_env(), did, gargs) {
                 Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) => (rd, args),
