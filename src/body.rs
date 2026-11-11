@@ -18,7 +18,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::traits;
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
+use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
 use crate::frontend::{FnKey, Frontend, GenCall, Inst};
@@ -29,6 +29,25 @@ type R<T> = Result<T, Unsup>;
 
 fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
+}
+
+/// Replaces the `impl Trait` types by their hidden types (those containing themselves are kept).
+struct RevealOpaque<'tcx>(TyCtxt<'tcx>);
+
+impl<'tcx> ty::TypeFolder<TyCtxt<'tcx>> for RevealOpaque<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
+        self.0
+    }
+
+    fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
+        if let ty::Alias(_, a) = t.kind()
+            && let ty::AliasTyKind::Opaque { def_id } = a.kind
+            && let Ok(h) = self.0.try_expand_impl_trait_type(def_id, a.args)
+        {
+            return h;
+        }
+        t.super_fold_with(self)
+    }
 }
 
 /// `f(args)` for the HOL term `f` of a function value and the uRust arguments `a`.
@@ -1857,11 +1876,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// The candidate implementing the trait reference `r` in the body's typing environment.
+    /// The candidate implementing the trait reference `r` in the body's typing environment (an
+    /// `impl Trait` type in it is its hidden type, as for its HOL type, see `Frontend::ty`).
     fn select(&self, r: ty::TraitRef<'tcx>) -> R<&'tcx traits::ImplSource<'tcx, ()>> {
         let tcx = self.tcx;
         let env = self.typing_env();
-        let r = tcx.erase_and_anonymize_regions(r);
+        let r = tcx.erase_and_anonymize_regions(r.fold_with(&mut RevealOpaque(tcx)));
         let r = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(r)).unwrap_or(r);
         tcx.codegen_select_candidate(env.as_query_input(r)).map_err(|_| Unsup(format!("implementation of `{}`", r)))
     }
@@ -1900,24 +1920,26 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     .find_map(|(p, n)| self.bound_dict(p, n, r))
                     .ok_or_else(|| Unsup(format!("bound `{}` without a dictionary", r)))
             }
-            traits::ImplSource::Builtin(..) => self.builtin_dict(r),
+            traits::ImplSource::Builtin(..) => self.model_dict(r, "built-in"),
         }
     }
 
-    /// The dictionary of a built-in implementation: `Clone` of a `Copy` type (copying), or a trait
-    /// without methods of its own (e.g. `Copy`: its supertraits' dictionaries).
-    fn builtin_dict(&mut self, r: ty::TraitRef<'tcx>) -> R<String> {
+    /// The dictionary of a built-in or derived implementation of `r` (`what`): its methods are
+    /// the models of their direct calls (see `std_call`): `clone` is the value itself (a value is
+    /// its clone), `clone_from` assigns, `eq` and `ne` of a type with itself are HOL (in)equality;
+    /// the dictionaries of the supertraits are fields. Other methods have no model.
+    fn model_dict(&mut self, r: ty::TraitRef<'tcx>, what: &str) -> R<String> {
         let tcx = self.tcx;
-        let unsupported = || unsup(format!("dictionary of the built-in implementation of `{}`", r));
-        let copy = tcx.type_is_copy_modulo_regions(self.typing_env(), r.self_ty());
+        let unsupported = || unsup(format!("dictionary of the {} implementation of `{}`", what, r));
+        let clone = tcx.is_lang_item(r.def_id, LangItem::Clone);
+        let eq = tcx.is_lang_item(r.def_id, LangItem::PartialEq) && r.args.type_at(0) == r.args.type_at(1);
         let mut fields = vec![];
         for m in self.fe.dict_methods(r.def_id) {
-            if !(tcx.is_lang_item(r.def_id, LangItem::Clone) && copy) {
-                return unsupported();
-            }
-            fields.push(match tcx.item_name(m).as_str() {
-                "clone" => "(\\<lambda>x. FunctionBody (literal x))".to_string(),
-                "clone_from" => "(\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>)".to_string(),
+            fields.push(match (clone, eq, tcx.item_name(m).as_str()) {
+                (true, _, "clone") => "(\\<lambda>x. FunctionBody (literal x))".to_string(),
+                (true, _, "clone_from") => "(\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>)".to_string(),
+                (_, true, "eq") => "(\\<lambda>a b. FunctionBody \\<lbrakk> a == b \\<rbrakk>)".to_string(),
+                (_, true, "ne") => "(\\<lambda>a b. FunctionBody \\<lbrakk> a != b \\<rbrakk>)".to_string(),
                 _ => return unsupported(),
             });
         }
@@ -1956,10 +1978,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// templates), then the dictionaries of the trait's supertraits.
     fn impl_dict(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
         let tcx = self.tcx;
-        if imp.is_local() && tcx.is_automatically_derived(imp) {
-            return unsup("dictionary of a derived implementation");
-        }
         let r = tcx.impl_trait_ref(imp).instantiate(tcx, args).skip_normalization();
+        if imp.is_local() && tcx.is_automatically_derived(imp) {
+            return self.model_dict(r, "derived");
+        }
         let tr = r.def_id;
         let name = self.fe.dict_name(tr);
         let implementors = tcx.impl_item_implementor_ids(imp);
