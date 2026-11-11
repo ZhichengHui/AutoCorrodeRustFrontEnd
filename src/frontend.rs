@@ -11,10 +11,22 @@ use rustc_span::{Span, Symbol, sym};
 
 use crate::names;
 
-/// A translated function: a local item with a body, either translated once for all its generic
-/// arguments (`None`: type parameters become type variables) or an instance for concrete generic
-/// arguments (`Some`: monomorphisation).
-pub type FnKey<'tcx> = (DefId, Option<GenericArgsRef<'tcx>>);
+/// How a local item with a body is translated.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Inst<'tcx> {
+    /// Once for all its generic arguments: type parameters become type variables, trait bounds
+    /// dictionary parameters.
+    Generic,
+    /// An instance at concrete generic arguments (monomorphisation).
+    Mono(GenericArgsRef<'tcx>),
+    /// A trait default method for an implementation (the `DefId`) that does not override it:
+    /// `Self` is the implementing type, generic over the implementation's parameters, whose trait
+    /// bounds are its dictionary parameters.
+    ImplCopy(DefId),
+}
+
+/// A translated function: a local item with a body, and how it is translated.
+pub type FnKey<'tcx> = (DefId, Inst<'tcx>);
 
 /// Instances of one generic function at most; more (e.g. polymorphic recursion) are not translated.
 pub const MAX_INSTANCES: usize = 64;
@@ -106,6 +118,8 @@ pub struct Frontend<'tcx> {
     /// functions; trait default methods (generic over `Self`).
     pub mono_fns: HashSet<DefId>,
     instance_names: HashMap<(DefId, GenericArgsRef<'tcx>), String>,
+    /// names of the copies of default methods, by (method, implementation)
+    copy_names: HashMap<(DefId, DefId), String>,
     instances_per_fn: HashMap<DefId, usize>,
     /// Instances named but not yet translated.
     pub pending: Vec<FnKey<'tcx>>,
@@ -179,6 +193,7 @@ impl<'tcx> Frontend<'tcx> {
             marker_index: HashMap::new(),
             mono_fns: HashSet::new(),
             instance_names: HashMap::new(),
+            copy_names: HashMap::new(),
             instances_per_fn: HashMap::new(),
             pending: Vec::new(),
             opaque_adts: HashMap::new(),
@@ -238,7 +253,7 @@ impl<'tcx> Frontend<'tcx> {
         // an instance at a type without a uRust model (e.g. a closure type) could not be
         // translated; the generic function, whose type variable it instantiates, is called instead
         if !self.mono_fns.contains(&did) || args.has_param() || !args.types().all(|t| self.ty_dry(t).1) {
-            return Some((did, None));
+            return Some((did, Inst::Generic));
         }
         let args = self.tcx.erase_and_anonymize_regions(args);
         if !self.instance_names.contains_key(&(did, args)) {
@@ -252,17 +267,70 @@ impl<'tcx> Frontend<'tcx> {
             let n = unique(names::global_name(&segs), |n| self.used_names.contains(n));
             self.used_names.insert(n.clone());
             self.instance_names.insert((did, args), n);
-            self.pending.push((did, Some(args)));
+            self.pending.push((did, Inst::Mono(args)));
         }
-        Some((did, Some(args)))
+        Some((did, Inst::Mono(args)))
     }
 
-    /// HOL name of a function (`def_name` of the item, or the name of the instance).
+    /// The copy of the trait default method `did` for the implementation `imp` (queued for
+    /// translation the first time), named after the implementation's items.
+    pub fn impl_copy(&mut self, did: DefId, imp: DefId) -> FnKey<'tcx> {
+        if !self.copy_names.contains_key(&(did, imp)) {
+            let mut segs = self.path_segments(imp);
+            segs.push(self.tcx.item_name(did).to_string());
+            let n = unique(names::global_name(&segs), |n| self.used_names.contains(n));
+            self.used_names.insert(n.clone());
+            self.copy_names.insert((did, imp), n);
+            self.pending.push((did, Inst::ImplCopy(imp)));
+        }
+        (did, Inst::ImplCopy(imp))
+    }
+
+    /// HOL name of a function (`def_name` of the item, or the name of the instance or copy).
     pub fn fn_name(&mut self, key: FnKey<'tcx>) -> String {
         match key.1 {
-            None => self.def_name(key.0),
-            Some(args) => self.instance_names[&(key.0, args)].clone(),
+            Inst::Generic => self.def_name(key.0),
+            Inst::Mono(args) => self.instance_names[&(key.0, args)].clone(),
+            Inst::ImplCopy(imp) => self.copy_names[&(key.0, imp)].clone(),
         }
+    }
+
+    /// The generic arguments `key` instantiates its item's generic parameters with, if any: an
+    /// instance's, or for a default method's copy the implementation's trait arguments (and its
+    /// own lifetimes, erased).
+    pub fn inst_args(&self, key: FnKey<'tcx>) -> Option<GenericArgsRef<'tcx>> {
+        match key.1 {
+            Inst::Generic => None,
+            Inst::Mono(args) => Some(args),
+            Inst::ImplCopy(imp) => {
+                let tr = self.tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization();
+                let parent = tr.args.len();
+                Some(ty::GenericArgs::for_item(self.tcx, key.0, |p, _| {
+                    if (p.index as usize) < parent { tr.args[p.index as usize] } else { self.tcx.lifetimes.re_erased.into() }
+                }))
+            }
+        }
+    }
+
+    /// The typing environment of the body of `key`: an instance has no generic parameters left,
+    /// a copy has those of its implementation.
+    pub fn inst_env(&self, key: FnKey<'tcx>) -> ty::TypingEnv<'tcx> {
+        match key.1 {
+            Inst::Generic => ty::TypingEnv::post_analysis(self.tcx, key.0),
+            Inst::Mono(_) => ty::TypingEnv::fully_monomorphized(),
+            Inst::ImplCopy(imp) => ty::TypingEnv::post_analysis(self.tcx, imp),
+        }
+    }
+
+    /// `x` (from the type-checking results of the body of `key.0`) as the body of `key` sees it:
+    /// at its generic arguments, normalised in its typing environment.
+    pub fn at_key<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, key: FnKey<'tcx>, x: T) -> T {
+        let env = self.inst_env(key);
+        let x = match self.inst_args(key) {
+            Some(args) => ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args),
+            None => ty::Unnormalized::new_wip(x),
+        };
+        self.tcx.try_normalize_erasing_regions(env, x).unwrap_or_else(|_| x.skip_normalization())
     }
 
     // ------------------------------------------------------------------

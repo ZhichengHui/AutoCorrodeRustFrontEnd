@@ -20,7 +20,7 @@ use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, Der
 use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
-use crate::frontend::Frontend;
+use crate::frontend::{FnKey, Frontend, Inst};
 use crate::names;
 
 pub struct Unsup(pub String);
@@ -139,8 +139,8 @@ pub struct BodyTr<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
     owner: LocalDefId,
-    /// The generic arguments of the instance being translated (`None`: the generic body itself).
-    args: Option<GenericArgsRef<'tcx>>,
+    /// What is translated: the generic body itself, an instance, or a default method's copy.
+    key: FnKey<'tcx>,
     locals: HashMap<HirId, Local>,
     /// the mutable reference matched by the `match`/`if let`/`while let` being translated, if
     /// any (see `scrut_place`): patterns bind by mutable reference into it
@@ -155,15 +155,16 @@ pub struct BodyTr<'a, 'tcx> {
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
 
 impl<'a, 'tcx> BodyTr<'a, 'tcx> {
-    pub fn new(fe: &'a mut Frontend<'tcx>, owner: LocalDefId, args: Option<GenericArgsRef<'tcx>>) -> Self {
+    pub fn new(fe: &'a mut Frontend<'tcx>, key: FnKey<'tcx>) -> Self {
         let tcx = fe.tcx;
+        let owner = key.0.expect_local();
         let typeck = tcx.typeck(owner);
         BodyTr {
             fe,
             tcx,
             typeck,
             owner,
-            args,
+            key,
             locals: HashMap::new(),
             match_place: None,
             pat_refs: vec![],
@@ -173,20 +174,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// A type or generic arguments from the type-checking results, at the instance's arguments.
+    /// A type or generic arguments from the type-checking results, at the instance's or copy's
+    /// arguments.
     fn mono<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, x: T) -> T {
-        match self.args {
-            Some(a) => self.fe.mono(a, x),
-            None => x,
+        match self.key.1 {
+            Inst::Generic => x,
+            _ => self.fe.at_key(self.key, x),
         }
     }
 
-    /// The typing environment of the body: no generic parameters are left in an instance.
+    /// The typing environment of the body: no generic parameters are left in an instance; a copy
+    /// has those of its implementation.
     fn typing_env(&self) -> ty::TypingEnv<'tcx> {
-        match self.args {
-            Some(_) => ty::TypingEnv::fully_monomorphized(),
-            None => ty::TypingEnv::post_analysis(self.tcx, self.owner.to_def_id()),
-        }
+        self.fe.inst_env(self.key)
     }
 
     fn node_ty(&self, hid: HirId) -> Ty<'tcx> { self.mono(self.typeck.node_type(hid)) }
@@ -219,12 +219,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn hty(&mut self, t: Ty<'tcx>) -> String {
         // normalised as the signature is (`translate`): in a generic body, in the item's own typing
         // environment, which also reveals its `impl Trait` types; an instance's types are already
-        let t = match self.args {
-            None => self
+        let t = match self.key.1 {
+            Inst::Generic => self
                 .tcx
                 .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
                 .unwrap_or(t),
-            Some(_) => t,
+            _ => t,
         };
         self.fe.ty(t)
     }
@@ -1230,8 +1230,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("`static mut`");
         }
         if did.is_local() && self.tcx.hir_maybe_body_owned_by(did.expect_local()).is_some() && !self.fe.is_trait_item(did) {
-            self.calls.insert((did, None));
-            let m = self.fe.marker((did, None));
+            self.calls.insert((did, Inst::Generic));
+            let m = self.fe.marker((did, Inst::Generic));
             return Ok(Tr::new(format!("\u{1}Z{}\u{2}", m), 999));
         }
         if let Some(lit) = self.scalar_const(did, t) {
@@ -1785,7 +1785,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup(format!("more than {} instances of a generic function", crate::frontend::MAX_INSTANCES));
         };
         // a default method is generic over `Self`: only its instances are translated
-        if self.fe.is_trait_item(did) && key.1.is_none() { return unsup("call of a trait default method") }
+        if self.fe.is_trait_item(did) && key.1 == Inst::Generic { return unsup("call of a trait default method") }
         self.calls.insert(key);
         let m = self.fe.marker(key);
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();

@@ -12,7 +12,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
-use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, field_ty, one_line, paren_ty};
+use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, one_line, paren_ty};
 use crate::names;
 
 pub struct Options {
@@ -146,7 +146,7 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         fe.def_name(d);
     }
     for &d in &bodies {
-        translate_item(&mut fe, (d, None));
+        translate_item(&mut fe, (d, Inst::Generic));
     }
     // instances called from the translated bodies, and from those instances
     while let Some(key) = fe.pending.pop() {
@@ -435,21 +435,17 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let is_fn = matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn);
     let name = fe.fn_name(key);
     let rust_path = match key.1 {
-        None => tcx.def_path_str(did),
-        Some(args) => tcx.def_path_str_with_args(did, args),
+        Inst::Generic => tcx.def_path_str(did),
+        Inst::Mono(args) => tcx.def_path_str_with_args(did, args),
+        Inst::ImplCopy(imp) => format!("{} (default method, for {})", tcx.def_path_str(did), tcx.def_path_str(imp)),
     };
     let (params, ret): (Vec<(String, bool)>, (String, bool)) = if is_fn {
         let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(did).instantiate_identity().skip_normalization());
         // an instance's types at its arguments; a generic item's projections normalised in its own
         // typing environment (e.g. `<Iter<T> as Iterator>::Item` through the impl)
-        let at = |t: Ty<'tcx>| match key.1 {
-            Some(args) => fe.mono(args, t),
-            None => tcx
-                .try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, did), ty::Unnormalized::new_wip(t))
-                .unwrap_or(t),
-        };
+        let at = |t: Ty<'tcx>| fe.at_key(key, t);
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
-        if key.1.is_none() {
+        if key.1 == Inst::Generic {
             fe.register_ext_adts(&tys);
             fe.proj_tvars = proj_tvars(fe, did, &tys);
         }
@@ -514,7 +510,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         return fd;
     }
     let body = tcx.hir_body_owned_by(ld);
-    let mut bt = BodyTr::new(fe, ld, key.1);
+    let mut bt = BodyTr::new(fe, key);
     let res = bt.fn_body(body);
     let calls = std::mem::take(&mut bt.calls);
     let comments = std::mem::take(&mut bt.comments);
