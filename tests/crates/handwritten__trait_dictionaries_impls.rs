@@ -28,3 +28,8 @@ pub fn use_mk(x: u32) -> u32 { let g = mk(x); twice(&g) }
 pub fn total<I: IntoIterator<Item = u32>>(xs: I) -> u32 { let mut s = 0; for x in xs { s += x; } s }
 pub trait Family { type Of<T>; fn wrap<T>(t: T) -> Self::Of<T>; }
 pub fn wrap_u32<F: Family>(x: u32) -> F::Of<u32> { F::wrap(x) }
+// a projection reached through an associated type bound that is no dictionary field (it reaches the
+// trait again), and one only in the type of an `Fn` bound: type variables of their own
+pub trait Node { type Child: Node; fn child(&self) -> Self::Child; }
+pub fn grandchild<N: Node>(n: &N) -> <N::Child as Node>::Child { n.child().child() }
+pub fn apply_of<F: Family, G: Fn(F::Of<u32>) -> u32>(g: G, x: u32) -> u32 { g(F::wrap(x)) }
