@@ -18,7 +18,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::traits;
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeckResults};
+use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
 use crate::frontend::{FnKey, Frontend, GenCall, Inst};
@@ -29,25 +29,6 @@ type R<T> = Result<T, Unsup>;
 
 fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
-}
-
-/// Replaces the `impl Trait` types by their hidden types (those containing themselves are kept).
-struct RevealOpaque<'tcx>(TyCtxt<'tcx>);
-
-impl<'tcx> ty::TypeFolder<TyCtxt<'tcx>> for RevealOpaque<'tcx> {
-    fn cx(&self) -> TyCtxt<'tcx> {
-        self.0
-    }
-
-    fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Alias(_, a) = t.kind()
-            && let ty::AliasTyKind::Opaque { def_id } = a.kind
-            && let Ok(h) = self.0.try_expand_impl_trait_type(def_id, a.args)
-        {
-            return h;
-        }
-        t.super_fold_with(self)
-    }
 }
 
 /// `f(args)` for the HOL term `f` of a function value and the uRust arguments `a`.
@@ -256,10 +237,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // normalised as the signature is (`translate`): in a generic body, in the item's own typing
         // environment, which also reveals its `impl Trait` types; an instance's types are already
         let t = match self.key.1 {
-            Inst::Generic => self
-                .tcx
-                .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
-                .unwrap_or(t),
+            Inst::Generic => crate::frontend::normalize(self.tcx, self.typing_env(), ty::Unnormalized::new_wip(t)).unwrap_or(t),
             _ => t,
         };
         self.fe.ty(t)
@@ -1892,8 +1870,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn resolve_instance(&self, did: DefId, args: GenericArgsRef<'tcx>) -> Result<Option<ty::Instance<'tcx>>, rustc_span::ErrorGuaranteed> {
         let tcx = self.tcx;
         let env = self.typing_env();
-        let args = tcx.erase_and_anonymize_regions(args.fold_with(&mut RevealOpaque(tcx)));
-        match tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(args)) {
+        let args = tcx.erase_and_anonymize_regions(args);
+        match crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(args)) {
             Ok(args) => ty::Instance::try_resolve(tcx, env, did, args),
             Err(_) => Ok(None),
         }
@@ -1904,8 +1882,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn select(&self, r: ty::TraitRef<'tcx>) -> R<&'tcx traits::ImplSource<'tcx, ()>> {
         let tcx = self.tcx;
         let env = self.typing_env();
-        let r = tcx.erase_and_anonymize_regions(r.fold_with(&mut RevealOpaque(tcx)));
-        let r = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(r)).unwrap_or(r);
+        let r = tcx.erase_and_anonymize_regions(r);
+        let r = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(r)).unwrap_or(r);
         tcx.codegen_select_candidate(env.as_query_input(r)).map_err(|_| Unsup(format!("implementation of `{}`", r)))
     }
 
@@ -1950,7 +1928,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let tcx = self.tcx;
             let env = self.typing_env();
             let norm = |x: ty::Unnormalized<'tcx, Ty<'tcx>>| {
-                tcx.erase_and_anonymize_regions(tcx.try_normalize_erasing_regions(env, x).unwrap_or_else(|_| x.skip_normalization()))
+                tcx.erase_and_anonymize_regions(crate::frontend::normalize(tcx, env, x).unwrap_or_else(|_| x.skip_normalization()))
             };
             let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(key.0).instantiate_identity().skip_normalization());
             for t in sig.inputs_and_output {
@@ -2091,7 +2069,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let norm = |x: ty::TraitRef<'tcx>| {
             let x = tcx.erase_and_anonymize_regions(x);
-            tcx.try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(x)).unwrap_or(x)
+            crate::frontend::normalize(tcx, self.typing_env(), ty::Unnormalized::new_wip(x)).unwrap_or(x)
         };
         if norm(p) == norm(r) {
             return Some(d);

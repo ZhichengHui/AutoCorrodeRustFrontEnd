@@ -6,7 +6,7 @@ use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeVisitableExt};
+use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
 use rustc_span::{Span, Symbol, sym};
 
 use crate::names;
@@ -215,7 +215,21 @@ pub fn word_enum_consts(n: &str) -> Vec<String> {
 }
 
 pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, f: &ty::FieldDef, args: GenericArgsRef<'tcx>, env: ty::TypingEnv<'tcx>) -> Ty<'tcx> {
-    tcx.erase_and_anonymize_regions(tcx.normalize_erasing_regions(env, f.ty(tcx, args)))
+    tcx.erase_and_anonymize_regions(normalize(tcx, env, f.ty(tcx, args)).expect("a field type normalises"))
+}
+
+/// `x` normalised in `env`, with erased regions. The aliases in types from type checking (and in
+/// their instantiations) are marked rigid in its environment and mode, and normalisation skips rigid
+/// aliases; the frontend normalises in other environments (post-analysis, the caller's for a callee's
+/// types), so they are first made non-rigid, as rustc does for MIR after type checking
+/// (`rustc_mir_transform::post_analysis_normalize`). Otherwise an `impl Trait` type is not revealed,
+/// and a projection on one is not normalised.
+pub fn normalize<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
+    tcx: TyCtxt<'tcx>,
+    env: ty::TypingEnv<'tcx>,
+    x: ty::Unnormalized<'tcx, T>,
+) -> Result<T, ty::normalize_erasing_regions::NormalizationError<'tcx>> {
+    tcx.try_normalize_erasing_regions(env, ty::set_aliases_to_non_rigid(tcx, x.skip_normalization()))
 }
 
 pub fn paren_ty(s: &str) -> String {
@@ -394,7 +408,7 @@ impl<'tcx> Frontend<'tcx> {
             Some(args) => ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args),
             None => ty::Unnormalized::new_wip(x),
         };
-        self.tcx.try_normalize_erasing_regions(env, x).unwrap_or_else(|_| x.skip_normalization())
+        normalize(self.tcx, env, x).unwrap_or_else(|_| x.skip_normalization())
     }
 
     // ------------------------------------------------------------------
@@ -603,11 +617,11 @@ impl<'tcx> Frontend<'tcx> {
                     return false;
                 }
                 seen.push(t);
-                // a field that does not normalise (e.g. a projection on an `impl Trait` type, which
-                // the environment does not reveal) stays a projection, which has none
+                // a field that does not normalise (only under impossible bounds, see `normalize`)
+                // stays a projection, which has none
                 def.all_fields().any(|f| {
                     let t = f.ty(tcx, args);
-                    let t = tcx.try_normalize_erasing_regions(env, t).unwrap_or_else(|_| t.skip_normalization());
+                    let t = normalize(tcx, env, t).unwrap_or_else(|_| t.skip_normalization());
                     self.has_cell(tcx.erase_and_anonymize_regions(t), env, seen)
                 })
             }
@@ -706,20 +720,8 @@ impl<'tcx> Frontend<'tcx> {
     /// (e.g. the inner projection of a slot `<<I as A>::X as B>::Y` and of the same type written in
     /// a signature).
     pub fn proj_key(&self, t: Ty<'tcx>) -> Option<ty::AliasTy<'tcx>> {
-        struct NotRigid<'tcx>(TyCtxt<'tcx>);
-        impl<'tcx> ty::TypeFolder<TyCtxt<'tcx>> for NotRigid<'tcx> {
-            fn cx(&self) -> TyCtxt<'tcx> {
-                self.0
-            }
-            fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
-                let t = t.super_fold_with(self);
-                match t.kind() {
-                    ty::Alias(ty::IsRigid::Yes, a) => Ty::new_alias(self.0, ty::IsRigid::No, *a),
-                    _ => t,
-                }
-            }
-        }
-        match self.tcx.erase_and_anonymize_regions(t).fold_with(&mut NotRigid(self.tcx)).kind() {
+        let t = ty::set_aliases_to_non_rigid(self.tcx, self.tcx.erase_and_anonymize_regions(t)).skip_normalization();
+        match t.kind() {
             ty::Alias(_, a) => Some(*a),
             _ => None,
         }
@@ -751,7 +753,7 @@ impl<'tcx> Frontend<'tcx> {
                     ty::Adt(def, args) => {
                         for &p in self.adt_projs.get(&def.did()).into_iter().flatten() {
                             let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
-                            add(self.tcx.try_normalize_erasing_regions(env, at).unwrap_or(at.skip_normalization()), &mut out);
+                            add(normalize(self.tcx, env, at).unwrap_or(at.skip_normalization()), &mut out);
                         }
                     }
                     _ => {}
@@ -843,7 +845,7 @@ impl<'tcx> Frontend<'tcx> {
                             for p in ps {
                                 let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
                                 let at = match self.proj_env {
-                                    Some(env) => self.tcx.try_normalize_erasing_regions(env, at).unwrap_or_else(|_| at.skip_normalization()),
+                                    Some(env) => normalize(self.tcx, env, at).unwrap_or_else(|_| at.skip_normalization()),
                                     None => at.skip_normalization(),
                                 };
                                 a.push(self.ty(at));
@@ -863,7 +865,7 @@ impl<'tcx> Frontend<'tcx> {
                 if let Some(m) = self.proj_tvars.as_ref() && let Some(v) = self.proj_key(t).and_then(|a| m.get(&a)) {
                     return v.clone();
                 }
-                if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
+                if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = normalize(self.tcx, ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
                     if !matches!(n.kind(), ty::Alias(..)) {
                         return self.ty(n);
                     }

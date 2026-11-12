@@ -296,7 +296,7 @@ impl<'tcx> Frontend<'tcx> {
             a.push(self.ty(t));
         }
         for s in self.dict_slots(r) {
-            let s = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(s)).unwrap_or(s);
+            let s = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s)).unwrap_or(s);
             a.push(self.ty(s));
         }
         format!("({}) {}", a.join(", "), n)
@@ -353,7 +353,7 @@ impl<'tcx> Frontend<'tcx> {
         for (index, ins, ret) in self.fn_bounded_params(owner) {
             let norm = |t: Ty<'tcx>| {
                 let t = tcx.erase_and_anonymize_regions(t);
-                tcx.try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, owner), ty::Unnormalized::new_wip(t)).unwrap_or(t)
+                crate::frontend::normalize(tcx, ty::TypingEnv::post_analysis(tcx, owner), ty::Unnormalized::new_wip(t)).unwrap_or(t)
             };
             let ps: Vec<String> = ins.iter().map(|t| self.ty(norm(*t))).collect();
             let r = self.ty(norm(ret));
