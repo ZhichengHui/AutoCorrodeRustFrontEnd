@@ -9,10 +9,11 @@ use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
+use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
-use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, one_line, paren_ty};
+use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, mentions_adt, one_line, paren_ty};
 use crate::names;
 
 pub struct Options {
@@ -514,6 +515,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         ret_ty,
         params: vec![],
         body: String::new(),
+        data: None,
         calls: crate::frontend::DefSet::default(),
         comments: vec![],
         n_dicts: dicts.len(),
@@ -561,6 +563,10 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         fn_placeholder(fe, &mut fd, "item without body");
         return fd;
     }
+    if let Some(data) = const_data(fe, did) {
+        fd.data = Some(data);
+        return fd;
+    }
     let body = tcx.hir_body_owned_by(ld);
     let mut bt = BodyTr::new(fe, key);
     let res = bt.fn_body(body);
@@ -576,6 +582,114 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         Err(Unsup(m)) => fn_placeholder(fe, &mut fd, &m),
     }
     fd
+}
+
+/// The value of the constant `did`, computed by rustc's const evaluation, as the data of an
+/// `urust_const_data` definition (a HOL value, elaborated against the constant's HOL type): the
+/// HOL term of a large table (e.g. an array of thousands of elements) written as an initialiser
+/// expression takes Isabelle's parser and type inference superlinear time. Only free, non-generic
+/// constants are evaluated (see below). `None` when the
+/// evaluation fails or the value contains a part without a data form (see `value_data`): the
+/// constant is then translated from its initialiser.
+fn const_data<'tcx>(fe: &mut Frontend<'tcx>, did: DefId) -> Option<String> {
+    let tcx = fe.tcx;
+    // a free constant (not an associated one: rustc does not evaluate an unused associated
+    // constant, and its evaluation's failure would be a compilation error here)
+    if !matches!(tcx.def_kind(did), DefKind::Const) || tcx.generics_of(did).requires_monomorphization(tcx) {
+        return None;
+    }
+    let val = tcx.const_eval_poly(did).ok()?;
+    let t = tcx.type_of(did).instantiate_identity().skip_normalization();
+    let t = tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), ty::Unnormalized::new_wip(t)).ok()?;
+    let mut out = String::new();
+    value_data(fe, val, t, &mut out)?;
+    Some(out)
+}
+
+/// Append the HOL value of the constant value `val` of type `t` (see `Frontend::ty`) to `out`:
+/// integers as numbers, `bool` as `True` / `False`, arrays as lists, tuples as tuples ending in
+/// `TNil`, `()` as `()`, `Option` and `Result` by their HOL constructors, and local ADTs (not
+/// unions, not declared as abstract types) by their datatype constructors. Anything else
+/// (floats, `char`, references, pointers, other external or standard library types, ...) has
+/// no data form: `None`.
+fn value_data<'tcx>(fe: &mut Frontend<'tcx>, val: ConstValue, t: Ty<'tcx>, out: &mut String) -> Option<()> {
+    let tcx = fe.tcx;
+    // the fields of an aggregate value (array elements, tuple components, a variant's fields)
+    let fields = |val: ConstValue| tcx.try_destructure_mir_constant_for_user_output(val, t);
+    let list = |fe: &mut Frontend<'tcx>, fs: &[(ConstValue, Ty<'tcx>)], out: &mut String| -> Option<()> {
+        for (i, &(v, ft)) in fs.iter().enumerate() {
+            if i > 0 {
+                // lines of bounded length
+                let line = out.len() - out.rfind('\n').map_or(0, |k| k + 1);
+                out.push_str(if line > 100 { ",\n    " } else { ", " });
+            }
+            value_data(fe, v, ft, out)?;
+        }
+        Some(())
+    };
+    match t.kind() {
+        ty::Bool => out.push_str(if val.try_to_bool()? { "True" } else { "False" }),
+        ty::Int(_) | ty::Uint(_) => {
+            let s = val.try_to_scalar_int()?;
+            let bits = s.to_bits(s.size());
+            if t.is_signed() {
+                let shift = 128 - s.size().bits();
+                write!(out, "{}", (bits as i128) << shift >> shift).unwrap();
+            } else {
+                write!(out, "{}", bits).unwrap();
+            }
+        }
+        ty::Tuple(ts) if ts.is_empty() => out.push_str("()"),
+        // `(a, b)` is `a × b × tnil` (see `Frontend::ty`)
+        ty::Tuple(_) => {
+            out.push('(');
+            list(fe, fields(val)?.fields, out)?;
+            out.push_str(", TNil)");
+        }
+        ty::Array(..) => {
+            out.push('[');
+            list(fe, fields(val)?.fields, out)?;
+            out.push(']');
+        }
+        ty::Adt(def, _) => {
+            let adt = def.did();
+            if def.is_union() || fe.opaque_adts.contains_key(&adt) {
+                return None;
+            }
+            let local = match fe.std_adt(adt) {
+                Some("Option") | Some("Result") => false,
+                Some(_) => return None,
+                None if adt.is_local() => true,
+                None => return None,
+            };
+            let d = fields(val)?;
+            let vidx = d.variant.expect("an ADT value has a variant");
+            let name = if local {
+                fe.variant_ctor_name(adt, vidx.as_usize())
+            } else {
+                let vdid = def.variant(vidx).def_id;
+                let item = [LangItem::OptionSome, LangItem::OptionNone, LangItem::ResultOk, LangItem::ResultErr]
+                    .into_iter()
+                    .find(|&i| tcx.is_lang_item(vdid, i))
+                    .expect("a variant of Option or Result is a lang item");
+                match item {
+                    LangItem::OptionSome => "Some",
+                    LangItem::OptionNone => "None",
+                    LangItem::ResultOk => "Ok",
+                    _ => "Err",
+                }
+                .to_string()
+            };
+            out.push_str(&name);
+            if !d.fields.is_empty() {
+                out.push('(');
+                list(fe, d.fields, out)?;
+                out.push(')');
+            }
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 // ----------------------------------------------------------------------
@@ -648,6 +762,13 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 writeln!(out, "(* {} *)\ntypedecl {}\n", cmt(&m), head).unwrap();
                 continue;
             }
+            // an enum without fields has no type parameters (they would be unused), hence no
+            // others in its group
+            if let Some((width, vals)) = fe.word_enum(d, &tn) {
+                let ctors: Vec<String> = (0..def.variants().len()).map(|vi| fe.variant_ctor_name(d, vi)).collect();
+                out.push_str(&word_enum_decl(&tn, width, &ctors, &vals));
+                continue;
+            }
             if def.is_enum() && def.variants().iter().any(|v| matches!(v.discr, ty::VariantDiscr::Explicit(_))) {
                 let m = fe.placeholder("explicit enum discriminants (dropped)", Some(tcx.def_span(d)));
                 writeln!(out, "(* {} *)", cmt(&m)).unwrap();
@@ -659,7 +780,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 if v.fields.is_empty() {
                     decls.push(format!("{} = make_{}", head, tn));
                 } else if fe.record_adts.contains(&d) {
-                    let mut s = format!("datatype_record {} =\n", head);
+                    let mut s = format!("scalable_datatype_record {} =\n", head);
                     for (n, t) in fnames.iter().zip(ftys.iter()) {
                         writeln!(s, "  {} :: {}", n, cart(t)).unwrap();
                     }
@@ -684,7 +805,14 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                         after.push_str(&ctor_fun(&format!("{}_mk", cn), &cn, &ftys, &head));
                     }
                 }
-                decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+                // a monomorphic enum that is not recursive (alone in its group, not in its own
+                // fields) is an `enum`, whose declaration scales with the number of variants
+                let fields: Vec<Ty<'tcx>> = def.all_fields().map(|f| field_ty(tcx, f, own, env)).collect();
+                if comp.len() == 1 && tparams.is_empty() && !mentions_adt(&fields, d) {
+                    out.push_str(&enum_decl(&head, &ctors));
+                } else {
+                    decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+                }
             }
         }
         fe.proj_tvars = None;
@@ -695,6 +823,55 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
         out.push_str(&after);
     }
     out
+}
+
+/// The `simple_word_enum` declaration of the enum `name` (see `Frontend::word_enum`): each
+/// constructor is its discriminant, a word of the given width. The plugin `word_conversion`
+/// would define functions `name_to_uN`, `name_try_from_uN`, whose names may be taken by
+/// translated functions (the frontend does not use them).
+fn word_enum_decl(name: &str, width: u64, ctors: &[String], vals: &[u128]) -> String {
+    let vs: Vec<String> = ctors.iter().zip(vals).map(|(c, v)| format!("{} = {}", c, v)).collect();
+    format!("simple_word_enum (plugins del: word_conversion) ({}) {} =\n    {}\n\n", width, name, vs.join("\n  | "))
+}
+
+/// Among the external types `left` (each depending on another of them), types using each other
+/// whose dependencies in `left` are all among themselves: a strongly connected component of the
+/// dependencies with no dependency on another component, found by moving from a type to a
+/// dependency outside its component.
+fn ext_cycle<'a>(fe: &Frontend<'_>, left: &[&'a String]) -> Vec<&'a String> {
+    let deps = |n: &String| -> Vec<&'a String> {
+        fe.ext_types[n].deps.iter().filter_map(|d| left.iter().copied().find(|m| *m == d)).collect()
+    };
+    let reach = |n: &'a String| -> Vec<&'a String> {
+        let mut seen = vec![n];
+        let mut todo = vec![n];
+        while let Some(m) = todo.pop() {
+            for d in deps(m) {
+                if !seen.contains(&d) {
+                    seen.push(d);
+                    todo.push(d);
+                }
+            }
+        }
+        seen
+    };
+    let mut n = left[0];
+    loop {
+        let from_n = reach(n);
+        let comp: Vec<&String> = from_n.iter().copied().filter(|m| reach(m).contains(&n)).collect();
+        match from_n.iter().copied().find(|m| !comp.contains(m)) {
+            Some(below) => n = below,
+            None => return comp,
+        }
+    }
+}
+
+/// The `enum` declaration (AutoCorrode, `Enum_Theory`) of a monomorphic enum that is not
+/// recursive, with the given constructors (each with its argument types): unlike a `datatype`,
+/// it does not prove a theorem per pair of constructors, so its declaration scales with the number
+/// of variants.
+fn enum_decl(head: &str, ctors: &[String]) -> String {
+    format!("enum {} =\n    {}\n\n", head, ctors.join("\n  | "))
 }
 
 /// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.
@@ -1108,6 +1285,10 @@ fn emit_def(fe: &Frontend<'_>, d: &FunDef<'_>, body: &str) -> String {
         writeln!(out, "(* {} *)", cmt(c)).unwrap();
     }
     let ty = fe.fun_type(&d.param_tys, &d.ret_ty);
+    if let Some(data) = &d.data {
+        writeln!(out, "urust_const_data \"{}\" :: {} = {}\n", d.name, cart(&ty), cart(data)).unwrap();
+        return out;
+    }
     let lam = if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
     writeln!(
         out,
@@ -1182,7 +1363,19 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     while !left.is_empty() {
         let ready: Vec<&String> =
             left.iter().copied().filter(|n| fe.ext_types[*n].deps.iter().all(|d| !left.contains(&d))).collect();
-        let group = if ready.is_empty() { left.clone() } else { vec![ready[0]] };
+        let group = if ready.is_empty() { ext_cycle(fe, &left) } else { vec![ready[0]] };
+        // an enum without fields uses no other types, so it is a group of its own
+        if let [n] = group[..] && let Some((width, vals)) = &fe.ext_types[n].word {
+            let t = &fe.ext_types[n];
+            let ctors: Vec<String> = t.ctors.iter().map(|(c, _)| c.clone()).collect();
+            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
+            te.push_str(&word_enum_decl(n, *width, &ctors, vals));
+            left.retain(|m| *m != n);
+            continue;
+        }
+        // each type's constructors and constructor functions; a plain enum (see
+        // `ExtType::plain_enum`) that is not in a cycle of external types is an `enum`
+        let plain = matches!(group[..], [n] if fe.ext_types[n].plain_enum);
         let mut decls = vec![];
         for n in &group {
             let t = &fe.ext_types[*n];
@@ -1193,14 +1386,20 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
                 .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
                 .collect();
             writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
-            decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            if plain {
+                te.push_str(&enum_decl(&head, &ctors));
+            } else {
+                decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            }
             for (c, fs) in &t.ctors {
                 if !fs.is_empty() {
                     mks.push_str(&ctor_fun(&format!("{}_mk", c), c, fs, &head));
                 }
             }
         }
-        writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+        if !plain {
+            writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+        }
         left.retain(|n| !group.contains(n));
     }
     te.push_str(&mks);
