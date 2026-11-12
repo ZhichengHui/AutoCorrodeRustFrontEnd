@@ -91,9 +91,21 @@ impl<'tcx> Frontend<'tcx> {
     /// (the type variables of a field's type; e.g. not `<Self::Item as HasAssoc>::Assoc` that a
     /// method's own bound `where Self::Item: HasAssoc` names).
     pub fn dict_methods(&self, tr: DefId) -> Vec<DefId> {
+        if let Some(ms) = self.dict_methods_memo.borrow().get(&tr) {
+            return ms.clone();
+        }
+        let ms = self.find_dict_methods(tr);
+        self.dict_methods_memo.borrow_mut().insert(tr, ms.clone());
+        ms
+    }
+
+    fn find_dict_methods(&self, tr: DefId) -> Vec<DefId> {
         let tcx = self.tcx;
-        let slots: Vec<ty::AliasTy<'tcx>> =
-            self.dict_slots(ty::TraitRef::identity(tcx, tr)).into_iter().filter_map(|s| self.proj_key(s)).collect();
+        let slots: Vec<ty::AliasTy<'tcx>> = self
+            .dict_slots(ty::TraitRef::identity(tcx, tr))
+            .into_iter()
+            .map(|s| self.proj_key(s).expect("slots are projections"))
+            .collect();
         self.monomorphic_methods(tr)
             .into_iter()
             .filter(|&m| {
@@ -162,7 +174,7 @@ impl<'tcx> Frontend<'tcx> {
         let mut clauses: Vec<(ty::Clause<'tcx>, bool)> =
             tcx.explicit_super_clauses_of(tr).skip_binder().iter().map(|(c, _)| (*c, true)).collect();
         for i in tcx.associated_items(tr).in_definition_order() {
-            if matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_params.is_empty() && tcx.opt_rpitit_info(i.def_id).is_none() {
+            if matches!(i.kind, ty::AssocKind::Type { .. }) && self.is_slot(i.def_id) {
                 clauses.extend(tcx.explicit_item_self_bounds(i.def_id).skip_binder().iter().map(|(c, _)| (*c, false)));
             }
         }

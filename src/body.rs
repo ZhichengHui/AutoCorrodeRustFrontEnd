@@ -1924,7 +1924,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // IntoIterator>`, `<T as IntoIterator>::Item` is a projection of its own (the bound, not the
         // blanket implementation over `Iterator`), while the callee `fn callee<T: Iterator>(..) -> <T
         // as IntoIterator>::Item` has `<T as Iterator>::Item` through that implementation
-        if key.1 == Inst::Generic && matches!(self.tcx.def_kind(key.0), DefKind::Fn | DefKind::AssocFn) {
+        // (a default method's copy: its signature at its implementation's trait reference, and `kargs`
+        // the implementation's arguments)
+        if !matches!(key.1, Inst::Mono(_)) && matches!(self.tcx.def_kind(key.0), DefKind::Fn | DefKind::AssocFn) {
             let tcx = self.tcx;
             let env = self.typing_env();
             let norm = |x: ty::Unnormalized<'tcx, Ty<'tcx>>| {
@@ -1932,8 +1934,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             };
             let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(key.0).instantiate_identity().skip_normalization());
             for t in sig.inputs_and_output {
+                let declared = match self.fe.inst_args(key) {
+                    Some(a) => ty::EarlyBinder::bind(tcx, t).instantiate(tcx, a).skip_normalization(),
+                    None => t,
+                };
                 let callee_view = norm(ty::EarlyBinder::bind(tcx, self.fe.at_key(key, t)).instantiate(tcx, kargs));
-                if callee_view != norm(ty::EarlyBinder::bind(tcx, t).instantiate(tcx, kargs)) {
+                if callee_view != norm(ty::EarlyBinder::bind(tcx, declared).instantiate(tcx, kargs)) {
                     return unsup(format!(
                         "call of a generic function whose signature type `{}` is another type in the callee's typing environment",
                         t

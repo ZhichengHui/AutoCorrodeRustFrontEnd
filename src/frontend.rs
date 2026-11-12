@@ -176,6 +176,8 @@ pub struct Frontend<'tcx> {
     /// local ADT takes as type parameters are normalised at its uses (to the projections that
     /// `proj_tvars` has, e.g. `<DP::VS as VersionSet>::V` to `DP::V`).
     pub proj_env: Option<ty::TypingEnv<'tcx>>,
+    /// The methods of each trait that are fields of its dictionaries (see `dict_methods`).
+    pub dict_methods_memo: std::cell::RefCell<HashMap<DefId, Vec<DefId>>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
     /// `Fn` traits (see `fn_param_types`).
     pub fn_params: HashMap<u32, String>,
@@ -295,6 +297,7 @@ impl<'tcx> Frontend<'tcx> {
             adt_projs: HashMap::new(),
             proj_tvars: None,
             proj_env: None,
+            dict_methods_memo: Default::default(),
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
             gen_calls: Vec::new(),
