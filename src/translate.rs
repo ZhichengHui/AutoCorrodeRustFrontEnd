@@ -982,11 +982,12 @@ fn markers_in(fe: &Frontend<'_>, text: &str, poly: &HashSet<usize>, out: &mut Ve
 /// (one class of the renaming has at most one parameter of each member). A call at other type
 /// arguments (`f::<Vec<T>>` in `f<T>`, or at concrete types) is polymorphic recursion. Without such
 /// calls the allocation records (see `alloc_sets`) are finite: their types grow only along cycles.
-fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> HashSet<usize> {
+fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> (HashSet<usize>, HashMap<FnKey<'tcx>, Renaming<'tcx>>) {
     let ids: Vec<FnKey<'tcx>> = defs.iter().map(|d| d.key).collect();
     let by_id: HashMap<FnKey<'tcx>, usize> = defs.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
     let succ = |d: FnKey<'tcx>| -> Vec<FnKey<'tcx>> { defs[by_id[&d]].calls.iter().copied().collect() };
     let mut poly = HashSet::new();
+    let mut renamings = HashMap::new();
     for comp in sccs(&ids, &succ) {
         let group: HashSet<FnKey<'tcx>> = comp.iter().copied().collect();
         // union-find over (member, type parameter index); each class lists its members
@@ -1022,8 +1023,102 @@ fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> HashSet<u
                 }
             }
         }
+        for &m in &comp {
+            renamings.insert(m, uf.clone());
+        }
     }
-    poly
+    (poly, renamings)
+}
+
+/// For each member of the recursive group `members` (see `emit_funs`), the renaming of its HOL
+/// type variables in the group's definition: the type parameters that the group's calls rename into
+/// each other (see `Renaming`) are one variable, others are distinct ones; the projections' type
+/// variables (see `slot_tvars`) are one where their projections are one at those parameters.
+fn group_tvars<'tcx>(fe: &Frontend<'tcx>, members: &[&FunDef<'tcx>], uf: &mut Renaming<'tcx>) -> Vec<HashMap<String, String>> {
+    let tcx = fe.tcx;
+    let mut used: HashSet<String> = HashSet::new();
+    let mut class_name: HashMap<usize, (String, u32)> = HashMap::new();
+    let fresh = |base: &str, used: &mut HashSet<String>| {
+        let mut n = base.to_string();
+        let mut k = 0;
+        while used.contains(&n) {
+            k += 1;
+            n = format!("{}{}", base, k);
+        }
+        used.insert(n.clone());
+        n
+    };
+    let mut proj_names: HashMap<ty::AliasTy<'tcx>, String> = HashMap::new();
+    let mut out = vec![];
+    for d in members {
+        let mut map = HashMap::new();
+        let owner = match d.key.1 {
+            Inst::Generic => d.key.0,
+            Inst::ImplCopy(imp) => imp,
+            Inst::Mono(_) => {
+                out.push(map);
+                continue;
+            }
+        };
+        // the group's variable of each type parameter (as a parameter type, for the projections)
+        let ident = ty::GenericArgs::identity_for_item(tcx, owner);
+        let mut at_group = vec![];
+        for (i, a) in ident.iter().enumerate() {
+            let ty::GenericArgKind::Type(t) = a.kind() else {
+                at_group.push(a);
+                continue;
+            };
+            let ty::Param(p) = t.kind() else { unreachable!("identity arguments are parameters") };
+            let old = names::tvar_name(p.name.as_str());
+            let c = uf.class_of((d.key, i as u32));
+            let (new, gid) = match class_name.get(&c) {
+                Some(x) => x.clone(),
+                None => {
+                    let x = (fresh(&old, &mut used), class_name.len() as u32);
+                    class_name.insert(c, x.clone());
+                    x
+                }
+            };
+            // (a `Fn`-bounded parameter is a function type, not a variable, see `Frontend::ty`)
+            if !d.fn_ctx.contains_key(&(i as u32)) {
+                map.insert(old, new.clone());
+            }
+            at_group.push(Ty::new_param(tcx, gid, rustc_span::Symbol::intern(&new)).into());
+        }
+        let at_group = tcx.mk_args(&at_group);
+        for (a, v) in d.proj_ctx.iter().flatten() {
+            let t = ty::EarlyBinder::bind(tcx, Ty::new_alias(tcx, ty::IsRigid::No, *a)).instantiate(tcx, at_group).skip_normalization();
+            let key = fe.proj_key(t).expect("projections are aliases");
+            let n = proj_names.len();
+            let new = proj_names.entry(key).or_insert_with(|| format!("'proj{}", n)).clone();
+            map.insert(v.clone(), new);
+        }
+        out.push(map);
+    }
+    out
+}
+
+/// `s` with its HOL type variables renamed by `map` (simultaneously).
+fn rename_tvars(s: &str, map: &HashMap<String, String>) -> String {
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            let tok = &s[i..j];
+            out.push_str(map.get(tok).map(|x| x.as_str()).unwrap_or(tok));
+            i = j;
+        } else {
+            let c = s[i..].chars().next().expect("in the string");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
 }
 
 /// Classes of type parameters (member, index) of a recursive group that its calls rename into
@@ -1313,7 +1408,7 @@ fn indent(s: &str, n: usize) -> String {
 /// The definitions (and the allocation records' datatypes, for the types theory).
 fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
     let mut defs = std::mem::take(&mut fe.fun_defs);
-    let poly_calls = poly_rec_calls(fe, &defs);
+    let (poly_calls, mut renamings) = poly_rec_calls(fe, &defs);
     let allocs = alloc_sets(fe, &defs, &poly_calls);
     // the polymorphic-recursive calls are placeholders (of the calls' result types); one as a
     // function value makes its whole definition one (the value's function type is not known here)
@@ -1390,14 +1485,23 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
         let k = members.len();
         let step = format!("{}_rec_step", members[0].name);
         let tys: Vec<String> = members.iter().map(|d| fe.fun_type(&d.param_tys, &d.ret_ty)).collect();
-        let tuple_ty = tys.iter().map(|t| format!("({})", t)).collect::<Vec<_>>().join(" \\<times> ");
+        // the members' type variables in the group's definition (see `group_tvars`)
+        let mut uf = renamings.remove(&comp[0]).expect("every group has a renaming");
+        let tvars = group_tvars(fe, &members, &mut uf);
+        let tuple_ty = tys
+            .iter()
+            .zip(&tvars)
+            .map(|(t, m)| format!("({})", rename_tvars(t, m)))
+            .collect::<Vec<_>>()
+            .join(" \\<times> ");
         let recs: Vec<String> = members.iter().map(|d| format!("rec_{}", d.name)).collect();
         let binder = if k == 1 { recs[0].clone() } else { format!("({})", recs.join(", ")) };
         let lam = |d: &FunDef<'_>| if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
         let bodies: Vec<String> = members
             .iter()
-            .map(|d| {
-                let body = subst_markers(fe, &allocs, d.key, &d.body, Some(&set), &names, &poly);
+            .zip(&tvars)
+            .map(|(d, m)| {
+                let body = rename_tvars(&subst_markers(fe, &allocs, d.key, &d.body, Some(&set), &names, &poly), m);
                 format!("{}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>", lam(d), indent(&body, 4))
             })
             .collect();
