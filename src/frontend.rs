@@ -854,7 +854,11 @@ impl<'tcx> Frontend<'tcx> {
         let comment = format!("Rust: {}", self.tcx.def_path_str(did));
         self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
         self.ext_type_ids.insert(did, n.clone());
-        if let Some((params, ctors, deps)) = self.ext_datatype(did, &n) {
+        // the fields' type parameters are the ADT's (see `ext_fun`)
+        let fn_params = std::mem::take(&mut self.fn_params);
+        let datatype = self.ext_datatype(did, &n);
+        self.fn_params = fn_params;
+        if let Some((params, ctors, deps)) = datatype {
             let t = self.ext_types.get_mut(&n).expect("registered above");
             (t.params, t.ctors, t.deps) = (params, ctors, deps);
         }
@@ -987,10 +991,14 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(base, |n| self.used_names.contains(n));
         self.used_names.insert(n.clone());
         let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
+        // the signature's type parameters are the external function's, not those of the item being
+        // translated, whose `Fn`-bounded parameters (by index) do not apply
+        let fn_params = std::mem::take(&mut self.fn_params);
         self.alias_tvars = Some(0);
         let params: Vec<String> = sig.inputs().iter().map(|t| self.ty(*t)).collect();
         let ret = self.ty(sig.output());
         self.alias_tvars = None;
+        self.fn_params = fn_params;
         let hol_type = self.fun_type(&params, &ret);
         let ef = ExtFun { hol_name: n.clone(), rust_path: self.tcx.def_path_str(did), hol_type, arity: params.len() };
         if foreign { self.foreign_funs.insert(n.clone(), ef); } else { self.ext_funs.insert(n.clone(), ef); }
