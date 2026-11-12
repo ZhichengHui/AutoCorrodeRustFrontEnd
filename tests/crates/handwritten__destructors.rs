@@ -58,3 +58,15 @@ pub fn reassign(v: &mut Vec<u8>) -> u32 {
 pub fn temp(v: &mut Vec<u8>) {
     let _ = Log { out: v, tag: 4 };
 }
+
+pub fn boxed(b: Box<Log<'_>>) -> u8 {
+    b.tag
+}
+
+pub fn matched(out: &mut Vec<u8>, x: Option<u8>) -> u8 {
+    let l = Log { out, tag: 5 };
+    match x {
+        Some(v) => v + l.tag,
+        None => return 0,
+    }
+}

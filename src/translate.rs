@@ -356,8 +356,8 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
 /// The calls of a body that only an instance can translate (`dependent`): of trait methods that are
 /// not dictionary fields (see `Frontend::dict_methods`: e.g. with generic parameters of their own)
 /// at arguments with the body's generic parameters; and the calls of local functions at such
-/// arguments (`callees`). In a crate with destructors, also a binding of a value whose type has
-/// generic parameters: only an instance knows whether dropping it runs a destructor (see
+/// arguments (`callees`). In a crate with destructors, also a binding or an expression whose type
+/// has generic parameters: only an instance knows whether dropping it runs a destructor (see
 /// `BodyTr::needs_glue`).
 struct GenericCalls<'a, 'tcx> {
     fe: &'a Frontend<'tcx>,
@@ -419,6 +419,10 @@ impl<'a, 'tcx> Visitor<'tcx> for GenericCalls<'a, 'tcx> {
     }
 
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
+        // a value of a type with parameters (a temporary dropped at once, an argument, ...)
+        if self.fe.has_drop_impls && self.typeck.expr_ty(e).has_param() {
+            self.dependent = true;
+        }
         if let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) {
             self.call(did, self.typeck.node_args(e.hir_id));
         }

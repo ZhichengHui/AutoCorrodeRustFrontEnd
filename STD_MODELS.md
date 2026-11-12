@@ -194,7 +194,7 @@
 | `vec::IntoIter<T>`（`Vec` 按值的 `into_iter`） | `T list` | `list_iter_next`（`next_back` 同 `slice::Iter`） | 手写 | 同上 |
 | `slice::Chunks<T>` | `T list × 64 word × tnil`（剩余元素、块大小） | `chunks_next`（最后一块可以较短） | 手写 | 同上 |
 | `Filter<I, P>` | `I × P × tnil` | `filter_next`：内层的 `find`，带 crate 的燃料 | 手写 | 同上 |
-| 无符号整数的 `a..b`、`a..=b`、`a..` 作为迭代器 | `range` 记录、下一个值 | `range_next`、`range_next_back`（耗尽的 `a..=b`，即 Rust 的 `exhausted`，表示为空的 `b..b`）、`range_from_next`（溢出时 panic） | 手写 | 同上 |
+| 无符号整数的 `a..b`、`a..=b`、`a..` 作为迭代器 | `range` 记录、下一个值 | `range_next`、`range_next_back`（耗尽的 `a..=b`，即 Rust 的 `exhausted`，表示为空的 `b..b`；Rust 以耗尽的 `a..=b` 作切片下标时取 `b+1..b+1`，`b` 等于长度时 panic，这里不 panic）、`range_from_next`（溢出时 panic） | 手写 | 同上 |
 | `slice::IterMut<T>` | 剩余元素的引用的列表 | `list_iter_next`、`list_iter_next_back` | 手写 | 同上 |
 | `for_each(f)` | `iter_for_each`：按顺序对每个元素调用 `f`（`iter_fold`，带 crate 的燃料） | | 手写 | `iter_call` |
 | `any(&mut self, f)`、`min`（无符号整数） | `iter_ref_any`（写回迭代器的状态）、`iter_min`（第一个最小的元素） | | 手写 | `iter_call` |

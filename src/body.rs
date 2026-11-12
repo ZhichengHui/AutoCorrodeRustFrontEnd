@@ -196,6 +196,8 @@ pub struct BodyTr<'a, 'tcx> {
     local_flags: HashMap<HirId, String>,
     /// set while a binding that owns its value is declared (see `declare`, `own`)
     owning: bool,
+    /// the types whose drop glue is being generated (see `drop_glue`)
+    glue_stack: Vec<Ty<'tcx>>,
     /// the mutable locals holding the values of the `loop`s being translated that produce one
     loop_results: HashMap<HirId, String>,
 }
@@ -256,6 +258,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             moved_uses: HashMap::new(),
             local_flags: HashMap::new(),
             owning: false,
+            glue_stack: vec![],
             loop_results: HashMap::new(),
         }
     }
@@ -391,6 +394,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         prologue.push(self.let_binding(&n, m, &a, &n));
                     }
                     prologue.extend(self.own(hid, true)?);
+                }
+                _ if !matches!(p.pat.kind, PatKind::Binding(..)) && self.needs_glue(self.pat_ty(p.pat)) => {
+                    return unsup("parameter with a destructor bound by a pattern");
                 }
                 PatKind::Wild => params.push(format!("unused_{}", i)),
                 _ => {
@@ -685,6 +691,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok(with_prologue(&[self.let_binding(&n, m, &a, &v.at(20))], &flag.join("\n")))
             }
             PatKind::Wild => Ok(format!("let _ = {};", v.at(20))),
+            // the parts not bound would be dropped (not modelled)
+            _ if self.needs_glue(self.pat_ty(pat)) => unsup("destructuring a value with a destructor"),
             _ => {
                 let tmp = self.fresh("destr");
                 let lets = self.irrefutable(pat, &Tr::atom(tmp.clone()))?;
@@ -811,6 +819,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The value matched by a pattern: a scrutinee of type `&mut T` (match ergonomics) is
     /// dereferenced; bindings by mutable reference are rejected by the pattern translation.
     fn scrut(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        // a temporary with a destructor lives until the end of the `match` (not modelled)
+        if !is_place_expr(self.typeck, e) && self.needs_glue(self.ty_of(e)) {
+            return unsup("matching a temporary with a destructor");
+        }
         let mut v = self.val(e)?;
         let mut t = self.ty_adj(e);
         while let ty::Ref(_, inner, m) = t.kind() {
@@ -1286,6 +1298,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 MatchSource::ForLoopDesugar => self.for_loop(scrut, arms),
                 MatchSource::TryDesugar(_) => {
                     let ExprKind::Call(_, [inner]) = scrut.kind else { return unsup("`?` desugaring") };
+                    if self.exit_after_owned_operand(e) {
+                        return unsup("early exit after evaluating a value with a destructor");
+                    }
                     let v = self.val(inner)?;
                     // the drops of an early return (see `exit_drops`)
                     let drops = self.exit_drops(None)?;
@@ -1359,6 +1374,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             ExprKind::AddrOf(..) => unsup("raw borrow"),
+            ExprKind::Break(..) | ExprKind::Continue(_) | ExprKind::Ret(_) if self.exit_after_owned_operand(e) => {
+                unsup("early exit after evaluating a value with a destructor")
+            }
             ExprKind::Break(dest, None) => self.jump_drops(dest, loop_jump("break", dest)),
             // `break v` out of a `loop` producing a value: the loop's result is set (see `loop_expr`)
             ExprKind::Break(dest, Some(v)) => match dest.target_id.ok().and_then(|t| self.loop_results.get(&t).cloned()) {
@@ -3646,6 +3664,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some((some_arm, pat)) = some else { return unsup("for-loop desugaring") };
         // the iterable: a range, slice, array or Vec is iterated by a uRust `for` loop
         let ht = self.ty_of(head);
+        // the elements not moved out by the body would be dropped (not modelled)
+        if self.needs_glue(ht) {
+            return unsup("`for` over values with destructors");
+        }
         // over `&mut` of a slice, array or Vec (or `xs.iter_mut()`) the items are references to
         // the elements: AutoCorrode's `iter_mut`
         let mut_items = match ht.kind() {
@@ -4287,6 +4309,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     pro.extend(self.own(hid, true)?);
                     ps.push(n);
                 }
+                _ if self.needs_glue(self.pat_ty(p.pat)) => return unsup("parameter with a destructor bound by a pattern"),
                 _ => {
                     let n = format!("carg_{}", i);
                     pro.extend(self.irrefutable(p.pat, &Tr::atom(n.clone()))?);
@@ -4344,6 +4367,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// elements of a sequence in order.
     fn drop_glue(&mut self, t: Ty<'tcx>, pv: PV) -> R<Vec<String>> {
         if !self.needs_glue(t) { return Ok(vec![]) }
+        let rt = self.reveal(t);
+        if self.glue_stack.contains(&rt) { return unsup("destructor of a recursive type") }
+        self.glue_stack.push(rt);
+        let r = self.drop_glue_unrolled(t, pv);
+        self.glue_stack.pop();
+        r
+    }
+
+    fn drop_glue_unrolled(&mut self, t: Ty<'tcx>, pv: PV) -> R<Vec<String>> {
         let tcx = self.tcx;
         let t = self.reveal(t);
         let mut out = vec![];
@@ -4434,6 +4466,43 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(out)
     }
 
+    /// Whether, when the early exit `e` (`return`, `?`, `break`, `continue`) is reached, an
+    /// operand with a destructor was already evaluated by an enclosing expression (e.g. `l` in
+    /// `Pair { first: l, n: x? }`): Rust drops it, which is not modelled. Conservative: every
+    /// other operand of the enclosing expressions counts, up to the body or closure.
+    fn exit_after_owned_operand(&self, e: &'tcx hir::Expr<'tcx>) -> bool {
+        if !self.fe.has_drop_impls { return false }
+        let mut child = e.hir_id;
+        for (h, node) in self.tcx.hir_parent_iter(e.hir_id) {
+            let hir::Node::Expr(a) = node else {
+                if matches!(node, hir::Node::Item(_) | hir::Node::ImplItem(_) | hir::Node::TraitItem(_)) { break }
+                child = h;
+                continue;
+            };
+            let operands: Vec<&'tcx hir::Expr<'tcx>> = match a.kind {
+                ExprKind::Closure(_) => break,
+                ExprKind::Call(f, args) => std::iter::once(f).chain(args).collect(),
+                ExprKind::MethodCall(_, r, args, _) => std::iter::once(r).chain(args).collect(),
+                ExprKind::Tup(xs) | ExprKind::Array(xs) => xs.iter().collect(),
+                ExprKind::Struct(_, fs, tail) => {
+                    let mut v: Vec<_> = fs.iter().map(|f| f.expr).collect();
+                    if let hir::StructTailExpr::Base(b) = tail { v.push(b) }
+                    v
+                }
+                ExprKind::Binary(_, l, r) | ExprKind::Assign(l, r, _) | ExprKind::AssignOp(_, l, r) | ExprKind::Index(l, r, _) => vec![l, r],
+                // a place matched is not moved (its scope drops it)
+                ExprKind::Match(sc, _, _) if !is_place_expr(self.typeck, sc) => vec![sc],
+                ExprKind::If(c, _, _) => vec![c],
+                _ => vec![],
+            };
+            if operands.iter().any(|o| o.hir_id != child && self.needs_glue(self.ty_adj(o))) {
+                return true;
+            }
+            child = h;
+        }
+        false
+    }
+
     /// The drops when control leaves the scopes up to the loop `target` (`break`, `continue`), or
     /// up to and including the function's or closure's body (`None`: `return`), innermost first.
     fn exit_drops(&mut self, target: Option<HirId>) -> R<Vec<String>> {
@@ -4518,8 +4587,21 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// How the use `p` (a path to a local with a destructor) treats the value; an error for a
     /// move of a part with a destructor out of it, or a value discarded by a statement.
     fn use_kind(&self, p: &'tcx hir::Expr<'tcx>) -> R<UseKind> {
-        // a borrow or dereference adjustment: a place
-        if !self.typeck.expr_adjustments(p).is_empty() { return Ok(UseKind::Place) }
+        let parent = self.tcx.parent_hir_node(p.hir_id);
+        let adj = self.typeck.expr_adjustments(p);
+        if !adj.is_empty() {
+            // borrowed (autoref): a place
+            if adj.iter().any(|a| matches!(a.kind, Adjust::Borrow(_))) { return Ok(UseKind::Place) }
+            // dereferenced (a `Box`): a field read through it is a place, see below; anything else
+            // moves the contents out of the box
+            if adj.iter().any(|a| matches!(a.kind, Adjust::Deref(_)))
+                && !matches!(parent, hir::Node::Expr(par) if matches!(par.kind, ExprKind::Field(..)))
+            {
+                return unsup("move out of a box holding a value with a destructor");
+            }
+            // a coercion of the value (unsizing): moved
+            if !adj.iter().any(|a| matches!(a.kind, Adjust::Deref(_))) { return Ok(UseKind::Move) }
+        }
         let bad_bindings = |pat: &'tcx hir::Pat<'tcx>| {
             let mut bad = false;
             pat.walk_always(|q| {
@@ -4533,7 +4615,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         };
         Ok(match self.tcx.parent_hir_node(p.hir_id) {
             hir::Node::Expr(par) => match par.kind {
-                ExprKind::AddrOf(..) | ExprKind::Index(..) | ExprKind::Unary(UnOp::Deref, _) | ExprKind::AssignOp(..) => UseKind::Place,
+                ExprKind::AddrOf(..) => UseKind::Place,
+                // the operand of an overloaded `+=` or index taken by value is moved
+                ExprKind::AssignOp(_, lhs, _) | ExprKind::Index(lhs, _, _) => {
+                    if lhs.hir_id == p.hir_id { UseKind::Place } else { UseKind::Move }
+                }
+                // the contents of a `Box`: moved out if they have a destructor and the use moves them
+                ExprKind::Unary(UnOp::Deref, _) => {
+                    if self.needs_glue(self.ty_of(par)) && self.use_kind(par)? == UseKind::Move {
+                        return unsup("move out of a box holding a value with a destructor");
+                    }
+                    UseKind::Place
+                }
                 // a part: moved out if it has a destructor and its use moves it
                 ExprKind::Field(..) => {
                     if self.needs_glue(self.ty_of(par)) && self.use_kind(par)? == UseKind::Move {
@@ -4559,20 +4652,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 _ => UseKind::Move,
             },
-            hir::Node::LetStmt(l) if matches!(l.pat.kind, PatKind::Wild) => UseKind::Place,
-            hir::Node::LetStmt(l) => {
-                if bad_bindings(l.pat) || matches!(l.pat.kind, PatKind::Binding(..)) { UseKind::Move } else { UseKind::Place }
-            }
+            hir::Node::LetStmt(l) => match l.pat.kind {
+                PatKind::Wild | PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(..), _), ..) => UseKind::Place,
+                PatKind::Binding(..) => UseKind::Move,
+                _ if bad_bindings(l.pat) => return unsup("move of a part with a destructor out of a value"),
+                _ => UseKind::Place,
+            },
             hir::Node::Stmt(_) => return unsup("value with a destructor discarded by a statement"),
             _ => UseKind::Move,
         })
     }
 }
 
-/// Whether `e` is a place expression (a local, or a field, element or dereference of one).
+/// Whether `e` is a place expression (a local or a static, or a field, element or dereference of
+/// one).
 fn is_place_expr<'tcx>(typeck: &TypeckResults<'tcx>, e: &hir::Expr<'tcx>) -> bool {
     match e.kind {
-        ExprKind::Path(ref qp) => matches!(typeck.qpath_res(qp, e.hir_id), Res::Local(_)),
+        ExprKind::Path(ref qp) => matches!(typeck.qpath_res(qp, e.hir_id), Res::Local(_) | Res::Def(DefKind::Static { .. }, _)),
         ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Unary(UnOp::Deref, _) => true,
         _ => false,
     }
