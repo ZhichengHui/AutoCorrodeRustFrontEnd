@@ -2876,6 +2876,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn match_arms(&mut self, v: &Tr, place: &Option<Tr>, arms: &'tcx [hir::Arm<'tcx>]) -> R<String> {
         let mut out = vec![];
         for (i, arm) in arms.iter().enumerate() {
+            // an arm rustc finds unreachable is not translated (see `reachability`)
+            if crate::reachability::unreachable_arm(arm.hir_id) {
+                continue;
+            }
             let p = self.pat_at(arm.pat, place.clone())?;
             let mut conds = p.conds.clone();
             if let Some(g) = arm.guard {

@@ -6,17 +6,20 @@
 #![feature(rustc_private)]
 
 extern crate rustc_abi;
+extern crate rustc_arena;
 extern crate rustc_ast;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
+extern crate rustc_pattern_analysis;
 extern crate rustc_span;
 
 mod body;
 mod dict;
 mod frontend;
 mod names;
+mod reachability;
 mod translate;
 
 use rustc_driver::Compilation;
@@ -27,6 +30,10 @@ struct Callbacks {
 }
 
 impl rustc_driver::Callbacks for Callbacks {
+    fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        config.override_queries = Some(|_, providers| reachability::wrap_check_match(providers));
+    }
+
     fn after_analysis<'tcx>(&mut self, _c: &rustc_interface::interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         translate::run(tcx, &self.opts);
         Compilation::Stop

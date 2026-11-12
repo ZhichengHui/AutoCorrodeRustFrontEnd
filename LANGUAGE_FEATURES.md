@@ -51,7 +51,7 @@
 ## 控制流
 
 - `if`/`else` 原样翻译；`if let` 的模式含字面量或区间子模式时翻译成带守卫的 `match`，模式是元组、或含有分量不全是变量的元组时翻译成 `match`（uRust 的 `if let` 只接受由变量组成的元组模式）。
-- `match`：被匹配的值是整数、`char`、`str` 或 `String`，或者所有分支的模式都只由字面量、区间、整数或 `bool` 常量、`Ordering` 变体、绑定以及它们组成的元组和或模式构成时，翻译成 `if` 链（被匹配的值先绑定到临时变量）。其他 `match` 翻译成 uRust 的 `match`：字面量和区间子模式变成守卫条件；不会失败但带条件的分支变成一个分支，在其中检查条件，不满足时匹配其余分支（都不满足时 `panic!("non-exhaustive match")`）；不会失败的分支之后的分支被省略（不可达）。
+- `match`：被匹配的值是整数、`char`、`str` 或 `String`，或者所有分支的模式都只由字面量、区间、整数或 `bool` 常量、`Ordering` 变体、绑定以及它们组成的元组和或模式构成时，翻译成 `if` 链（被匹配的值先绑定到临时变量）。其他 `match` 翻译成 uRust 的 `match`：字面量和区间子模式变成守卫条件；不会失败但带条件的分支变成一个分支，在其中检查条件，不满足时匹配其余分支（都不满足时 `panic!("non-exhaustive match")`）；不会失败的分支之后的分支被省略（不可达）；rustc 的模式分析判定为不可达的分支（`unreachable_patterns`，例如所有变体都已列出之后的 `_`）不翻译，因为 Isabelle 的 `case` 把多余分支当作错误。
 - `while`、`loop` 翻译成 uRust 的带燃料循环 `#[fuel(urust_fuel)]`，`urust_fuel` 是 crate locale 的参数。燃料耗尽时循环结束（AutoCorrode 的 `bounded_while`）。
 - 循环的标签原样保留在翻译出的 uRust 循环上（`'l: for …`、`#[fuel(urust_fuel)] 'l: while …`、`#[fuel(urust_fuel)] 'l: loop …`、`#[fuel(urust_fuel)] 'l: while let …`），包括下面由 `while let` 和 `for` 展开成的循环。
 - `break`、`continue`、`break 'l`、`continue 'l` 翻译成 uRust 的 `break;`、`continue;`、`break 'l;`、`continue 'l;`。uRust 与 Rust 一样，按标签确定目标循环，没有标签时目标是最内层的循环。
