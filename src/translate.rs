@@ -13,7 +13,7 @@ use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
-use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, one_line, paren_ty};
+use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, mentions_adt, one_line, paren_ty};
 use crate::names;
 
 pub struct Options {
@@ -587,16 +587,15 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
 /// The value of the constant `did`, computed by rustc's const evaluation, as the data of an
 /// `urust_const_data` definition (a HOL value, elaborated against the constant's HOL type): the
 /// HOL term of a large table (e.g. an array of thousands of elements) written as an initialiser
-/// expression takes Isabelle's parser and type inference superlinear time. A generic constant
-/// or a trait's associated constant is not evaluated (rustc would abort). `None` when the
+/// expression takes Isabelle's parser and type inference superlinear time. Only free, non-generic
+/// constants are evaluated (see below). `None` when the
 /// evaluation fails or the value contains a part without a data form (see `value_data`): the
 /// constant is then translated from its initialiser.
 fn const_data<'tcx>(fe: &mut Frontend<'tcx>, did: DefId) -> Option<String> {
     let tcx = fe.tcx;
-    if !matches!(tcx.def_kind(did), DefKind::Const | DefKind::AssocConst { .. })
-        || fe.is_trait_item(did)
-        || tcx.generics_of(did).requires_monomorphization(tcx)
-    {
+    // a free constant (not an associated one: rustc does not evaluate an unused associated
+    // constant, and its evaluation's failure would be a compilation error here)
+    if !matches!(tcx.def_kind(did), DefKind::Const) || tcx.generics_of(did).requires_monomorphization(tcx) {
         return None;
     }
     let val = tcx.const_eval_poly(did).ok()?;
@@ -765,7 +764,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             }
             // an enum without fields has no type parameters (they would be unused), hence no
             // others in its group
-            if let Some((width, vals)) = fe.word_enum(d) {
+            if let Some((width, vals)) = fe.word_enum(d, &tn) {
                 let ctors: Vec<String> = (0..def.variants().len()).map(|vi| fe.variant_ctor_name(d, vi)).collect();
                 out.push_str(&word_enum_decl(&tn, width, &ctors, &vals));
                 continue;
@@ -808,10 +807,8 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 }
                 // a monomorphic enum that is not recursive (alone in its group, not in its own
                 // fields) is an `enum`, whose declaration scales with the number of variants
-                let self_field = def.all_fields().any(|f| field_ty(tcx, f, own, env).walk().any(|g| {
-                    matches!(g.as_type().map(|x| x.kind()), Some(ty::Adt(a, _)) if a.did() == d)
-                }));
-                if comp.len() == 1 && tparams.is_empty() && !self_field {
+                let fields: Vec<Ty<'tcx>> = def.all_fields().map(|f| field_ty(tcx, f, own, env)).collect();
+                if comp.len() == 1 && tparams.is_empty() && !mentions_adt(&fields, d) {
                     out.push_str(&enum_decl(&head, &ctors));
                 } else {
                     decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
@@ -835,6 +832,38 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
 fn word_enum_decl(name: &str, width: u64, ctors: &[String], vals: &[u128]) -> String {
     let vs: Vec<String> = ctors.iter().zip(vals).map(|(c, v)| format!("{} = {}", c, v)).collect();
     format!("simple_word_enum (plugins del: word_conversion) ({}) {} =\n    {}\n\n", width, name, vs.join("\n  | "))
+}
+
+/// Among the external types `left` (each depending on another of them), types using each other
+/// whose dependencies in `left` are all among themselves: a strongly connected component of the
+/// dependencies with no dependency on another component, found by moving from a type to a
+/// dependency outside its component.
+fn ext_cycle<'a>(fe: &Frontend<'_>, left: &[&'a String]) -> Vec<&'a String> {
+    let deps = |n: &String| -> Vec<&'a String> {
+        fe.ext_types[n].deps.iter().filter_map(|d| left.iter().copied().find(|m| *m == d)).collect()
+    };
+    let reach = |n: &'a String| -> Vec<&'a String> {
+        let mut seen = vec![n];
+        let mut todo = vec![n];
+        while let Some(m) = todo.pop() {
+            for d in deps(m) {
+                if !seen.contains(&d) {
+                    seen.push(d);
+                    todo.push(d);
+                }
+            }
+        }
+        seen
+    };
+    let mut n = left[0];
+    loop {
+        let from_n = reach(n);
+        let comp: Vec<&String> = from_n.iter().copied().filter(|m| reach(m).contains(&n)).collect();
+        match from_n.iter().copied().find(|m| !comp.contains(m)) {
+            Some(below) => n = below,
+            None => return comp,
+        }
+    }
 }
 
 /// The `enum` declaration (AutoCorrode, `Enum_Theory`) of a monomorphic enum that is not
@@ -1334,7 +1363,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     while !left.is_empty() {
         let ready: Vec<&String> =
             left.iter().copied().filter(|n| fe.ext_types[*n].deps.iter().all(|d| !left.contains(&d))).collect();
-        let group = if ready.is_empty() { left.clone() } else { vec![ready[0]] };
+        let group = if ready.is_empty() { ext_cycle(fe, &left) } else { vec![ready[0]] };
         // an enum without fields uses no other types, so it is a group of its own
         if let [n] = group[..] && let Some((width, vals)) = &fe.ext_types[n].word {
             let t = &fe.ext_types[n];
@@ -1344,24 +1373,9 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
             left.retain(|m| *m != n);
             continue;
         }
-        // a plain enum (see `ExtType::plain_enum`) that is not in a cycle of external types
-        if let [n] = group[..] && fe.ext_types[n].plain_enum {
-            let t = &fe.ext_types[n];
-            let ctors: Vec<String> = t
-                .ctors
-                .iter()
-                .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
-                .collect();
-            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
-            te.push_str(&enum_decl(n, &ctors));
-            for (c, fs) in &t.ctors {
-                if !fs.is_empty() {
-                    mks.push_str(&ctor_fun(&format!("{}_mk", c), c, fs, n));
-                }
-            }
-            left.retain(|m| *m != n);
-            continue;
-        }
+        // each type's constructors and constructor functions; a plain enum (see
+        // `ExtType::plain_enum`) that is not in a cycle of external types is an `enum`
+        let plain = matches!(group[..], [n] if fe.ext_types[n].plain_enum);
         let mut decls = vec![];
         for n in &group {
             let t = &fe.ext_types[*n];
@@ -1372,14 +1386,20 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
                 .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
                 .collect();
             writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
-            decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            if plain {
+                te.push_str(&enum_decl(&head, &ctors));
+            } else {
+                decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            }
             for (c, fs) in &t.ctors {
                 if !fs.is_empty() {
                     mks.push_str(&ctor_fun(&format!("{}_mk", c), c, fs, &head));
                 }
             }
         }
-        writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+        if !plain {
+            writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+        }
         left.retain(|n| !group.contains(n));
     }
     te.push_str(&mks);

@@ -189,6 +189,31 @@ pub struct Frontend<'tcx> {
 /// The type of field `f` of an ADT at its type arguments `args`, without regions and normalised in
 /// `env`. A field is this type wherever the frontend looks at it, as in Rust: a projection is the
 /// type it denotes (`<Foo as Tr>::Out` is `Bar`), and what remains of one depends on type parameters.
+/// Does the type `t` contain a `&mut` reference (outside function pointers, trait objects and raw
+/// pointers, whose HOL types are placeholder types without the store's type variables)?
+pub fn has_mut_ref(t: Ty<'_>) -> bool {
+    let mut w = t.walk();
+    while let Some(g) = w.next() {
+        match g.as_type().map(|x| *x.kind()) {
+            Some(ty::Ref(_, _, m)) if m.is_mut() => return true,
+            Some(ty::FnPtr(..) | ty::Dynamic(..) | ty::RawPtr(..)) => w.skip_current_subtree(),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Does one of the types `ts` (an ADT's field types) mention the ADT `did`?
+pub fn mentions_adt(ts: &[Ty<'_>], did: DefId) -> bool {
+    ts.iter().any(|t| t.walk().any(|g| matches!(g.as_type().map(|x| *x.kind()), Some(ty::Adt(a, _)) if a.did() == did)))
+}
+
+/// The constants the `simple_word_enum` declaration of the type `n` defines besides its
+/// constructors (AutoCorrode's `Simple_Word_Enums` and `Case_for_Typedefs`).
+pub fn word_enum_consts(n: &str) -> Vec<String> {
+    vec![format!("{}_variants", n), format!("{}_all", n), format!("{}_index", n), format!("match_{}", n), format!("case_{}", n)]
+}
+
 pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, f: &ty::FieldDef, args: GenericArgsRef<'tcx>, env: ty::TypingEnv<'tcx>) -> Ty<'tcx> {
     tcx.erase_and_anonymize_regions(tcx.normalize_erasing_regions(env, f.ty(tcx, args)))
 }
@@ -448,6 +473,9 @@ impl<'tcx> Frontend<'tcx> {
         self.used_type_names.insert(n.clone());
         // constructor function / notation names derive from the type name
         self.used_names.insert(n.clone());
+        if self.word_enum(did, &n).is_some() {
+            self.used_names.extend(word_enum_consts(&n));
+        }
         self.type_names.insert(did, n.clone());
         n
     }
@@ -456,10 +484,16 @@ impl<'tcx> Frontend<'tcx> {
     /// discriminant type and each variant's discriminant, as a word of that width. Such an enum
     /// is a `simple_word_enum` (AutoCorrode), whose declaration scales with the number of
     /// variants, unlike a `datatype` (distinctness of all pairs of constructors).
-    pub fn word_enum(&self, adt: DefId) -> Option<(u64, Vec<u128>)> {
+    /// `n` is its HOL name: an enum whose constructor names (`n_V`) would be among the constants
+    /// `simple_word_enum` defines (see `word_enum_consts`) is not one.
+    pub fn word_enum(&self, adt: DefId, n: &str) -> Option<(u64, Vec<u128>)> {
         let tcx = self.tcx;
         let def = tcx.adt_def(adt);
         if !def.is_enum() || def.variants().is_empty() || def.variants().iter().any(|v| !v.fields.is_empty()) {
+            return None;
+        }
+        let consts = word_enum_consts(n);
+        if def.variants().iter().any(|v| consts.contains(&format!("{}_{}", n, names::ident_chars(v.name.as_str())))) {
             return None;
         }
         let width = match def.repr().discr_type() {
@@ -467,8 +501,7 @@ impl<'tcx> Frontend<'tcx> {
             rustc_abi::IntegerType::Fixed(i, _) => i.size().bits(),
         };
         // `Discr::val` is the discriminant's bits in its type (e.g. `-1i8` is 0xff)
-        let mask = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
-        Some((width, def.discriminants(tcx).map(|(_, d)| d.val & mask).collect()))
+        Some((width, def.discriminants(tcx).map(|(_, d)| d.val).collect()))
     }
 
     pub fn variant_ctor_name(&mut self, adt: DefId, vidx: usize) -> String {
@@ -919,15 +952,12 @@ impl<'tcx> Frontend<'tcx> {
         let fn_params = std::mem::take(&mut self.fn_params);
         let datatype = self.ext_datatype(did, &n);
         self.fn_params = fn_params;
-        if let Some((params, ctors, deps)) = datatype {
-            let word = self.word_enum(did);
-            let tcx = self.tcx;
-            let def = tcx.adt_def(did);
-            let (own, env) = (ty::GenericArgs::identity_for_item(tcx, did), ty::TypingEnv::post_analysis(tcx, did));
-            let self_field = def.all_fields().any(|f| {
-                field_ty(tcx, f, own, env).walk().any(|g| matches!(g.as_type().map(|x| x.kind()), Some(ty::Adt(a, _)) if a.did() == did))
-            });
-            let plain_enum = def.is_enum() && params.is_empty() && !self_field;
+        if let Some((params, ctors, deps, self_field)) = datatype {
+            let word = self.word_enum(did, &n);
+            if word.is_some() {
+                self.used_names.extend(word_enum_consts(&n));
+            }
+            let plain_enum = self.tcx.adt_def(did).is_enum() && params.is_empty() && !self_field;
             let t = self.ext_types.get_mut(&n).expect("registered above");
             (t.params, t.ctors, t.deps, t.word, t.plain_enum) = (params, ctors, deps, word, plain_enum);
         }
@@ -938,7 +968,8 @@ impl<'tcx> Frontend<'tcx> {
     /// public fields, without const parameters, whose field types all have uRust models and contain
     /// no `&mut` reference (see `ExtType`). Its associated types become `adt_projs`, as for local
     /// ADTs.
-    fn ext_datatype(&mut self, did: DefId, n: &str) -> Option<(Vec<String>, Vec<(String, Vec<String>)>, Vec<String>)> {
+    /// Also tells whether a field mentions the ADT itself (see `mentions_adt`).
+    fn ext_datatype(&mut self, did: DefId, n: &str) -> Option<(Vec<String>, Vec<(String, Vec<String>)>, Vec<String>, bool)> {
         let tcx = self.tcx;
         if !matches!(tcx.def_kind(did), DefKind::Enum | DefKind::Struct) { return None }
         let def = tcx.adt_def(did);
@@ -954,7 +985,7 @@ impl<'tcx> Frontend<'tcx> {
         let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
         // a `&mut` reference in a field is a HOL type over the store's type variables `'addr`,
         // `'gv`, which a datatype in the external types template does not have as parameters
-        if all.iter().any(|t| t.walk().any(|g| matches!(g.as_type().map(|x| x.kind()), Some(ty::Ref(_, _, m)) if m.is_mut()))) {
+        if all.iter().any(|&t| has_mut_ref(t)) {
             return None;
         }
         let projs = self.projections(did, &all);
@@ -993,7 +1024,7 @@ impl<'tcx> Frontend<'tcx> {
             }
             let mut params: Vec<String> = own.types().map(|t| self.ty(t)).collect();
             params.extend(proj_names.iter().cloned());
-            (params, ctors, deps)
+            (params, ctors, deps, mentions_adt(&all, did))
         });
         (self.proj_tvars, self.proj_env) = saved;
         if result.is_some() && !projs.is_empty() {
