@@ -100,14 +100,12 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             hir::ItemKind::TraitAlias(..) => fe.item_placeholder("trait alias", tcx.def_span(did)),
             hir::ItemKind::GlobalAsm { .. } => fe.item_placeholder("global assembly", item.span),
             hir::ItemKind::Impl(_) => {
+                // destructors are called where Rust drops the values (see `BodyTr::drop_glue`)
                 if !tcx.is_automatically_derived(did)
                     && let Some(tr) = tcx.impl_opt_trait_ref(did)
                     && tcx.is_lang_item(tr.skip_binder().def_id, LangItem::Drop)
                 {
-                    fe.item_placeholder(
-                        "destructor semantics (drop is translated as an ordinary function; destructor calls are not inserted)",
-                        tcx.def_span(did),
-                    );
+                    fe.has_drop_impls = true;
                 }
             }
             hir::ItemKind::ForeignMod { items: fitems, .. } => {
@@ -327,7 +325,8 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             }
         }
     }
-    // ADTs containing `&mut` references, directly or through other local ADTs
+    // ADTs containing `&mut` references, directly or through other local ADTs, or through the
+    // standard types whose models hold references (see `Frontend::ty`)
     loop {
         let mut changed = false;
         for &d in &adts {
@@ -336,7 +335,7 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             }
             let needs = field_subtypes(d).any(|t| match t.kind() {
                 ty::Ref(_, _, m) => m.is_mut(),
-                ty::Adt(a, _) => fe.ref_adts.contains(&a.did()),
+                ty::Adt(a, _) => fe.ref_adts.contains(&a.did()) || matches!(fe.std_adt(a.did()), Some("SliceIterMut" | "HashMapEntry")),
                 _ => false,
             });
             if needs {
@@ -357,7 +356,9 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
 /// The calls of a body that only an instance can translate (`dependent`): of trait methods that are
 /// not dictionary fields (see `Frontend::dict_methods`: e.g. with generic parameters of their own)
 /// at arguments with the body's generic parameters; and the calls of local functions at such
-/// arguments (`callees`).
+/// arguments (`callees`). In a crate with destructors, also a binding of a value whose type has
+/// generic parameters: only an instance knows whether dropping it runs a destructor (see
+/// `BodyTr::needs_glue`).
 struct GenericCalls<'a, 'tcx> {
     fe: &'a Frontend<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -408,6 +409,13 @@ impl<'a, 'tcx> Visitor<'tcx> for GenericCalls<'a, 'tcx> {
 
     fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
         self.tcx
+    }
+
+    fn visit_pat(&mut self, p: &'tcx hir::Pat<'tcx>) {
+        if self.fe.has_drop_impls && matches!(p.kind, hir::PatKind::Binding(..)) && self.typeck.pat_ty(p).has_param() {
+            self.dependent = true;
+        }
+        intravisit::walk_pat(self, p);
     }
 
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {

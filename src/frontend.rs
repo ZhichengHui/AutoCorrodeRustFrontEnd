@@ -139,6 +139,8 @@ pub struct Frontend<'tcx> {
     /// generic `Fn` argument) depending on their type parameters, directly or through other such
     /// functions; trait default methods (generic over `Self`).
     pub mono_fns: HashSet<DefId>,
+    /// whether the crate implements `Drop` for a type (see `BodyTr::needs_glue`)
+    pub has_drop_impls: bool,
     instance_names: HashMap<(DefId, GenericArgsRef<'tcx>), String>,
     /// names of the copies of default methods, by (method, implementation)
     copy_names: HashMap<(DefId, DefId), String>,
@@ -226,6 +228,7 @@ impl<'tcx> Frontend<'tcx> {
             marker_ids: Vec::new(),
             marker_index: HashMap::new(),
             mono_fns: HashSet::new(),
+            has_drop_impls: false,
             instance_names: HashMap::new(),
             copy_names: HashMap::new(),
             dict_traits: Vec::new(),
