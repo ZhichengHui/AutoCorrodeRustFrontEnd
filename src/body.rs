@@ -194,8 +194,13 @@ pub struct BodyTr<'a, 'tcx> {
     moved_uses: HashMap<HirId, String>,
     /// the flags of the locals with a destructor that have one (see `own`)
     local_flags: HashMap<HirId, String>,
-    /// set while a binding that owns its value is declared (see `declare`, `own`)
-    owning: bool,
+    /// the jumps (`break`, `continue`) translated as statements ending a block (see `diverging`):
+    /// those after drops, or setting a loop's value
+    stmt_jumps: HashMap<HirId, String>,
+    /// whether dropping a value of a type runs a destructor (see `needs_glue`)
+    glue_cache: std::cell::RefCell<HashMap<Ty<'tcx>, bool>>,
+    /// the paths to each local in the body, and the locals a closure captures by value (see `own`)
+    local_uses: Option<(HashMap<HirId, Vec<&'tcx hir::Expr<'tcx>>>, HashSet<HirId>)>,
     /// the types whose drop glue is being generated (see `drop_glue`)
     glue_stack: Vec<Ty<'tcx>>,
     /// the mutable locals holding the values of the `loop`s being translated that produce one
@@ -230,8 +235,6 @@ enum UseKind {
     Place,
     /// moved out whole
     Move,
-    /// assigned
-    Assign,
 }
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
@@ -257,7 +260,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             drop_scopes: vec![],
             moved_uses: HashMap::new(),
             local_flags: HashMap::new(),
-            owning: false,
+            stmt_jumps: HashMap::new(),
+            glue_cache: Default::default(),
+            local_uses: None,
             glue_stack: vec![],
             loop_results: HashMap::new(),
         }
@@ -340,11 +345,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// local (a cell), which needs storage for its type: returns its allocator, if not the
     /// locale's (see `alloc`).
     fn declare(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<Option<String>> {
-        // a binding with a destructor is supported where it owns its value (see `own`); a local
-        // with a destructor is dropped by its name, which must not be shadowed while it lives
-        if !self.owning && self.needs_glue(self.node_ty(hid)) {
+        // a binding with a destructor is supported where it owns its value (see `declare_owned`)
+        if self.needs_glue(self.node_ty(hid)) {
             return unsup("binding of a value with a destructor in a pattern");
         }
+        self.declare_owned(hid, name, m)
+    }
+
+    /// As `declare`, for a binding that owns its value, whose destructor `own` arranges.
+    fn declare_owned(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<Option<String>> {
+        // a local with a destructor is dropped by its name, which must not be shadowed while it lives
         if self.drop_scopes.iter().any(|sc| match sc {
             DropScope::Block(ls) | DropScope::Body(ls) => ls.iter().any(|l| l.name == name),
             DropScope::Loop(_) => false,
@@ -386,18 +396,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let n = names::local_name(ident.as_str());
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
-                    self.owning = true;
-                    let a = self.declare(hid, &n, m);
-                    self.owning = false;
-                    let a = a?;
+                    let a = self.declare_owned(hid, &n, m)?;
                     if m.is_mut() {
                         prologue.push(self.let_binding(&n, m, &a, &n));
                     }
                     prologue.extend(self.own(hid, true)?);
                 }
-                _ if !matches!(p.pat.kind, PatKind::Binding(..)) && self.needs_glue(self.pat_ty(p.pat)) => {
-                    return unsup("parameter with a destructor bound by a pattern");
-                }
+                _ if self.needs_glue(self.pat_ty(p.pat)) => return unsup("parameter with a destructor bound by a pattern"),
                 PatKind::Wild => params.push(format!("unused_{}", i)),
                 _ => {
                     let n = format!("arg_{}", i);
@@ -419,8 +424,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ls = ls.clone();
         let drops = self.drop_locals(&ls)?;
         if drops.is_empty() { return Ok(b) }
+        Ok(self.then_drops(&format!("{{\n{}\n}}", b), &drops))
+    }
+
+    /// `let r = v; drops; r` (statements, the last the value): Rust computes a block's or a
+    /// return's value before the drops.
+    fn then_drops(&mut self, v: &str, drops: &[String]) -> String {
         let r = self.fresh("res");
-        Ok(format!("let {} = {{\n{}\n}};\n{}\n{}", r, b, drops.join("\n"), r))
+        format!("let {} = {};\n{}\n{}", r, v, drops.join("\n"), r)
     }
 
     /// Translate an expression used as a whole body (no braces).
@@ -505,10 +516,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if drops.is_empty() {
                         parts.push(format!("\u{3}{}", tt.s)); // \u{3} marks a tail expression
                     } else {
-                        let r = self.fresh("res");
-                        parts.push(format!("let {} = {};", r, tt.at(20)));
-                        parts.extend(drops);
-                        parts.push(format!("\u{3}{}", r));
+                        parts.push(format!("\u{3}{}", self.then_drops(&tt.at(20), &drops)));
                     }
                 }
                 None if !drops.is_empty() => {
@@ -548,11 +556,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return;
         }
         if matches!(e.kind, ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)) {
-            // a `break` (with a value, or after drops, see `jump_drops`) or `continue` after drops: its statements
-            if let Some(inner) = tr.s.strip_prefix("{\n").and_then(|x| x.strip_suffix("\n}"))
-                && inner.ends_with(';')
-            {
-                parts.push(format!("\u{4}{}", inner));
+            // a `break` with a value, or a jump after drops: its statements (see `stmt_jumps`)
+            if let Some(st) = self.stmt_jumps.remove(&e.hir_id) {
+                parts.push(format!("\u{4}{}", st));
                 return;
             }
             // \u{4}: ends with its own semicolon
@@ -639,10 +645,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // `let x;` -- deferred initialisation: model as a mutable local.
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
-                    self.owning = true;
-                    let a = self.declare(hid, &n, hir::Mutability::Mut);
-                    self.owning = false;
-                    let a = a?;
+                    let a = self.declare_owned(hid, &n, hir::Mutability::Mut)?;
                     let ht = self.hty(self.node_ty(hid));
                     let v = format!("\\<llangle>undefined :: {}\\<rrangle>", ht);
                     let flag = self.own(hid, false)?;
@@ -674,10 +677,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pat.kind {
             PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.owning = true;
-                let a = self.declare(hid, &n, m);
-                self.owning = false;
-                let a = a?;
+                let a = self.declare_owned(hid, &n, m)?;
                 let flag = self.own(hid, true)?;
                 // the allocator of a mutable local is chosen by its type; for a list or an option the
                 // initial value (`[]`, `None`, `Vec::with_capacity(n)`, ...) may not fix the element
@@ -1377,7 +1377,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Break(..) | ExprKind::Continue(_) | ExprKind::Ret(_) if self.exit_after_owned_operand(e) => {
                 unsup("early exit after evaluating a value with a destructor")
             }
-            ExprKind::Break(dest, None) => self.jump_drops(dest, loop_jump("break", dest)),
+            ExprKind::Break(dest, None) => self.jump_drops(e, dest, loop_jump("break", dest)),
             // `break v` out of a `loop` producing a value: the loop's result is set (see `loop_expr`)
             ExprKind::Break(dest, Some(v)) => match dest.target_id.ok().and_then(|t| self.loop_results.get(&t).cloned()) {
                 Some(res) => {
@@ -1385,13 +1385,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     // the `break` (with its `;`, of any type) ends the block, which has its type
                     let brk = loop_jump("break", dest).s;
                     let drops = self.exit_drops(dest.target_id.ok())?;
-                    // (as statements where it ends a block, see `diverging`)
-                    let drops = if drops.is_empty() { String::new() } else { format!("{}\n", drops.join("\n")) };
-                    Ok(Tr::block(format!("{{\n* {} = {};\n{}{}\n}}", res, v.at(40), drops, brk)))
+                    let mut st = vec![format!("* {} = {};", res, v.at(40))];
+                    st.extend(drops);
+                    st.push(brk);
+                    Ok(self.jump_stmts(e, st))
                 }
                 None => unsup("`break` with a value"),
             },
-            ExprKind::Continue(dest) => self.jump_drops(dest, loop_jump("continue", dest)),
+            ExprKind::Continue(dest) => self.jump_drops(e, dest, loop_jump("continue", dest)),
             // the value, then the drops of the locals of the function (or closure)
             ExprKind::Ret(v) => {
                 let t = match v {
@@ -1405,9 +1406,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         None => "return;".to_string(),
                     }));
                 }
-                let r = self.fresh("res");
                 let t = t.map(|t| t.at(20)).unwrap_or_else(|| "()".to_string());
-                Ok(Tr::atom(format!("return {{\nlet {} = {};\n{}\n{}\n}};", r, t, drops.join("\n"), r)))
+                Ok(Tr::atom(format!("return {{\n{}\n}};", self.then_drops(&t, &drops))))
             }
             ExprKind::Struct(qp, fields, tail) => self.struct_expr(e, qp, fields, tail),
             ExprKind::Array(es) => {
@@ -2637,7 +2637,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         // a standard library function could drop a value with a destructor it is given (only
         // `mem::drop`, `swap`, `replace` are known)
-        if arg_exprs.iter().any(|a| self.needs_glue(self.ty_adj(a).peel_refs()))
+        let owned_or_mut = |s: &Self, a: &hir::Expr<'tcx>| {
+            let mut t = s.ty_adj(a);
+            while let ty::Ref(_, inner, m) = *t.kind() {
+                // through a shared reference nothing can be dropped
+                if !m.is_mut() { return false }
+                t = inner;
+            }
+            s.needs_glue(t)
+        };
+        if arg_exprs.iter().any(|a| owned_or_mut(self, a))
             && !matches!(self.std_fn(target), Some(StdFn::Drop | StdFn::Model("mem_swap" | "mem_replace")))
         {
             return unsup("standard library function given a value with a destructor");
@@ -3515,8 +3524,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // an early return with drops: `return { let r = <residual>; drops; r }`
         let ret_with = |s: &mut Self, r: String| -> String {
             if drops.is_empty() { return format!("return {};", r) }
-            let n = s.fresh("res");
-            format!("return {{\nlet {} = {};\n{}\n{}\n}};", n, r, drops.join("\n"), n)
+            format!("return {{\n{}\n}};", s.then_drops(&r, drops))
         };
         if !drops.is_empty() && self.fe.std_adt(fd.did()) == Some("Option") && self.fe.std_adt(td.did()) == Some("Option") {
             let x = self.fresh("some");
@@ -4301,10 +4309,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if modelled {
                         pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
                     }
-                    self.owning = true;
-                    let a = self.declare(hid, &n, m);
-                    self.owning = false;
-                    let a = a?;
+                    let a = self.declare_owned(hid, &n, m)?;
                     if m.is_mut() {
                         pro.push(self.let_binding(&n, m, &a, &n));
                     }
@@ -4335,7 +4340,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// functions binding values of such types are also translated per instance (see
     /// `translate::GenericCalls`).
     fn needs_glue(&self, t: Ty<'tcx>) -> bool {
-        self.fe.has_drop_impls && self.glue_in(t, &mut vec![])
+        if !self.fe.has_drop_impls { return false }
+        if let Some(&r) = self.glue_cache.borrow().get(&t) { return r }
+        let r = self.glue_in(t, &mut vec![]);
+        self.glue_cache.borrow_mut().insert(t, r);
+        r
     }
 
     /// `t` normalised, with an `impl Trait` type replaced by its hidden type.
@@ -4353,7 +4362,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 self.tcx.adt_destructor(d.did()).is_some()
                     || d.all_fields().any(|f| self.glue_in(f.ty(self.tcx, args).skip_normalization(), seen))
             }
-            ty::Adt(_, args) => args.types().any(|x| self.glue_in(x, seen)),
+            // a standard type: one with a destructor drops what its type arguments own (a
+            // `Vec`, a `Box`, ...); one without drops its fields (an iterator over borrowed
+            // elements holds pointers, which own nothing)
+            ty::Adt(d, args) if self.tcx.adt_destructor(d.did()).is_some() => args.types().any(|x| self.glue_in(x, seen)),
+            ty::Adt(d, args) => d.all_fields().any(|f| self.glue_in(f.ty(self.tcx, args).skip_normalization(), seen)),
             ty::Tuple(ts) => ts.iter().any(|x| self.glue_in(x, seen)),
             ty::Array(x, _) | ty::Slice(x) => self.glue_in(*x, seen),
             ty::Closure(_, a) => a.as_closure().upvar_tys().iter().any(|x| self.glue_in(x, seen)),
@@ -4536,11 +4549,21 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(out)
     }
 
-    /// The jump `j` (`break`/`continue` to `dest`) after the drops of the scopes it leaves.
-    fn jump_drops(&mut self, dest: hir::Destination, j: Tr) -> R<Tr> {
-        let drops = self.exit_drops(dest.target_id.ok())?;
-        if drops.is_empty() { return Ok(j) }
-        Ok(Tr::block(format!("{{\n{}\n{}\n}}", drops.join("\n"), j.s)))
+    /// The jump `j` (`break`/`continue` to `dest`, the expression `e`) after the drops of the
+    /// scopes it leaves.
+    fn jump_drops(&mut self, e: &'tcx hir::Expr<'tcx>, dest: hir::Destination, j: Tr) -> R<Tr> {
+        let mut st = self.exit_drops(dest.target_id.ok())?;
+        if st.is_empty() { return Ok(j) }
+        st.push(j.s);
+        Ok(self.jump_stmts(e, st))
+    }
+
+    /// The statements `st` ending with a jump (of the expression `e`): a block (of any type, as
+    /// the jump), and, where it ends a block, the statements themselves (see `diverging`).
+    fn jump_stmts(&mut self, e: &'tcx hir::Expr<'tcx>, st: Vec<String>) -> Tr {
+        let st = st.join("\n");
+        self.stmt_jumps.insert(e.hir_id, st.clone());
+        Tr::block(format!("{{\n{}\n}}", st))
     }
 
     /// The local `hid` (just declared) owns its value: if dropping it runs a destructor (see
@@ -4552,15 +4575,20 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let t = self.node_ty(hid);
         if !self.needs_glue(t) { return Ok(vec![]) }
         let l = self.locals.get(&hid).cloned().expect("an owned local is declared");
-        // the uses of the local in the body (also in closures)
-        let body = self.tcx.hir_body_owned_by(self.key.0.expect_local());
-        let mut uses = LocalUses { tcx: self.tcx, typeck: self.typeck, hid, uses: vec![], by_value_capture: false };
-        uses.visit_body(body);
-        if uses.by_value_capture {
+        // the uses of the local in the body (also in closures), collected once
+        if self.local_uses.is_none() {
+            let body = self.tcx.hir_body_owned_by(self.key.0.expect_local());
+            let mut v = LocalUses { tcx: self.tcx, typeck: self.typeck, uses: HashMap::new(), by_value: HashSet::new() };
+            v.visit_body(body);
+            self.local_uses = Some((v.uses, v.by_value));
+        }
+        let (uses, by_value) = self.local_uses.as_ref().expect("collected");
+        if by_value.contains(&hid) {
             return unsup("closure capturing a value with a destructor");
         }
+        let uses = uses.get(&hid).cloned().unwrap_or_default();
         let mut moves = vec![];
-        for u in uses.uses {
+        for u in uses {
             if self.use_kind(u)? == UseKind::Move {
                 moves.push(u.hir_id);
             }
@@ -4636,7 +4664,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     }
                     UseKind::Place
                 }
-                ExprKind::Assign(lhs, _, _) if lhs.hir_id == p.hir_id => UseKind::Assign,
+                // assigned (the old value is dropped there, see `expr`)
+                ExprKind::Assign(lhs, _, _) if lhs.hir_id == p.hir_id => UseKind::Place,
                 ExprKind::Match(s, arms, _) if s.hir_id == p.hir_id => {
                     if arms.iter().any(|a| bad_bindings(a.pat)) {
                         return unsup("move of a part with a destructor out of a value");
@@ -4671,19 +4700,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 fn is_place_expr<'tcx>(typeck: &TypeckResults<'tcx>, e: &hir::Expr<'tcx>) -> bool {
     match e.kind {
         ExprKind::Path(ref qp) => matches!(typeck.qpath_res(qp, e.hir_id), Res::Local(_) | Res::Def(DefKind::Static { .. }, _)),
-        ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Unary(UnOp::Deref, _) => true,
+        // a part of a place (of a temporary it is a temporary)
+        ExprKind::Field(b, _) | ExprKind::Index(b, _, _) => is_place_expr(typeck, b),
+        // what a reference points to is a place; the contents of a `Box` are where the box is
+        ExprKind::Unary(UnOp::Deref, b) => {
+            matches!(typeck.expr_ty_adjusted(b).kind(), ty::Ref(..) | ty::RawPtr(..)) || is_place_expr(typeck, b)
+        }
         _ => false,
     }
 }
 
-/// The paths to the local `hid` in a body (also in its closures), and whether a closure captures
-/// it by value.
+/// The paths to each local in a body (also in its closures), and the locals a closure captures
+/// by value.
 struct LocalUses<'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
-    hid: HirId,
-    uses: Vec<&'tcx hir::Expr<'tcx>>,
-    by_value_capture: bool,
+    uses: HashMap<HirId, Vec<&'tcx hir::Expr<'tcx>>>,
+    by_value: HashSet<HirId>,
 }
 
 impl<'tcx> Visitor<'tcx> for LocalUses<'tcx> {
@@ -4695,12 +4728,16 @@ impl<'tcx> Visitor<'tcx> for LocalUses<'tcx> {
 
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
         match e.kind {
-            ExprKind::Path(ref qp) if self.typeck.qpath_res(qp, e.hir_id) == Res::Local(self.hid) => self.uses.push(e),
+            ExprKind::Path(ref qp) => {
+                if let Res::Local(h) = self.typeck.qpath_res(qp, e.hir_id) {
+                    self.uses.entry(h).or_default().push(e);
+                }
+            }
             ExprKind::Closure(c) => {
-                if self.typeck.closure_min_captures_flattened(c.def_id).any(|cap| {
-                    cap.get_root_variable() == self.hid && !matches!(cap.info.capture_kind, ty::UpvarCapture::ByRef(_))
-                }) {
-                    self.by_value_capture = true;
+                for cap in self.typeck.closure_min_captures_flattened(c.def_id) {
+                    if !matches!(cap.info.capture_kind, ty::UpvarCapture::ByRef(_)) {
+                        self.by_value.insert(cap.get_root_variable());
+                    }
                 }
             }
             _ => {}

@@ -114,6 +114,8 @@ pub struct Frontend<'tcx> {
     ext_type_ids: HashMap<DefId, String>,
     pub foreign_funs: BTreeMap<String, ExtFun>,
     pub alloc_types: Vec<String>,
+    /// their canonical forms (see `need_alloc`)
+    alloc_keys: Vec<String>,
     /// the function items whose types `ty` is translating (a function item's signature may
     /// contain its own type, through an `impl Trait` result)
     fn_items: Vec<DefId>,
@@ -310,6 +312,7 @@ impl<'tcx> Frontend<'tcx> {
             ext_type_ids: HashMap::new(),
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
+            alloc_keys: vec![],
             fn_items: Vec::new(),
             fmt_error: fmt_error_of(tcx),
             std_adts: std_adts_of(tcx),
@@ -1032,9 +1035,10 @@ impl<'tcx> Frontend<'tcx> {
         // the same type may be written with different parentheses: one storage per type (else the
         // overloading of `store_reference_const` is ambiguous)
         let key = canonical_hol_ty(hol_ty);
-        match self.alloc_types.iter().position(|t| canonical_hol_ty(t) == key) {
+        match self.alloc_keys.iter().position(|t| *t == key) {
             Some(k) => k,
             None => {
+                self.alloc_keys.push(key);
                 self.alloc_types.push(hol_ty.to_string());
                 self.alloc_types.len() - 1
             }
