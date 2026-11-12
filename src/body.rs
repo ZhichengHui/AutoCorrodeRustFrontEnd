@@ -188,6 +188,12 @@ pub struct BodyTr<'a, 'tcx> {
     dicts: Vec<(ty::TraitRef<'tcx>, String)>,
     /// the arguments of the call being translated (see `call_args`)
     call_scope: Option<CallScope>,
+    /// the write-backs of subslices borrowed by `let` (see `let_subslice`), by the statement after
+    /// which they come
+    write_back_after: HashMap<HirId, String>,
+    /// expressions translated as given values (the bounds standing for the subslice borrows of a
+    /// `let`'s initializer, see `let_subslice`)
+    given: HashMap<HirId, Tr>,
 }
 
 /// The arguments of a call (or the iterable of a `for` loop) whose mutable borrows of subslices
@@ -222,6 +228,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             comments: vec![],
             dicts: fe_dicts,
             call_scope: None,
+            write_back_after: HashMap::new(),
+            given: HashMap::new(),
         }
     }
 
@@ -390,7 +398,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             match st.kind {
                 StmtKind::Item(_) => {}
                 StmtKind::Let(l) => {
-                    let (pre, post) = self.let_stmt(l)?;
+                    let (mut pre, post) = match self.let_subslice(l, &stmts[i + 1..], tail)? {
+                        Some(copy_in) => (copy_in, String::new()),
+                        None => self.let_stmt(l)?,
+                    };
+                    if let Some(wb) = self.write_back_after.remove(&st.hir_id) {
+                        pre = format!("{}\n{}", pre, wb);
+                    }
                     let rest = self.block_seq(&stmts[i + 1..], tail)?;
                     parts.push(format!("{}\n{}{}", pre, rest, post));
                     return Ok(join_seq(parts));
@@ -403,6 +417,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     }
                     let s = self.stmt_expr(e);
                     parts.push(s);
+                    if let Some(wb) = self.write_back_after.remove(&st.hir_id) {
+                        parts.push(wb);
+                    }
                 }
             }
         }
@@ -723,6 +740,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn pv_adjusted(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<PV> {
+        if let Some(t) = self.given.remove(&e.hir_id) {
+            return Ok(PV::Val(t));
+        }
         // a subslice auto-borrowed mutably as a method's receiver (`v[a..b].fill(x)`), before it is
         // translated as a value (see `subslice_copy_in`)
         if let [adj] = self.typeck.expr_adjustments(e)
@@ -920,6 +940,195 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         s.pre.push(copy);
         s.post.push(format!("* {} = {};", b, back.at(40)));
         Ok(Some(Tr::atom(tmp)))
+    }
+
+    /// The result expressions of `e`: the tails of its blocks and the branches of its `if`s; `false`
+    /// if a block has no tail or an `if` no `else`.
+    fn result_leaves(e: &'tcx hir::Expr<'tcx>, out: &mut Vec<&'tcx hir::Expr<'tcx>>) -> bool {
+        match e.kind {
+            ExprKind::Block(b, None) => b.expr.is_some_and(|t| Self::result_leaves(t, out)),
+            ExprKind::If(_, t, Some(el)) => Self::result_leaves(t, out) && Self::result_leaves(el, out),
+            ExprKind::DropTemps(x) => Self::result_leaves(x, out),
+            _ => {
+                out.push(e);
+                true
+            }
+        }
+    }
+
+    /// The block that contains the `let` declaring the local `hid` (or the `let` statement `hid`).
+    fn let_block(&self, hid: HirId) -> Option<HirId> {
+        let mut n = hid;
+        for _ in 0..4 {
+            n = self.tcx.parent_hir_id(n);
+            if let hir::Node::Block(b) = self.tcx.hir_node(n) {
+                return Some(b.hir_id);
+            }
+        }
+        None
+    }
+
+    /// `let x = e;` where every result of `e` (see `result_leaves`) mutably borrows a subslice of,
+    /// or the whole of, the same local sequence `b` declared earlier in this block (and not a
+    /// reference): the subslice is copied into a fresh mutable local, `x` is its reference, and the
+    /// copy is written back into `b` after the last statement using `x` (see `block_seq`). The
+    /// statements up to there may only pass `x` directly as a call's argument, the other arguments
+    /// of such a call must not refer to anything with a lifetime, a call's result with a lifetime
+    /// must at once be (borrowed as) a call's argument, and their `let`s bind types without
+    /// lifetimes: then the borrow ends there. A `return` or `break` out of the block ends `b`
+    /// too. `None` if this does not apply.
+    fn let_subslice(
+        &mut self,
+        l: &'tcx hir::LetStmt<'tcx>,
+        later: &'tcx [hir::Stmt<'tcx>],
+        tail: Option<&'tcx hir::Expr<'tcx>>,
+    ) -> R<Option<String>> {
+        let (Some(init), None) = (l.init, l.els) else { return Ok(None) };
+        let PatKind::Binding(hir::BindingMode(hir::ByRef::No, hir::Mutability::Not), xh, _, None) = l.pat.kind else { return Ok(None) };
+        let ty::Ref(_, slice_ty, m) = *self.node_ty(xh).kind() else { return Ok(None) };
+        if !m.is_mut() || !self.list_like(slice_ty) { return Ok(None) }
+        // the results: `&mut b[range]` or `&mut b`, for one local `b`
+        let mut leaves = vec![];
+        if !Self::result_leaves(init, &mut leaves) { return Ok(None) }
+        let local = |e: &hir::Expr<'_>| match e.kind {
+            ExprKind::Path(hir::QPath::Resolved(None, p)) => match p.res {
+                Res::Local(h) => Some(h),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut base: Option<(HirId, &'tcx hir::Expr<'tcx>)> = None;
+        let mut parts = vec![];
+        for leaf in &leaves {
+            let ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, p) = leaf.kind else { return Ok(None) };
+            let (b, r) = match p.kind {
+                ExprKind::Index(b, r, _) if self.range_literal(r).is_some() => (b, Some(r)),
+                _ => (p, None),
+            };
+            let Some(bh) = local(b) else { return Ok(None) };
+            if base.is_some_and(|(h, _)| h != bh) || !self.list_like(self.node_ty(bh)) || self.node_ty(bh).is_ref() {
+                return Ok(None);
+            }
+            base = Some((bh, b));
+            parts.push((leaf.hir_id, r));
+        }
+        let Some((bh, b)) = base else { return Ok(None) };
+        if self.let_block(bh) != self.let_block(l.hir_id) { return Ok(None) }
+        // the statements using `x`, up to the last one; not the block's tail
+        let uses = |e: &'tcx hir::Expr<'tcx>| uses_local(e, xh);
+        if tail.is_some_and(uses) { return Ok(None) }
+        let stmt_expr = |s: &'tcx hir::Stmt<'tcx>| match s.kind {
+            StmtKind::Let(l2) => l2.init,
+            StmtKind::Expr(e) | StmtKind::Semi(e) => Some(e),
+            StmtKind::Item(_) => None,
+        };
+        let last = later.iter().rposition(|s| stmt_expr(s).is_some_and(uses));
+        for s in &later[..last.map_or(0, |j| j + 1)] {
+            if let StmtKind::Let(l2) = s.kind {
+                if l2.els.is_some() || self.has_lifetime(self.node_ty(l2.pat.hir_id)) { return Ok(None) }
+            }
+            if let Some(e) = stmt_expr(s)
+                && !self.borrow_kept_in_calls(e, xh)
+            {
+                return Ok(None);
+            }
+        }
+        // the copy-in: the bounds of the subslice chosen by `e`, the copy, `x`
+        let bref = self.place(b)?;
+        let len = Tr::atom(format!("len(* {})", bref.at(200)));
+        for (leaf, r) in parts {
+            let (lo, hi) = match r {
+                Some(r) => {
+                    let Some((lo, hi, incl)) = self.range_bounds(r, len.clone())? else { return Ok(None) };
+                    (lo, if incl { Tr::new(format!("{} + 1_usize", hi.at(49)), 49) } else { hi })
+                }
+                None => (Tr::atom("0_usize"), len.clone()),
+            };
+            self.given.insert(leaf, Tr::atom(format!("({}, {})", lo.at(20), hi.at(20))));
+        }
+        let bounds = self.val(init);
+        if !self.given.is_empty() {
+            self.given.clear();
+            return unsup("mutable borrow of a subslice in a `let`");
+        }
+        let bounds = bounds?;
+        let (bn, lo, sub) = (self.fresh("bnds"), self.fresh("lo"), self.fresh("sub"));
+        let a = self.alloc(slice_ty)?;
+        let copy = self.let_binding(&sub, hir::Mutability::Mut, &a, &format!("(* {})[{} .. {}.1]", bref.at(200), lo, bn));
+        let bind_x = self.bind_pattern(l.pat, Tr::atom(sub.clone()))?;
+        let back = self.named_call(
+            "slice_splice",
+            vec![Tr::new(format!("* {}", bref.at(200)), 98), Tr::atom(lo.clone()), Tr::new(format!("* {}", sub), 98)],
+        );
+        let wb = format!("* {} = {};", bref.at(200), back.at(40));
+        let mut pre = format!("let {} = {};\nlet {} = {}.0;\n{}\n{}", bn, bounds.at(20), lo, bn, copy, bind_x);
+        match last {
+            Some(j) => {
+                self.write_back_after.insert(later[j].hir_id, wb);
+            }
+            None => pre = format!("{}\n{}", pre, wb),
+        }
+        Ok(Some(pre))
+    }
+
+    fn has_lifetime(&self, t: Ty<'tcx>) -> bool {
+        t.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Lifetime(_)))
+    }
+
+    /// In `e`: the local `x` occurs only as an argument (or receiver) of calls; a call with an
+    /// argument containing `x` has no other argument referring to something with a lifetime, and
+    /// its result has no lifetime unless it is (borrowed as) an argument of another call.
+    fn borrow_kept_in_calls(&self, e: &'tcx hir::Expr<'tcx>, x: HirId) -> bool {
+        struct V<'a, 'b, 'tcx> {
+            tr: &'a BodyTr<'b, 'tcx>,
+            x: HirId,
+            ok: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for V<'_, '_, 'tcx> {
+            fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
+                let tcx = self.tr.tcx;
+                let arg_of_call = |h: HirId| {
+                    matches!(tcx.parent_hir_node(h), hir::Node::Expr(p) if match p.kind {
+                        ExprKind::Call(_, args) => args.iter().any(|a| a.hir_id == h),
+                        ExprKind::MethodCall(_, r, args, _) => r.hir_id == h || args.iter().any(|a| a.hir_id == h),
+                        _ => false,
+                    })
+                };
+                if let ExprKind::Path(hir::QPath::Resolved(None, p)) = e.kind
+                    && p.res == Res::Local(self.x)
+                    && !arg_of_call(e.hir_id)
+                {
+                    self.ok = false;
+                }
+                let args: Vec<&'tcx hir::Expr<'tcx>> = match e.kind {
+                    ExprKind::Call(_, args) => args.iter().collect(),
+                    ExprKind::MethodCall(_, r, args, _) => std::iter::once(r).chain(args).collect(),
+                    _ => vec![],
+                };
+                if !args.is_empty() && args.iter().any(|a| uses_local(a, self.x)) {
+                    let refers = |a: &&'tcx hir::Expr<'tcx>| {
+                        self.tr.ty_adj(a).walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(t) if matches!(t.kind(), ty::Ref(_, inner, _) if self.tr.has_lifetime(*inner))))
+                    };
+                    if args.iter().any(|a| !uses_local(a, self.x) && refers(a)) {
+                        self.ok = false;
+                    }
+                    // a result with a lifetime: at once an argument, perhaps borrowed
+                    if self.tr.has_lifetime(self.tr.ty_of(e)) {
+                        let h = match tcx.parent_hir_node(e.hir_id) {
+                            hir::Node::Expr(p) if matches!(p.kind, ExprKind::AddrOf(..)) => p.hir_id,
+                            _ => e.hir_id,
+                        };
+                        if !arg_of_call(h) {
+                            self.ok = false;
+                        }
+                    }
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        let mut v = V { tr: self, x, ok: true };
+        v.visit_expr(e);
+        v.ok
     }
 
     /// The values of the arguments `es` of a call, in order, and, if an argument mutably borrows a
@@ -4060,6 +4269,24 @@ fn with_prologue(pro: &[String], body: &str) -> String {
 
 fn paren_if(c: &str) -> String {
     if c.contains(' ') { format!("({})", c) } else { c.to_string() }
+}
+
+/// Whether `e` mentions the local `x`.
+fn uses_local<'tcx>(e: &'tcx hir::Expr<'tcx>, x: HirId) -> bool {
+    struct U(HirId, bool);
+    impl<'v> Visitor<'v> for U {
+        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
+            if let ExprKind::Path(hir::QPath::Resolved(None, p)) = e.kind
+                && p.res == Res::Local(self.0)
+            {
+                self.1 = true;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut u = U(x, false);
+    u.visit_expr(e);
+    u.1
 }
 
 /// Whether the pattern `pat` is a single binding that `body` uses only dereferenced (`*x`): a

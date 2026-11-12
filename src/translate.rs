@@ -145,9 +145,18 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     for &d in &bodies {
         fe.def_name(d);
     }
-    // a function with const generic parameters only at its instances (see `local_callee`)
+    // A function with const generic parameters only at its instances (see `local_callee`). A
+    // function translated per instance (see `mono_fns`) that the crate does not export is
+    // translated generically only when a definition refers to its generic version, or when it
+    // has no instance (see below): its generic version cannot translate what needs the instances.
+    let exported = tcx.effective_visibilities(());
+    let deferred: Vec<DefId> = bodies
+        .iter()
+        .copied()
+        .filter(|&d| fe.mono_fns.contains(&d) && !fe.has_const_params(d) && d.as_local().is_some_and(|l| !exported.is_exported(l)))
+        .collect();
     for &d in &bodies {
-        if !fe.has_const_params(d) {
+        if !fe.has_const_params(d) && !deferred.contains(&d) {
             translate_item(&mut fe, (d, Inst::Generic));
         }
     }
@@ -167,9 +176,27 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             }
         }
     }
-    // instances called from the translated bodies, and from those instances
-    while let Some(key) = fe.pending.pop() {
-        translate_item(&mut fe, key);
+    // instances called from the translated bodies, and from those instances; then the deferred
+    // generic versions that are referred to or whose functions have no instance (and what they call)
+    loop {
+        while let Some(key) = fe.pending.pop() {
+            translate_item(&mut fe, key);
+        }
+        let needed: Vec<DefId> = deferred
+            .iter()
+            .copied()
+            .filter(|&d| {
+                let g = (d, Inst::Generic);
+                !fe.fun_defs.iter().any(|f| f.key == g)
+                    && (fe.fun_defs.iter().any(|f| f.calls.0.contains(&g)) || !fe.fun_defs.iter().any(|f| f.key.0 == d))
+            })
+            .collect();
+        if needed.is_empty() {
+            break;
+        }
+        for d in needed {
+            translate_item(&mut fe, (d, Inst::Generic));
+        }
     }
     for d in default_methods {
         if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
