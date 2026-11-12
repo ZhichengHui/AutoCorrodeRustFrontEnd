@@ -90,7 +90,7 @@
 | `<[T]>::copy_from_slice`、`fill`、`reverse` | `slice_copy_from_slice`（长度不等时 panic）、`slice_fill`、`slice_reverse` | 手写 | 同上 |
 | `Vec::truncate`、`clear`、`resize`、`extend_from_slice` | `vec_truncate`、`vec_clear`、`vec_resize`、`vec_extend_from_slice` | 手写 | 同上 |
 | `Vec::into_boxed_slice` | 恒等 | 前端写法 | 同上 |
-| 作为调用参数（或方法的接收者）的 `&mut v[a..b]`（`a..b`、`a..`、`..b`、`..=b`、`..`）；`for` 遍历 `&mut v[a..b]`（循环体只能正常结束或跳出本循环） | 子切片复制到新的可变局部变量，引用它；调用（循环）之后用 `slice_splice` 写回 `v`。借用存活期间 Rust 不允许访问 `v`，切片的长度不变，所以与 Rust 一致。`let x = &mut v[a..b]`（及结果都是同一序列的子切片或整体借用的 `if`）在 `x` 最后一次使用之后写回（条件见 `LANGUAGE_FEATURES.md`）。调用可能保留借用时（结果或其他参数带生命周期）、借用出现在其他位置时，仍是占位符 | 手写 `slice_splice` + 前端写法 | `borrow_mut`、`call_args`、`with_writeback`、`for_loop` |
+| 作为调用参数（或方法的接收者）的 `&mut v[a..b]`（`a..b`、`a..`、`..b`、`..=b`、`..`）；`for` 遍历 `&mut v[a..b]`（循环体只能正常结束或跳出本循环） | 子切片复制到新的可变局部变量，引用它；调用（循环）之后用 `slice_splice` 写回 `v`。借用存活期间 Rust 不允许访问 `v`，切片的长度不变，所以与 Rust 一致。`let x = &mut v[a..b]`（及结果都是同一序列的子切片或整体借用的 `if`）在 `x` 最后一次使用之后写回（条件见 `LANGUAGE_FEATURES.md`）。调用可能保留借用时（结果带生命周期，或其他参数是指向带生命周期之物的引用、按值传入的带生命周期的值）、借用出现在其他位置时，仍是占位符 | 手写 `slice_splice` + 前端写法 | `borrow_mut`、`call_args`、`with_writeback`、`for_loop` |
 | `Vec::push` | `vec_push`：追加到末尾 | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
 | `Vec::pop` | `vec_pop`：空时 `None`，否则去掉并返回最后一个元素 | 手写 | 同上 |
 | `<[T]>::swap` | `slice_swap`：交换两个位置，越界时 panic | 手写 | 同上 |
