@@ -103,21 +103,23 @@
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
 | `Ordering` 及其变体 | `ordering` | AutoCorrode `StdLib_Ordering` | `Frontend::ty`、`unit_ctor` |
-| `Ord::cmp`（操作数为有符号或无符号整数；AutoCorrode 的 `cmp` 只定义在 word 上，有符号时按有符号数比较） | `cmp` | AutoCorrode `StdLib_Ordering` | `std_call`（`hol_ordered`） |
+| `Ord::cmp`（操作数为有符号或无符号整数；AutoCorrode 的 `cmp` 只定义在 word 上，有符号时按有符号数比较） | `cmp` | AutoCorrode `StdLib_Ordering` | `std_call`（`hol_ordered`）；标准库实现的字典字段（`model_field`） |
 
 `bool`、`str`、`String` 的 `Ord::cmp` 没有模型（AutoCorrode 的 `cmp` 不接受这些类型），生成外部函数模板。
+
+字典（见 `LANGUAGE_FEATURES.md` 的“泛型与 trait”）中，标准库对同一种有模型的整数实现的 `Add`、`Sub`、`Mul`、`Div`、`Rem`、`BitAnd`、`BitOr`、`BitXor` 的方法和 `PartialOrd` 的 `lt`、`le`、`gt`、`ge` 是 uRust 的相应运算，`bool` 的 `BitAnd`、`BitOr`、`BitXor` 是 `&&`、`||`、`!=`，与直接写出的运算符的翻译（`binary`）相同（`model_field`）；移位和其他方法生成外部函数模板。
 
 ### 相等（PartialEq）
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| 标准库实现与派生实现的 `==`、`!=` | HOL `=`、`≠` | Isabelle/HOL | `binary`（`structural_eq`）、`std_call` |
+| 标准库实现与派生实现的 `==`、`!=` | HOL `=`、`≠` | Isabelle/HOL | `binary`（`structural_eq`）、`std_call`；标准库、派生和内建实现的字典字段（`model_field`） |
 
 丢掉的语义：字段类型有自定义（非结构）的 `PartialEq` 时，派生实现不是结构相等；外部类型（如 `HashMap`）的相等不由表示决定。
 
 ### Clone
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| 标准库实现与派生实现的 `clone` | 恒等 | 前端写法 | `std_call` |
+| 标准库实现与派生实现的 `clone` | 恒等 | 前端写法 | `std_call`；标准库、派生和内建实现的字典字段（`model_field`，`clone_from` 为赋值） |
 
 丢掉的语义：字段类型有自定义的 `clone` 时，派生实现不是恒等。
 

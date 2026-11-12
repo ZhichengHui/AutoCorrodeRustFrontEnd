@@ -13,14 +13,15 @@ use rustc_ast::ast::{Label, LitKind};
 use rustc_hir as hir;
 use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
+use rustc_middle::traits;
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
+use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
-use crate::frontend::Frontend;
+use crate::frontend::{FnKey, Frontend, GenCall, Inst};
 use crate::names;
 
 pub struct Unsup(pub String);
@@ -28,6 +29,40 @@ type R<T> = Result<T, Unsup>;
 
 fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
+}
+
+/// Replaces the `impl Trait` types by their hidden types (those containing themselves are kept).
+struct RevealOpaque<'tcx>(TyCtxt<'tcx>);
+
+impl<'tcx> ty::TypeFolder<TyCtxt<'tcx>> for RevealOpaque<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
+        self.0
+    }
+
+    fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
+        if let ty::Alias(_, a) = t.kind()
+            && let ty::AliasTyKind::Opaque { def_id } = a.kind
+            && let Ok(h) = self.0.try_expand_impl_trait_type(def_id, a.args)
+        {
+            return h;
+        }
+        t.super_fold_with(self)
+    }
+}
+
+/// `f(args)` for the HOL term `f` of a function value and the uRust arguments `a`.
+pub fn term_call(f: &str, a: &[String]) -> String {
+    if a.len() <= 8 {
+        format!("\\<epsilon>\\<open>{}\\<close>({})", f, a.join(", "))
+    } else {
+        let wrapped: Vec<String> = a.iter().map(|x| format!("\\<lbrakk>{}\\<rbrakk>", x)).collect();
+        format!("\\<epsilon>\\<open>funcall{} ({}) {}\\<close>", a.len(), f, wrapped.join(" "))
+    }
+}
+
+/// A HOL term as an argument of an application: parenthesised unless it is a name.
+fn paren_term(t: &str) -> String {
+    if t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '\u{1}' || c == '\u{2}') { t.to_string() } else { format!("({})", t) }
 }
 
 /// The label of a loop as it precedes the uRust loop (`'l: `), or nothing.
@@ -138,9 +173,8 @@ pub struct BodyTr<'a, 'tcx> {
     pub fe: &'a mut Frontend<'tcx>,
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
-    owner: LocalDefId,
-    /// The generic arguments of the instance being translated (`None`: the generic body itself).
-    args: Option<GenericArgsRef<'tcx>>,
+    /// What is translated: the generic body itself, an instance, or a default method's copy.
+    key: FnKey<'tcx>,
     locals: HashMap<HirId, Local>,
     /// the mutable reference matched by the `match`/`if let`/`while let` being translated, if
     /// any (see `scrut_place`): patterns bind by mutable reference into it
@@ -150,43 +184,45 @@ pub struct BodyTr<'a, 'tcx> {
     fresh: usize,
     pub calls: crate::frontend::DefSet<'tcx>,
     pub comments: Vec<String>,
+    /// the dictionary parameters of the body (see `Frontend::dict_params`)
+    dicts: Vec<(ty::TraitRef<'tcx>, String)>,
 }
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
 
 impl<'a, 'tcx> BodyTr<'a, 'tcx> {
-    pub fn new(fe: &'a mut Frontend<'tcx>, owner: LocalDefId, args: Option<GenericArgsRef<'tcx>>) -> Self {
+    pub fn new(fe: &'a mut Frontend<'tcx>, key: FnKey<'tcx>) -> Self {
         let tcx = fe.tcx;
-        let typeck = tcx.typeck(owner);
+        let typeck = tcx.typeck(key.0.expect_local());
+        let fe_dicts = fe.dict_params(key);
         BodyTr {
             fe,
             tcx,
             typeck,
-            owner,
-            args,
+            key,
             locals: HashMap::new(),
             match_place: None,
             pat_refs: vec![],
             fresh: 0,
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
+            dicts: fe_dicts,
         }
     }
 
-    /// A type or generic arguments from the type-checking results, at the instance's arguments.
+    /// A type or generic arguments from the type-checking results, at the instance's or copy's
+    /// arguments.
     fn mono<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, x: T) -> T {
-        match self.args {
-            Some(a) => self.fe.mono(a, x),
-            None => x,
+        match self.key.1 {
+            Inst::Generic => x,
+            _ => self.fe.at_key(self.key, x),
         }
     }
 
-    /// The typing environment of the body: no generic parameters are left in an instance.
+    /// The typing environment of the body: no generic parameters are left in an instance; a copy
+    /// has those of its implementation.
     fn typing_env(&self) -> ty::TypingEnv<'tcx> {
-        match self.args {
-            Some(_) => ty::TypingEnv::fully_monomorphized(),
-            None => ty::TypingEnv::post_analysis(self.tcx, self.owner.to_def_id()),
-        }
+        self.fe.inst_env(self.key)
     }
 
     fn node_ty(&self, hid: HirId) -> Ty<'tcx> { self.mono(self.typeck.node_type(hid)) }
@@ -219,12 +255,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn hty(&mut self, t: Ty<'tcx>) -> String {
         // normalised as the signature is (`translate`): in a generic body, in the item's own typing
         // environment, which also reveals its `impl Trait` types; an instance's types are already
-        let t = match self.args {
-            None => self
+        let t = match self.key.1 {
+            Inst::Generic => self
                 .tcx
                 .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
                 .unwrap_or(t),
-            Some(_) => t,
+            _ => t,
         };
         self.fe.ty(t)
     }
@@ -248,13 +284,21 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Bind the pattern variable `hid` to the uRust local `name`; a `mut` binding is a mutable
-    /// local (a cell), which needs storage for its type.
-    fn declare(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<()> {
-        if m.is_mut() {
-            self.alloc(self.node_ty(hid))?;
-        }
+    /// local (a cell), which needs storage for its type: returns its allocator, if not the
+    /// locale's (see `alloc`).
+    fn declare(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<Option<String>> {
+        let a = if m.is_mut() { self.alloc(self.node_ty(hid))? } else { None };
         self.locals.insert(hid, Local { name: name.to_string(), cell: m.is_mut() });
-        Ok(())
+        Ok(a)
+    }
+
+    /// `let [mut] n = v;` for a binding of mutability `m` with the allocator `a` (see `alloc`):
+    /// with one from the allocation record, the cell is allocated by calling it.
+    fn let_binding(&self, n: &str, m: hir::Mutability, a: &Option<String>, v: &str) -> String {
+        match a {
+            Some(a) if m.is_mut() => format!("let {} = \\<epsilon>\\<open>{}\\<close>({});", n, a, v),
+            _ => format!("let {}{} = {};", m.prefix_str(), n, v),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -271,9 +315,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let n = names::local_name(ident.as_str());
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
-                    self.declare(hid, &n, m)?;
+                    let a = self.declare(hid, &n, m)?;
                     if m.is_mut() {
-                        prologue.push(format!("let mut {} = {};", n, n));
+                        prologue.push(self.let_binding(&n, m, &a, &n));
                     }
                 }
                 PatKind::Wild => params.push(format!("unused_{}", i)),
@@ -302,16 +346,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    fn alloc(&mut self, t: Ty<'tcx>) -> R<()> {
+    /// Storage for a mutable local of type `t`: the locale's allocator for its HOL type, which
+    /// `let mut` chooses (`None`), or for a type with generic parameters, which the locale cannot
+    /// have one for, the allocator of the body's allocation record (a marker completed at
+    /// emission, see `Frontend::alloc_sites`).
+    fn alloc(&mut self, t: Ty<'tcx>) -> R<Option<String>> {
         let (h, modelled) = self.fe.ty_modelled(t);
         if !modelled {
             return unsup(format!("mutable local of the unsupported type `{}`", t));
         }
         if t.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Type(x) if matches!(x.kind(), ty::Param(_)))) {
-            return unsup("mutable local of a generic type (needs a locale prism for a type parameter)");
+            let i = self.fe.alloc_sites.len();
+            self.fe.alloc_sites.push((self.key, self.tcx.erase_and_anonymize_regions(t), h));
+            return Ok(Some(format!("\u{1}A{}\u{2}", i)));
         }
         self.fe.need_alloc(&h);
-        Ok(())
+        Ok(None)
     }
 
     // ------------------------------------------------------------------
@@ -454,9 +504,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // `let x;` -- deferred initialisation: model as a mutable local.
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
-                    self.declare(hid, &n, hir::Mutability::Mut)?;
+                    let a = self.declare(hid, &n, hir::Mutability::Mut)?;
                     let ht = self.hty(self.node_ty(hid));
-                    Ok((format!("let mut {} = \\<llangle>undefined :: {}\\<rrangle>;", n, ht), String::new()))
+                    let v = format!("\\<llangle>undefined :: {}\\<rrangle>", ht);
+                    Ok((self.let_binding(&n, hir::Mutability::Mut, &a, &v), String::new()))
                 } else {
                     unsup("let without initializer and with a non-identifier pattern")
                 }
@@ -477,7 +528,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pat.kind {
             PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
+                let a = self.declare(hid, &n, m)?;
                 // the allocator of a mutable local is chosen by its type; for a list or an option the
                 // initial value (`[]`, `None`, `Vec::with_capacity(n)`, ...) may not fix the element
                 // type when the uses that would are placeholders or external, so it is annotated
@@ -485,9 +536,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if m.is_mut() && matches!(lt.kind(), ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Vec" | "Option"))) {
                     let ht = self.hty(lt);
                     let tv = self.typed("init", v, &ht);
-                    return Ok(format!("let mut {} = {};", n, tv.s));
+                    return Ok(self.let_binding(&n, m, &a, &tv.s));
                 }
-                Ok(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)))
+                Ok(self.let_binding(&n, m, &a, &v.at(20)))
             }
             PatKind::Wild => Ok(format!("let _ = {};", v.at(20))),
             _ => {
@@ -515,8 +566,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => {}
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
-                out.push(format!("let {}{} = {};", m.prefix_str(), n, v.at(20)));
+                let a = self.declare(hid, &n, m)?;
+                out.push(self.let_binding(&n, m, &a, &v.at(20)));
                 if let Some(s) = sub {
                     out.extend(self.irrefutable(s, &Tr::atom(n))?);
                 }
@@ -748,9 +799,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
             PV::Val(v) => {
-                self.alloc(t)?;
+                let a = self.alloc(t)?;
                 let tmp = self.fresh("tmp");
-                Ok(PV::Val(Tr::block(format!("{{ let mut {} = {}; {} }}", tmp, v.at(20), tmp))))
+                let b = self.let_binding(&tmp, hir::Mutability::Mut, &a, &v.at(20));
+                Ok(PV::Val(Tr::block(format!("{{ {} {} }}", b, tmp))))
             }
         }
     }
@@ -1230,8 +1282,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("`static mut`");
         }
         if did.is_local() && self.tcx.hir_maybe_body_owned_by(did.expect_local()).is_some() && !self.fe.is_trait_item(did) {
-            self.calls.insert((did, None));
-            let m = self.fe.marker((did, None));
+            self.calls.insert((did, Inst::Generic));
+            let m = self.fe.marker((did, Inst::Generic));
             return Ok(Tr::new(format!("\u{1}Z{}\u{2}", m), 999));
         }
         if let Some(lit) = self.scalar_const(did, t) {
@@ -1310,13 +1362,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let lv = self.val(l)?;
         let rv = self.val(r)?;
         if lt.is_bool() {
-            let tok = match op {
-                BinOpKind::BitAnd => "&&",
-                BinOpKind::BitOr => "||",
-                BinOpKind::BitXor => "!=",
-                _ => Self::binop_info(op).0,
-            };
-            let p = match tok { "&&" => 43, "||" => 42, _ => Self::binop_info(op).1 };
+            let (tok, p) = Self::bool_binop(op);
             if matches!(op, BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
                 return unsup("ordering comparison on `bool`");
             }
@@ -1334,7 +1380,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn structural_eq(&mut self, e: &'tcx hir::Expr<'tcx>) -> bool {
         let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) else { return true };
         let args = self.node_args(e.hir_id);
-        match ty::Instance::try_resolve(self.tcx, self.typing_env(), did, args) {
+        match self.resolve_instance(did, args) {
             Ok(Some(inst)) => {
                 // derived impls, and the std impls (Option, tuples, references, str, slices)
                 let rd = inst.def_id();
@@ -1437,7 +1483,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let mut t = self.ty_of(callee);
                 // a closure, or a function item (whose value is the closure calling it, see
                 // `fn_item_value`), e.g. in an instance at the closure's or function's type
-                if !matches!(t.peel_refs().kind(), ty::Closure(..) | ty::FnDef(..)) {
+                // or a type parameter bounded by an `Fn` trait (see `Frontend::fn_param_types`)
+                let fn_value = match *t.peel_refs().kind() {
+                    ty::Closure(..) | ty::FnDef(..) => true,
+                    ty::Param(p) => self.fe.fn_params.contains_key(&p.index),
+                    _ => false,
+                };
+                if !fn_value {
                     return unsup("call through a generic `Fn` parameter (trait call in generic code)");
                 }
                 // the closure value is read out of the local's cell and through the references
@@ -1694,7 +1746,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("formatting trait without `fmt`");
         };
         if let Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) =
-            ty::Instance::try_resolve(tcx, self.typing_env(), fmt_fn, tcx.mk_args(&[t.into()]))
+            self.resolve_instance(fmt_fn, tcx.mk_args(&[t.into()]))
         {
             if rd.is_local() && self.fe.local_fn_with_body(rd) && !self.derived(rd) {
                 return Ok(self.local_call(rd, rargs, vec![Tr::atom(v), Tr::atom(sub)])?.s);
@@ -1781,15 +1833,331 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// A call of the local function `did` at the generic arguments `args`.
     fn local_call(&mut self, did: DefId, args: GenericArgsRef<'tcx>, argv: Vec<Tr>) -> R<Tr> {
+        let (key, kargs) = self.local_callee(did, args)?;
+        // a recursive group is defined with fixed type arguments (`translate::emit_funs`): a
+        // generic function calling itself at other ones (polymorphic recursion) cannot be
+        if key == self.key && !matches!(key.1, Inst::Mono(_)) {
+            let owner = match key.1 {
+                Inst::ImplCopy(imp) => imp,
+                _ => key.0,
+            };
+            let ident = ty::GenericArgs::identity_for_item(self.tcx, owner);
+            if !self.tcx.erase_and_anonymize_regions(kargs).types().eq(ident.types()) {
+                return unsup("recursive call at other type arguments (polymorphic recursion)");
+            }
+        }
+        let dicts = self.callee_dicts(key, kargs)?;
+        self.calls.insert(key);
+        let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
+        // an instance takes neither dictionaries nor an allocation record
+        if let Inst::Mono(_) = key.1 {
+            let m = self.fe.marker(key);
+            return Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a));
+        }
+        let i = self.fe.gen_calls.len();
+        self.fe.gen_calls.push(GenCall { callee: key, kargs, dicts, args: Some(a) });
+        Ok(Tr::new(format!("\u{1}F{}\u{2}", i), 999))
+    }
+
+    /// The function translating the local function `did` at the generic arguments `args`, with
+    /// the generic arguments of the item its dictionary parameters are the bounds of (see
+    /// `Frontend::dict_params`): an instance, the item itself, or for a default method that the
+    /// implementation of a type with generic parameters does not override, the method's copy for
+    /// that implementation.
+    fn local_callee(&mut self, did: DefId, args: GenericArgsRef<'tcx>) -> R<(FnKey<'tcx>, GenericArgsRef<'tcx>)> {
         let Some(key) = self.fe.callee(did, args) else {
             return unsup(format!("more than {} instances of a generic function", crate::frontend::MAX_INSTANCES));
         };
-        // a default method is generic over `Self`: only its instances are translated
-        if self.fe.is_trait_item(did) && key.1.is_none() { return unsup("call of a trait default method") }
-        self.calls.insert(key);
-        let m = self.fe.marker(key);
+        if !(self.fe.is_trait_item(did) && key.1 == Inst::Generic) {
+            return Ok((key, args));
+        }
+        let tcx = self.tcx;
+        let tr = tcx.trait_of_assoc(did).expect("a default method is a trait item");
+        // only the methods that are dictionary fields have copies (see `translate::run`)
+        if !self.fe.dict_methods(tr).contains(&did) {
+            return unsup("call of a trait default method that is not a dictionary field (with generic parameters of its own, or returning `impl Trait`)");
+        }
+        let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&args[..tcx.generics_of(tr).count()]));
+        match self.select(r)? {
+            traits::ImplSource::UserDefined(d) if d.impl_def_id.is_local() && !tcx.is_automatically_derived(d.impl_def_id) => {
+                Ok((self.fe.impl_copy(did, d.impl_def_id), d.args))
+            }
+            _ => unsup("call of a trait default method"),
+        }
+    }
+
+    /// `Instance::try_resolve` in the body's typing environment, with the `impl Trait` types in
+    /// `args` revealed (see `select`); arguments that do not normalise there (rustc would abort)
+    /// resolve to nothing.
+    fn resolve_instance(&self, did: DefId, args: GenericArgsRef<'tcx>) -> Result<Option<ty::Instance<'tcx>>, rustc_span::ErrorGuaranteed> {
+        let tcx = self.tcx;
+        let env = self.typing_env();
+        let args = tcx.erase_and_anonymize_regions(args.fold_with(&mut RevealOpaque(tcx)));
+        match tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(args)) {
+            Ok(args) => ty::Instance::try_resolve(tcx, env, did, args),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The candidate implementing the trait reference `r` in the body's typing environment (an
+    /// `impl Trait` type in it is its hidden type, as for its HOL type, see `Frontend::ty`).
+    fn select(&self, r: ty::TraitRef<'tcx>) -> R<&'tcx traits::ImplSource<'tcx, ()>> {
+        let tcx = self.tcx;
+        let env = self.typing_env();
+        let r = tcx.erase_and_anonymize_regions(r.fold_with(&mut RevealOpaque(tcx)));
+        let r = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(r)).unwrap_or(r);
+        tcx.codegen_select_candidate(env.as_query_input(r)).map_err(|_| Unsup(format!("implementation of `{}`", r)))
+    }
+
+    /// `f(args)` for the HOL term `f` of a function value.
+    fn term_app(&self, f: &str, argv: Vec<Tr>) -> Tr {
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
-        Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a))
+        Tr::new(term_call(f, &a), 999)
+    }
+
+    // ------------------------------------------------------------------
+    // Dictionaries (see `crate::dict`)
+    // ------------------------------------------------------------------
+
+    /// The dictionaries `key` takes (see `Frontend::dict_params`), for its bounds at the generic
+    /// arguments `kargs` of their item.
+    fn callee_dicts(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<Vec<String>> {
+        // a parameter of the callee bounded by an `Fn` trait is a function value (see
+        // `Frontend::fn_param_types`): its argument must be a closure, a function item, or such a
+        // parameter of the body (a function pointer, for one, is a placeholder type)
+        let owner = match key.1 {
+            Inst::Generic => Some(key.0),
+            Inst::ImplCopy(imp) => Some(imp),
+            Inst::Mono(_) => None,
+        };
+        for (i, _, _) in owner.map(|o| self.fe.fn_bounded_params(o)).unwrap_or_default() {
+            let fn_value = match *kargs.type_at(i as usize).kind() {
+                ty::Closure(..) | ty::FnDef(..) => true,
+                ty::Param(p) => self.fe.fn_params.contains_key(&p.index),
+                _ => false,
+            };
+            if !fn_value {
+                return unsup(format!("`Fn` parameter of a generic function instantiated with `{}`", kargs.type_at(i as usize)));
+            }
+        }
+        let bounds: Vec<ty::TraitRef<'tcx>> = self.fe.dict_params(key).into_iter().map(|(r, _)| r).collect();
+        let mut out = vec![];
+        for b in bounds {
+            let r = ty::EarlyBinder::bind(self.tcx, b).instantiate(self.tcx, kargs).skip_normalization();
+            out.push(paren_term(&self.dict_term(r)?));
+        }
+        Ok(out)
+    }
+
+    /// The dictionary for the trait reference `r` in the body: one of the body's dictionary
+    /// parameters (or a supertrait's in one), or an implementation's.
+    fn dict_term(&mut self, r: ty::TraitRef<'tcx>) -> R<String> {
+        match self.select(r)? {
+            traits::ImplSource::UserDefined(d) => self.impl_dict(d.impl_def_id, d.args),
+            traits::ImplSource::Param(_) => {
+                let r = self.tcx.erase_and_anonymize_regions(r);
+                let ps = self.dicts.clone();
+                ps.into_iter()
+                    .find_map(|(p, n)| self.bound_dict(p, n, r))
+                    .ok_or_else(|| Unsup(format!("bound `{}` without a dictionary", r)))
+            }
+            traits::ImplSource::Builtin(..) => self.model_dict(r, "built-in"),
+        }
+    }
+
+    /// The dictionary of a built-in or derived implementation of `r` (`what`): its methods are
+    /// their models (see `model_field`); a method without one makes it a placeholder. The
+    /// dictionaries of the supertraits are fields.
+    fn model_dict(&mut self, r: ty::TraitRef<'tcx>, what: &str) -> R<String> {
+        let tcx = self.tcx;
+        let mut fields = vec![];
+        for m in self.fe.dict_methods(r.def_id) {
+            let Some(f) = self.model_field(r, m) else {
+                return unsup(format!("dictionary of the {} implementation of `{}`", what, r));
+            };
+            fields.push(paren_term(&f));
+        }
+        for p in self.fe.dict_parents(r.def_id) {
+            let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
+            fields.push(paren_term(&self.dict_term(p)?));
+        }
+        let name = self.fe.dict_name(r.def_id);
+        Ok(if fields.is_empty() { name } else { format!("{} {}", name, fields.join(" ")) })
+    }
+
+    /// The model of the method `m` of a derived, built-in or standard-library implementation of
+    /// `r`, as a function value, if its direct calls have one: `clone` is the value itself (a value
+    /// is its clone), `clone_from` assigns, `eq` and `ne` of a type with itself are HOL
+    /// (in)equality (see `binary`, `std_call`); on modelled integers of one type the comparisons and
+    /// the arithmetic and bitwise operators (not the shifts, see `shift_amount`) are uRust's, as
+    /// `binary` translates them, and `cmp` is AutoCorrode's; on `bool`, `&`, `|`, `^` are as in
+    /// `binary`. The methods are identified within their trait, which is a lang or diagnostic item.
+    fn model_field(&mut self, r: ty::TraitRef<'tcx>, m: DefId) -> Option<String> {
+        let tcx = self.tcx;
+        let tr = r.def_id;
+        let name = tcx.item_name(m);
+        let lam2 = |b: String| format!("\\<lambda>a b. FunctionBody \\<lbrakk> {} \\<rbrakk>", b);
+        if tcx.is_lang_item(tr, LangItem::Clone) {
+            return match name.as_str() {
+                "clone" => Some("\\<lambda>x. FunctionBody (literal x)".to_string()),
+                "clone_from" => Some("\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>".to_string()),
+                _ => None,
+            };
+        }
+        let this = r.self_ty();
+        let rhs = r.args.types().nth(1);
+        let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same {
+            return match name.as_str() {
+                "eq" => Some(lam2("a == b".into())),
+                "ne" => Some(lam2("a != b".into())),
+                _ => None,
+            };
+        }
+        let int = Self::int_suffix(this).is_some() && rhs.is_none_or(|t| t == this);
+        if int && tcx.is_diagnostic_item(sym::Ord, tr) && name.as_str() == "cmp" {
+            return Some(lam2("cmp(a, b)".into()));
+        }
+        let op = Self::trait_binop(tcx, tr, name.as_str())?;
+        if int && !matches!(op, BinOpKind::Shl | BinOpKind::Shr) {
+            return Some(lam2(format!("a {} b", Self::binop_info(op).0)));
+        }
+        if this.is_bool() && rhs == Some(this) && matches!(op, BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor) {
+            return Some(lam2(format!("a {} b", Self::bool_binop(op).0)));
+        }
+        None
+    }
+
+    /// The binary operator the method `m` of the operator or comparison trait `tr` (a lang item)
+    /// implements.
+    fn trait_binop(tcx: TyCtxt<'tcx>, tr: DefId, m: &str) -> Option<BinOpKind> {
+        use BinOpKind as K;
+        let ops = [
+            (LangItem::Add, "add", K::Add),
+            (LangItem::Sub, "sub", K::Sub),
+            (LangItem::Mul, "mul", K::Mul),
+            (LangItem::Div, "div", K::Div),
+            (LangItem::Rem, "rem", K::Rem),
+            (LangItem::BitAnd, "bitand", K::BitAnd),
+            (LangItem::BitOr, "bitor", K::BitOr),
+            (LangItem::BitXor, "bitxor", K::BitXor),
+            (LangItem::Shl, "shl", K::Shl),
+            (LangItem::Shr, "shr", K::Shr),
+            (LangItem::PartialOrd, "lt", K::Lt),
+            (LangItem::PartialOrd, "le", K::Le),
+            (LangItem::PartialOrd, "gt", K::Gt),
+            (LangItem::PartialOrd, "ge", K::Ge),
+        ];
+        ops.into_iter().find(|(l, n, _)| tcx.is_lang_item(tr, *l) && *n == m).map(|(_, _, k)| k)
+    }
+
+    /// The uRust operator (with its precedence) of `&`, `|`, `^` on `bool`, and of the comparisons.
+    fn bool_binop(op: BinOpKind) -> (&'static str, u32) {
+        match op {
+            BinOpKind::BitAnd => ("&&", 43),
+            BinOpKind::BitOr => ("||", 42),
+            BinOpKind::BitXor => ("!=", Self::binop_info(op).1),
+            _ => Self::binop_info(op),
+        }
+    }
+
+    /// The dictionary for `r` in the dictionary `d` for the bound `p`: `d` itself, or a
+    /// supertrait field of it (transitively).
+    fn bound_dict(&mut self, p: ty::TraitRef<'tcx>, d: String, r: ty::TraitRef<'tcx>) -> Option<String> {
+        // compared as `select` sees `r`: normalised in the body's typing environment
+        let tcx = self.tcx;
+        let norm = |x: ty::TraitRef<'tcx>| {
+            let x = tcx.erase_and_anonymize_regions(x);
+            tcx.try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(x)).unwrap_or(x)
+        };
+        if norm(p) == norm(r) {
+            return Some(d);
+        }
+        for (k, q) in self.fe.dict_parents(p.def_id).into_iter().enumerate() {
+            let q = ty::EarlyBinder::bind(self.tcx, q).instantiate(self.tcx, p.args).skip_normalization();
+            let f = self.fe.dict_parent_field(p.def_id, k);
+            if let Some(t) = self.bound_dict(q, format!("{} {}", f, paren_term(&d)), r) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// The dictionary of the implementation `imp` at the generic arguments `args`: its methods
+    /// (a local implementation's translated methods or default-method copies, an external one's
+    /// templates), then the dictionaries of the trait's supertraits.
+    fn impl_dict(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
+        let tcx = self.tcx;
+        let r = tcx.impl_trait_ref(imp).instantiate(tcx, args).skip_normalization();
+        if imp.is_local() && tcx.is_automatically_derived(imp) {
+            return self.model_dict(r, "derived");
+        }
+        let tr = r.def_id;
+        let name = self.fe.dict_name(tr);
+        let implementors = tcx.impl_item_implementor_ids(imp);
+        let mut fields = vec![];
+        for m in self.fe.dict_methods(tr) {
+            let f = match implementors.get(&m) {
+                Some(&im) if imp.is_local() => {
+                    let iargs = ty::GenericArgs::for_item(tcx, im, |p, _| {
+                        if (p.index as usize) < args.len() { args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
+                    });
+                    self.fn_value((im, Inst::Generic), iargs)?
+                }
+                // a standard-library implementation's method is its model, if it has one, as in
+                // direct calls (see `std_call`); other external ones are templates
+                Some(&im) => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
+                    Some(f) => f,
+                    None => self.fe.ext_fun(im, false),
+                },
+                None if imp.is_local() && m.is_local() => {
+                    let key = self.fe.impl_copy(m, imp);
+                    self.fn_value(key, args)?
+                }
+                None => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
+                    Some(f) => f,
+                    None => self.fe.ext_fun(m, false),
+                },
+            };
+            fields.push(paren_term(&f));
+        }
+        for p in self.fe.dict_parents(tr) {
+            let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
+            fields.push(paren_term(&self.dict_term(p)?));
+        }
+        Ok(if fields.is_empty() { name } else { format!("{} {}", name, fields.join(" ")) })
+    }
+
+    /// The local function `key` as a HOL function value, applied to its dictionaries for its
+    /// bounds at the generic arguments `kargs` of their item.
+    fn fn_value(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<String> {
+        let dicts = self.callee_dicts(key, kargs)?;
+        self.calls.insert(key);
+        let i = self.fe.gen_calls.len();
+        self.fe.gen_calls.push(GenCall { callee: key, kargs, dicts, args: None });
+        Ok(format!("\u{1}V{}\u{2}", i))
+    }
+
+    /// A call of the trait method `did` (at `gargs`) of a bound of the body: the method's field of
+    /// the bound's dictionary.
+    fn dict_call(&mut self, did: DefId, gargs: GenericArgsRef<'tcx>, argv: Vec<Tr>, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        let tcx = self.tcx;
+        let c = tcx.generics_of(did).own_counts();
+        if c.types > 0 || c.consts > 0 {
+            return unsup("call of a trait method with generic parameters of its own in generic code (a dictionary field cannot be polymorphic)");
+        }
+        let tr = tcx.trait_of_assoc(did).expect("a trait method");
+        let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&gargs[..tcx.generics_of(tr).count()]));
+        if !self.fe.has_dict(tr) {
+            return unsup("trait method call in generic code (a trait without dictionaries)");
+        }
+        if !self.fe.dict_methods(tr).contains(&did) {
+            return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, or is an internal method of the standard library) in generic code");
+        }
+        let d = self.dict_term(r)?;
+        let f = self.fe.dict_field(tr, did);
+        let call = self.term_app(&format!("{} {}", f, paren_term(&d)), argv);
+        Ok(self.result_stated(did, call, e))
     }
 
     fn callee_app(&self, callee: &str, hol: &str, zero: &str, a: Vec<String>) -> Tr {
@@ -1827,7 +2195,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // trait methods: resolve to the implementation (in an instance, at its concrete types)
         let mut target = did;
         if self.tcx.trait_of_assoc(did).is_some() {
-            let targs = match ty::Instance::try_resolve(self.tcx, self.typing_env(), did, gargs) {
+            let targs = match self.resolve_instance(did, gargs) {
                 Ok(Some(inst)) => match inst.def {
                     ty::InstanceKind::Item(rd) => {
                         target = rd;
@@ -1840,7 +2208,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         return unsup(format!("call of `{}`", self.tcx.def_path_str(did)));
                     }
                 },
-                _ => return unsup("trait method call in generic code (needs monomorphisation)"),
+                // a method of a bound of a generic body: no implementation is known
+                _ => return self.dict_call(did, gargs, argv, e),
             };
             if target.is_local() && !self.derived(target) {
                 let call = self.local_call(target, targs, argv)?;
@@ -2282,7 +2651,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some(from_fn) = self.tcx.lang_items().get(LangItem::FromFn) else { return unsup("`?` with an error conversion") };
         let args = self.tcx.mk_args(&[e2.into(), e1.into()]);
         let err = self.fresh("err");
-        let conv = match ty::Instance::try_resolve(self.tcx, self.typing_env(), from_fn, args) {
+        let conv = match self.resolve_instance(from_fn, args) {
             Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) if self.fe.local_fn_with_body(rd) => {
                 self.local_call(rd, rargs, vec![Tr::atom(err.clone())])?
             }
@@ -2431,9 +2800,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ps = match pat.kind {
             PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
+                let a = self.declare(hid, &n, m)?;
                 if m.is_mut() {
-                    pro.push(format!("let mut {} = {};", n, n));
+                    pro.push(self.let_binding(&n, m, &a, &n));
                 }
                 n
             }
@@ -2592,8 +2961,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => Ok((None, vec![])),
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
-                let mut binds = vec![format!("let {}{} = {};", m.prefix_str(), n, v.at(20))];
+                let a = self.declare(hid, &n, m)?;
+                let mut binds = vec![self.let_binding(&n, m, &a, &v.at(20))];
                 match sub {
                     Some(s) => {
                         let (c, b2) = self.pat_cond(s, v)?;
@@ -2756,9 +3125,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Wild => Ok("_".into()),
             PatKind::Binding(bm, hid, ident, sub) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                self.declare(hid, &n, m)?;
+                let a = self.declare(hid, &n, m)?;
                 if m.is_mut() {
-                    pro.push(format!("let mut {} = {};", n, n));
+                    pro.push(self.let_binding(&n, m, &a, &n));
                 }
                 match sub {
                     None => Ok(n),
@@ -2948,7 +3317,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
         let gargs = tcx.instantiate_bound_regions_with_erased(gargs);
         let (target, targs) = if self.fe.is_trait_item(did) {
-            match ty::Instance::try_resolve(tcx, self.typing_env(), did, gargs) {
+            match self.resolve_instance(did, gargs) {
                 Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) => (rd, args),
                 _ => return unsup("function item used as a value"),
             }
@@ -2983,9 +3352,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if modelled {
                         pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
                     }
-                    self.declare(hid, &n, m)?;
+                    let a = self.declare(hid, &n, m)?;
                     if m.is_mut() {
-                        pro.push(format!("let mut {} = {};", n, n));
+                        pro.push(self.let_binding(&n, m, &a, &n));
                     }
                     ps.push(n);
                 }

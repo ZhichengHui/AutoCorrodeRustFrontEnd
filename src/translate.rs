@@ -12,7 +12,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
-use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, field_ty, one_line, paren_ty};
+use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, one_line, paren_ty};
 use crate::names;
 
 pub struct Options {
@@ -146,7 +146,23 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         fe.def_name(d);
     }
     for &d in &bodies {
-        translate_item(&mut fe, (d, None));
+        translate_item(&mut fe, (d, Inst::Generic));
+    }
+    // each local implementation's copies of the default methods it does not override (its
+    // dictionaries' fields)
+    for id in items.free_items() {
+        let imp = id.owner_id.to_def_id();
+        if !matches!(tcx.def_kind(imp), DefKind::Impl { of_trait: true }) || tcx.is_automatically_derived(imp) {
+            continue;
+        }
+        let tr = tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization().def_id;
+        let implementors = tcx.impl_item_implementor_ids(imp);
+        let fields = fe.dict_methods(tr);
+        for &m in &default_methods {
+            if tcx.trait_of_assoc(m) == Some(tr) && fields.contains(&m) && !implementors.contains_key(&m) {
+                fe.impl_copy(m, imp);
+            }
+        }
     }
     // instances called from the translated bodies, and from those instances
     while let Some(key) = fe.pending.pop() {
@@ -158,7 +174,8 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         }
     }
 
-    let funs_text = emit_funs(&mut fe);
+    let (funs_text, alloc_decls) = emit_funs(&mut fe);
+    let types_text = types_text + &fe.dict_decls() + &alloc_decls;
     write_all(&mut fe, opts, types_text, funs_text);
 }
 
@@ -303,44 +320,40 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     adt_sccs
 }
 
-/// The calls of a body whose callee depends on the body's generic parameters: trait methods and
-/// generic `Fn` values (`dependent`), and local functions at such arguments (`callees`).
-struct GenericCalls<'tcx> {
+/// The calls of a body that only an instance can translate (`dependent`): of trait methods that are
+/// not dictionary fields (see `Frontend::dict_methods`: e.g. with generic parameters of their own)
+/// at arguments with the body's generic parameters; and the calls of local functions at such
+/// arguments (`callees`).
+struct GenericCalls<'a, 'tcx> {
+    fe: &'a Frontend<'tcx>,
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx ty::TypeckResults<'tcx>,
     dependent: bool,
     callees: Vec<DefId>,
 }
 
-impl<'tcx> GenericCalls<'tcx> {
+impl<'a, 'tcx> GenericCalls<'a, 'tcx> {
     fn call(&mut self, did: DefId, args: ty::GenericArgsRef<'tcx>) {
         if !args.has_param() {
             return;
         }
-        if self.tcx.trait_of_assoc(did).is_some() {
-            self.dependent = true;
+        if let Some(tr) = self.tcx.trait_of_assoc(did) {
+            // a call of a value of a type parameter bounded by an `Fn` trait is a call of a function
+            // value (see `Frontend::fn_param_types`)
+            if !self.fe.is_fn_trait(tr) && !self.fe.dict_methods(tr).contains(&did) {
+                self.dependent = true;
+            }
         } else if did.is_local() {
             self.callees.push(did);
         }
     }
 }
 
-impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
+impl<'a, 'tcx> Visitor<'tcx> for GenericCalls<'a, 'tcx> {
     type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
         self.tcx
-    }
-
-    // a mutable local (or parameter) of a type with generic parameters needs a locale prism for
-    // that type, which only an instance has
-    fn visit_pat(&mut self, p: &'tcx hir::Pat<'tcx>) {
-        if let hir::PatKind::Binding(hir::BindingMode(_, hir::Mutability::Mut), ..) = p.kind
-            && self.typeck.pat_ty(p).has_param()
-        {
-            self.dependent = true;
-        }
-        intravisit::walk_pat(self, p);
     }
 
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
@@ -348,29 +361,32 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
             self.call(did, self.typeck.node_args(e.hir_id));
         }
         if let hir::ExprKind::Call(callee, _) = e.kind {
-            match *self.typeck.expr_ty_adjusted(callee).peel_refs().kind() {
-                ty::FnDef(did, args) => self.call(did, args.skip_binder()),
-                ty::Param(_) => self.dependent = true,
-                _ => {}
+            if let ty::FnDef(did, args) = *self.typeck.expr_ty_adjusted(callee).peel_refs().kind() {
+                self.call(did, args.skip_binder());
             }
         }
         intravisit::walk_expr(self, e);
     }
 }
 
-/// The generic functions translated per instance: trait default methods, and generic functions
-/// with a call depending on their generic parameters or a mutable local of a generic type,
+/// The generic functions translated per instance (besides once generically): the trait default
+/// methods that are not dictionary fields (they have no copies for implementations, see `run`),
+/// and the generic functions with a call only an instance translates (see `GenericCalls`),
 /// directly or through other such functions.
 fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefId]) -> HashSet<DefId> {
     let tcx = fe.tcx;
-    let mut mono: HashSet<DefId> = default_methods.iter().copied().collect();
+    let mut mono: HashSet<DefId> = default_methods
+        .iter()
+        .copied()
+        .filter(|&m| !fe.dict_methods(tcx.trait_of_assoc(m).expect("a default method is a trait item")).contains(&m))
+        .collect();
     let mut callees: Vec<(DefId, Vec<DefId>)> = vec![];
     for &did in bodies {
         if !fe.local_fn_with_body(did) {
             continue;
         }
         let ld = did.expect_local();
-        let mut v = GenericCalls { tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
+        let mut v = GenericCalls { fe, tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
         v.visit_body(tcx.hir_body_owned_by(ld));
         if v.dependent {
             mono.insert(did);
@@ -422,9 +438,12 @@ fn proj_tvars<'tcx>(fe: &Frontend<'tcx>, did: DefId, sig_tys: &[Ty<'tcx>]) -> Op
 
 /// Translate the function or constant `key` and record its definition.
 fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) {
-    let fd = translate_fn(fe, key);
-    // the projections' type variables (see `proj_tvars`) are those of one definition
-    fe.proj_tvars = None;
+    let mut fd = translate_fn(fe, key);
+    // the projections' type variables (see `proj_tvars`) and the function types of `Fn`-bounded
+    // parameters are those of one definition; they are kept for its allocation record (see
+    // `alloc_sets`)
+    fd.proj_ctx = fe.proj_tvars.take();
+    fd.fn_ctx = std::mem::take(&mut fe.fn_params);
     fe.fun_defs.push(fd);
 }
 
@@ -434,27 +453,45 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let ld: LocalDefId = did.expect_local();
     let is_fn = matches!(tcx.def_kind(did), DefKind::Fn | DefKind::AssocFn);
     let name = fe.fn_name(key);
+    // the dictionary parameters come first (see `crate::dict`)
+    let dicts = if is_fn { fe.dict_params(key) } else { vec![] };
     let rust_path = match key.1 {
-        None => tcx.def_path_str(did),
-        Some(args) => tcx.def_path_str_with_args(did, args),
+        Inst::Generic => tcx.def_path_str(did),
+        Inst::Mono(args) => tcx.def_path_str_with_args(did, args),
+        Inst::ImplCopy(imp) => format!("{} (default method, for {})", tcx.def_path_str(did), tcx.def_path_str(imp)),
     };
     let (params, ret): (Vec<(String, bool)>, (String, bool)) = if is_fn {
         let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(did).instantiate_identity().skip_normalization());
         // an instance's types at its arguments; a generic item's projections normalised in its own
         // typing environment (e.g. `<Iter<T> as Iterator>::Item` through the impl)
-        let at = |t: Ty<'tcx>| match key.1 {
-            Some(args) => fe.mono(args, t),
-            None => tcx
-                .try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, did), ty::Unnormalized::new_wip(t))
-                .unwrap_or(t),
-        };
+        let at = |t: Ty<'tcx>| fe.at_key(key, t);
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
-        if key.1.is_none() {
+        if !matches!(key.1, Inst::Mono(_)) {
             fe.register_ext_adts(&tys);
-            fe.proj_tvars = proj_tvars(fe, did, &tys);
+            // the associated types of the dictionaries' slots are type variables too
+            let env = fe.inst_env(key);
+            let mut all = tys.clone();
+            for (r, _) in &dicts {
+                all.extend(fe.dict_slots(*r).into_iter().map(|t| {
+                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
+                }));
+            }
+            // and so are those in the types of the `Fn` bounds (see `Frontend::fn_param_types`)
+            let owner = match key.1 { Inst::ImplCopy(imp) => imp, _ => did };
+            for (_, ins, ret) in fe.fn_bounded_params(owner) {
+                all.extend(ins.into_iter().chain([ret]).map(|t| {
+                    let t = tcx.erase_and_anonymize_regions(t);
+                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
+                }));
+            }
+            fe.proj_tvars = proj_tvars(fe, owner, &all);
+            fe.fn_params = fe.fn_param_types(owner);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");
-        (ins.iter().map(|t| fe.ty_modelled(*t)).collect(), fe.ty_modelled(*out))
+        let env = fe.inst_env(key);
+        let mut ps: Vec<(String, bool)> = dicts.iter().map(|(r, _)| (fe.dict_type(*r, env), true)).collect();
+        ps.extend(ins.iter().map(|t| fe.ty_modelled(*t)));
+        (ps, fe.ty_modelled(*out))
     } else {
         (vec![], fe.ty_modelled(tcx.type_of(did).instantiate_identity().skip_normalization()))
     };
@@ -471,6 +508,9 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         body: String::new(),
         calls: crate::frontend::DefSet::default(),
         comments: vec![],
+        n_dicts: dicts.len(),
+        proj_ctx: None,
+        fn_ctx: HashMap::new(),
     };
     let sp = tcx.def_span(did);
     let fn_placeholder = |fe: &mut Frontend<'tcx>, fd: &mut FunDef<'tcx>, msg: &str| {
@@ -514,13 +554,13 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         return fd;
     }
     let body = tcx.hir_body_owned_by(ld);
-    let mut bt = BodyTr::new(fe, ld, key.1);
+    let mut bt = BodyTr::new(fe, key);
     let res = bt.fn_body(body);
     let calls = std::mem::take(&mut bt.calls);
     let comments = std::mem::take(&mut bt.comments);
     match res {
         Ok((params, text)) => {
-            fd.params = params;
+            fd.params = dicts.iter().map(|(_, n)| n.clone()).chain(params).collect();
             fd.body = text;
             fd.calls = calls;
             fd.comments = comments;
@@ -670,7 +710,192 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str) -> String {
     )
 }
 
-fn subst_markers<'tcx>(fe: &Frontend<'tcx>, body: &str, caller_scc: Option<&HashSet<FnKey<'tcx>>>, names: &HashMap<FnKey<'tcx>, String>) -> String {
+/// The markers (`\u{1}<kind><n>\u{2}`) in `text`, with those in the dictionaries and arguments of
+/// the generic calls among them (see `GenCall`), transitively.
+fn markers_in(fe: &Frontend<'_>, text: &str, out: &mut Vec<(char, usize)>) {
+    let mut rest = text;
+    while let Some(i) = rest.find('\u{1}') {
+        let j = rest[i..].find('\u{2}').expect("a marker is closed") + i;
+        let kind = rest[i + 1..].chars().next().expect("a marker has a kind");
+        let n: usize = rest[i + 2..j].parse().expect("a marker has an index");
+        out.push((kind, n));
+        if matches!(kind, 'F' | 'V') {
+            let c = &fe.gen_calls[n];
+            for t in c.dicts.iter().chain(c.args.iter().flatten()) {
+                markers_in(fe, t, out);
+            }
+        }
+        rest = &rest[j + 1..];
+    }
+}
+
+/// Allocation records beyond this size are not built (polymorphic recursion would make them grow
+/// without bound).
+const MAX_ALLOCS: usize = 64;
+
+/// The allocation records (see `BodyTr::alloc`): for each translation, the types with generic
+/// parameters of the cells allocated by its body and by the generic functions it calls (at its
+/// generic parameters), with their HOL types, in order; and the translations whose record would
+/// exceed `MAX_ALLOCS`.
+struct Allocs<'tcx> {
+    sets: HashMap<FnKey<'tcx>, Vec<(Ty<'tcx>, String)>>,
+    overflow: HashSet<FnKey<'tcx>>,
+    /// the datatypes' names
+    names: HashMap<FnKey<'tcx>, String>,
+}
+
+impl<'tcx> Allocs<'tcx> {
+    fn set(&self, k: FnKey<'tcx>) -> &[(Ty<'tcx>, String)] {
+        self.sets.get(&k).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// `t`, a type of the body of a callee, at the generic arguments `kargs` of a call in the body of
+/// `caller`, normalised there.
+fn at_call<'tcx>(fe: &Frontend<'tcx>, caller: FnKey<'tcx>, kargs: ty::GenericArgsRef<'tcx>, t: Ty<'tcx>) -> Ty<'tcx> {
+    let tcx = fe.tcx;
+    let x = ty::EarlyBinder::bind(tcx, t).instantiate(tcx, kargs);
+    tcx.erase_and_anonymize_regions(tcx.try_normalize_erasing_regions(fe.inst_env(caller), x).unwrap_or_else(|_| x.skip_normalization()))
+}
+
+/// The HOL type of `t` in the context of the definition `d` (its projections' type variables and
+/// `Fn`-bounded parameters).
+fn hol_in<'tcx>(fe: &mut Frontend<'tcx>, d: &FunDef<'tcx>, t: Ty<'tcx>) -> String {
+    let saved = (fe.proj_tvars.take(), std::mem::take(&mut fe.fn_params));
+    fe.proj_tvars = d.proj_ctx.clone();
+    fe.fn_params = d.fn_ctx.clone();
+    let h = fe.ty(t);
+    (fe.proj_tvars, fe.fn_params) = saved;
+    h
+}
+
+fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'tcx> {
+    let mut sets: HashMap<FnKey<'tcx>, Vec<(Ty<'tcx>, String)>> = HashMap::new();
+    let mut calls: Vec<Vec<usize>> = vec![];
+    for d in defs {
+        let mut ms = vec![];
+        markers_in(fe, &d.body, &mut ms);
+        let set = sets.entry(d.key).or_default();
+        for &(k, n) in &ms {
+            if k == 'A' {
+                let (_, t, ref h) = fe.alloc_sites[n];
+                if !set.iter().any(|(u, _)| *u == t) {
+                    set.push((t, h.clone()));
+                }
+            }
+        }
+        calls.push(ms.iter().filter(|(k, _)| matches!(k, 'F' | 'V')).map(|&(_, n)| n).collect());
+    }
+    let mut overflow = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (d, cs) in defs.iter().zip(&calls) {
+            for &c in cs {
+                let (callee, kargs) = (fe.gen_calls[c].callee, fe.gen_calls[c].kargs);
+                let needed: Vec<Ty<'tcx>> = sets.get(&callee).into_iter().flatten().map(|(t, _)| *t).collect();
+                for t in needed {
+                    let ti = at_call(fe, d.key, kargs, t);
+                    if !ti.has_param() || sets[&d.key].iter().any(|(u, _)| *u == ti) {
+                        continue;
+                    }
+                    if sets[&d.key].len() >= MAX_ALLOCS {
+                        overflow.insert(d.key);
+                        continue;
+                    }
+                    let h = hol_in(fe, d, ti);
+                    sets.get_mut(&d.key).expect("every definition has a set").push((ti, h));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut names = HashMap::new();
+    for d in defs {
+        if !sets[&d.key].is_empty() && !overflow.contains(&d.key) {
+            names.insert(d.key, fe.unique_global(format!("{}_alloc", d.name)));
+        }
+    }
+    Allocs { sets, overflow, names }
+}
+
+/// The type variables in the HOL types `tys`, in order, except those every record takes first.
+fn tvars_of(tys: &[String], base: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for t in tys {
+        let b = t.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\'' {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                let v = &t[i..j];
+                if j > i + 1 && !base.contains(&v) && !out.iter().any(|o| o == v) {
+                    out.push(v.to_string());
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+const ALLOC_BASE: [&str; 6] = ["'s", "'abort", "'i", "'o", "'addr", "'gv"];
+
+/// The allocation record datatype of a definition: one allocator per type of its set.
+fn alloc_decl(fe: &Frontend<'_>, name: &str, set: &[(Ty<'_>, String)]) -> (String, String) {
+    let fields: Vec<String> = set
+        .iter()
+        .map(|(_, h)| fe.fun_type(&[h.clone()], &format!("('addr, 'gv, {}) Global_Store.ref", h)))
+        .collect();
+    let mut tparams: Vec<String> = ALLOC_BASE.iter().map(|s| s.to_string()).collect();
+    tparams.extend(tvars_of(&fields, &ALLOC_BASE));
+    let decl = format!(
+        "datatype ({}) {} =\n  {} {}\n\n",
+        tparams.join(", "),
+        name,
+        name,
+        fields.iter().enumerate().map(|(k, f)| format!("({}_{}: {})", name, k, cart(f))).collect::<Vec<_>>().join("\n    ")
+    );
+    (format!("({}) {}", tparams.join(", "), name), decl)
+}
+
+/// The name of the allocation record parameter.
+const ALLOC_PARAM: &str = "alloc_record";
+
+/// The allocation record a generic call passes to its callee, if the callee takes one: each
+/// allocator is the caller's own (for a type with generic parameters) or the locale's.
+fn record_arg<'tcx>(fe: &mut Frontend<'tcx>, allocs: &Allocs<'tcx>, me: FnKey<'tcx>, c: usize) -> Option<String> {
+    let (callee, kargs) = (fe.gen_calls[c].callee, fe.gen_calls[c].kargs);
+    let name = allocs.names.get(&callee)?.clone();
+    let mut fields = vec![];
+    for (t, _) in allocs.set(callee).to_vec() {
+        let ti = at_call(fe, me, kargs, t);
+        fields.push(if ti.has_param() {
+            let j = allocs.set(me).iter().position(|(u, _)| *u == ti).expect("the caller's record has its callees' allocators");
+            format!("({}_{} {})", allocs.names[&me], j, ALLOC_PARAM)
+        } else {
+            let h = fe.ty(ti);
+            format!("ref_{}.new", fe.need_alloc(&h) + 1)
+        });
+    }
+    Some(format!("({} {})", name, fields.join(" ")))
+}
+
+fn subst_markers<'tcx>(
+    fe: &mut Frontend<'tcx>,
+    allocs: &Allocs<'tcx>,
+    me: FnKey<'tcx>,
+    body: &str,
+    caller_scc: Option<&HashSet<FnKey<'tcx>>>,
+    names: &HashMap<FnKey<'tcx>, String>,
+) -> String {
     let mut out = String::new();
     let mut rest = body;
     while let Some(i) = rest.find('\u{1}') {
@@ -679,17 +904,56 @@ fn subst_markers<'tcx>(fe: &Frontend<'tcx>, body: &str, caller_scc: Option<&Hash
         let tag = &rest[i + 1..j];
         let kind = &tag[..1];
         let idx: usize = tag[1..].parse().unwrap();
-        let key = fe.marker_ids[idx];
-        // every marked callee is a local item with a body, hence translated
-        let name = names.get(&key).cloned().expect("callee of a call marker is translated");
-        let rec = caller_scc.map(|s| s.contains(&key)).unwrap_or(false);
-        let s = match (kind, rec) {
-            ("C", false) | ("H", false) => name.clone(),
-            ("Z", false) => format!("{}()", name),
-            ("C", true) => format!("\\<epsilon>\\<open>rec_{}\\<close>", name),
-            ("H", true) => format!("rec_{}", name),
-            ("Z", true) => format!("\\<epsilon>\\<open>funcall0 rec_{}\\<close>", name),
-            _ => unreachable!(),
+        let s = match kind {
+            "A" => {
+                let t = fe.alloc_sites[idx].1;
+                let j = allocs.set(me).iter().position(|(u, _)| *u == t).expect("a cell's type is in its body's record");
+                format!("({}_{} {})", allocs.names[&me], j, ALLOC_PARAM)
+            }
+            "F" | "V" => {
+                let callee = fe.gen_calls[idx].callee;
+                // every marked callee is a local item with a body, hence translated
+                let name = names.get(&callee).cloned().expect("callee of a call marker is translated");
+                let rec = caller_scc.map(|s| s.contains(&callee)).unwrap_or(false);
+                let head = if rec { format!("rec_{}", name) } else { name.clone() };
+                let mut extra: Vec<String> = fe.gen_calls[idx].dicts.clone().iter().map(|d| subst_markers(fe, allocs, me, d, caller_scc, names)).collect();
+                extra.extend(record_arg(fe, allocs, me, idx));
+                let f = if extra.is_empty() { head.clone() } else { format!("{} {}", head, extra.join(" ")) };
+                match fe.gen_calls[idx].args.clone() {
+                    // a value applied to dictionaries or a record is an application: parenthesised, as
+                    // the marker it replaces is an argument without parentheses (see `paren_term`)
+                    None if extra.is_empty() => f,
+                    None => format!("({})", f),
+                    Some(args) => {
+                        let a: Vec<String> = args.iter().map(|x| subst_markers(fe, allocs, me, x, caller_scc, names)).collect();
+                        if !extra.is_empty() {
+                            crate::body::term_call(&f, &a)
+                        } else if a.is_empty() {
+                            if rec { format!("\\<epsilon>\\<open>funcall0 rec_{}\\<close>", name) } else { format!("{}()", name) }
+                        } else if a.len() <= 8 {
+                            let c = if rec { format!("\\<epsilon>\\<open>rec_{}\\<close>", name) } else { name };
+                            format!("{}({})", c, a.join(", "))
+                        } else {
+                            let wrapped: Vec<String> = a.iter().map(|x| format!("\\<lbrakk>{}\\<rbrakk>", x)).collect();
+                            format!("\\<epsilon>\\<open>funcall{} {} {}\\<close>", a.len(), head, wrapped.join(" "))
+                        }
+                    }
+                }
+            }
+            _ => {
+                let key = fe.marker_ids[idx];
+                // every marked callee is a local item with a body, hence translated
+                let name = names.get(&key).cloned().expect("callee of a call marker is translated");
+                let rec = caller_scc.map(|s| s.contains(&key)).unwrap_or(false);
+                match (kind, rec) {
+                    ("C", false) | ("H", false) => name.clone(),
+                    ("Z", false) => format!("{}()", name),
+                    ("C", true) => format!("\\<epsilon>\\<open>rec_{}\\<close>", name),
+                    ("H", true) => format!("rec_{}", name),
+                    ("Z", true) => format!("\\<epsilon>\\<open>funcall0 rec_{}\\<close>", name),
+                    _ => unreachable!(),
+                }
+            }
         };
         out.push_str(&s);
         rest = &rest[j + 1..];
@@ -720,8 +984,28 @@ fn indent(s: &str, n: usize) -> String {
     out
 }
 
-fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> String {
-    let defs = std::mem::take(&mut fe.fun_defs);
+/// The definitions (and the allocation records' datatypes, for the types theory).
+fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
+    let mut defs = std::mem::take(&mut fe.fun_defs);
+    let allocs = alloc_sets(fe, &defs);
+    let mut decls = String::new();
+    for d in defs.iter_mut() {
+        if allocs.overflow.contains(&d.key) {
+            let m = fe.placeholder("mutable locals of generic types in polymorphic recursion (allocation record without bound)", Some(fe.tcx.def_span(d.key.0)));
+            d.params = (0..d.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
+            d.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
+            d.calls.clear();
+            d.comments.push(m);
+            continue;
+        }
+        if let Some(n) = allocs.names.get(&d.key) {
+            let (t, decl) = alloc_decl(fe, n, allocs.set(d.key));
+            writeln!(decls, "(* Rust: allocators of the mutable locals of {} and the functions it calls *)", cmt(&d.rust_path)).unwrap();
+            decls.push_str(&decl);
+            d.param_tys.insert(d.n_dicts, t);
+            d.params.insert(d.n_dicts, ALLOC_PARAM.to_string());
+        }
+    }
     let ids: Vec<FnKey<'tcx>> = defs.iter().map(|d| d.key).collect();
     let by_id: HashMap<FnKey<'tcx>, usize> = defs.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
     let names: HashMap<FnKey<'tcx>, String> = defs.iter().map(|d| (d.key, d.name.clone())).collect();
@@ -732,7 +1016,7 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> String {
         let recursive = comp.len() > 1 || defs[by_id[&comp[0]]].calls.contains(&comp[0]);
         if !recursive {
             let d = &defs[by_id[&comp[0]]];
-            let body = subst_markers(fe, &d.body, None, &names);
+            let body = subst_markers(fe, &allocs, d.key, &d.body, None, &names);
             out.push_str(&emit_def(fe, d, &body));
             continue;
         }
@@ -750,7 +1034,7 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> String {
         let bodies: Vec<String> = members
             .iter()
             .map(|d| {
-                let body = subst_markers(fe, &d.body, Some(&set), &names);
+                let body = subst_markers(fe, &allocs, d.key, &d.body, Some(&set), &names);
                 format!("{}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>", lam(d), indent(&body, 4))
             })
             .collect();
@@ -802,7 +1086,7 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> String {
     }
 
     fe.fun_defs = defs;
-    out
+    (out, decls)
 }
 
 fn emit_def(fe: &Frontend<'_>, d: &FunDef<'_>, body: &str) -> String {

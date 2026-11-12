@@ -11,10 +11,22 @@ use rustc_span::{Span, Symbol, sym};
 
 use crate::names;
 
-/// A translated function: a local item with a body, either translated once for all its generic
-/// arguments (`None`: type parameters become type variables) or an instance for concrete generic
-/// arguments (`Some`: monomorphisation).
-pub type FnKey<'tcx> = (DefId, Option<GenericArgsRef<'tcx>>);
+/// How a local item with a body is translated.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Inst<'tcx> {
+    /// Once for all its generic arguments: type parameters become type variables, trait bounds
+    /// dictionary parameters.
+    Generic,
+    /// An instance at concrete generic arguments (monomorphisation).
+    Mono(GenericArgsRef<'tcx>),
+    /// A trait default method for an implementation (the `DefId`) that does not override it:
+    /// `Self` is the implementing type, generic over the implementation's parameters, whose trait
+    /// bounds are its dictionary parameters.
+    ImplCopy(DefId),
+}
+
+/// A translated function: a local item with a body, and how it is translated.
+pub type FnKey<'tcx> = (DefId, Inst<'tcx>);
 
 /// Instances of one generic function at most; more (e.g. polymorphic recursion) are not translated.
 pub const MAX_INSTANCES: usize = 64;
@@ -31,6 +43,19 @@ impl<'tcx> DefSet<'tcx> {
     pub fn contains(&self, d: &FnKey<'tcx>) -> bool { self.0.contains(d) }
     pub fn iter(&self) -> std::slice::Iter<'_, FnKey<'tcx>> { self.0.iter() }
     pub fn clear(&mut self) { self.0.clear() }
+}
+
+/// A call (or, without arguments, a function value) of a local generic function in a translated
+/// body. Its text is a marker (`\u{1}F<n>\u{2}`, `\u{1}V<n>\u{2}`) completed at emission, when
+/// the allocation record the callee takes, if any, is known (see `translate::alloc_sets`).
+pub struct GenCall<'tcx> {
+    pub callee: FnKey<'tcx>,
+    /// the generic arguments of the item the callee's dictionary parameters are the bounds of
+    pub kargs: GenericArgsRef<'tcx>,
+    /// the callee's dictionaries
+    pub dicts: Vec<String>,
+    /// the arguments (`None`: the function as a value)
+    pub args: Option<Vec<String>>,
 }
 
 /// A placeholder or external type, declared in the types template.
@@ -69,6 +94,12 @@ pub struct FunDef<'tcx> {
     pub body: String,
     pub calls: DefSet<'tcx>,
     pub comments: Vec<String>,
+    /// how many of the parameters are dictionaries (they come first)
+    pub n_dicts: usize,
+    /// the type variables of projections and the function types of `Fn`-bounded parameters of the
+    /// definition (see `Frontend::proj_tvars`, `Frontend::fn_params`)
+    pub proj_ctx: Option<HashMap<ty::AliasTy<'tcx>, String>>,
+    pub fn_ctx: HashMap<u32, String>,
 }
 
 pub struct Frontend<'tcx> {
@@ -106,6 +137,11 @@ pub struct Frontend<'tcx> {
     /// functions; trait default methods (generic over `Self`).
     pub mono_fns: HashSet<DefId>,
     instance_names: HashMap<(DefId, GenericArgsRef<'tcx>), String>,
+    /// names of the copies of default methods, by (method, implementation)
+    copy_names: HashMap<(DefId, DefId), String>,
+    /// the traits whose dictionaries are used, in order, with their datatypes' names
+    pub dict_traits: Vec<DefId>,
+    pub dict_names: HashMap<DefId, String>,
     instances_per_fn: HashMap<DefId, usize>,
     /// Instances named but not yet translated.
     pub pending: Vec<FnKey<'tcx>>,
@@ -127,6 +163,14 @@ pub struct Frontend<'tcx> {
     pub adt_projs: HashMap<DefId, Vec<Ty<'tcx>>>,
     /// While a datatype is declared: its projections' type variables (see `adt_projs`).
     pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
+    /// While a generic item is translated: the function types of its type parameters bounded by
+    /// `Fn` traits (see `fn_param_types`).
+    pub fn_params: HashMap<u32, String>,
+    /// The mutable locals of types with generic parameters, by marker index (`\u{1}A<n>\u{2}`):
+    /// the translation whose body has one, its type and HOL type (see `BodyTr::alloc`).
+    pub alloc_sites: Vec<(FnKey<'tcx>, Ty<'tcx>, String)>,
+    /// The calls of local generic functions, by marker index (see `GenCall`).
+    pub gen_calls: Vec<GenCall<'tcx>>,
 }
 
 /// The type of field `f` of an ADT at its type arguments `args`, without regions and normalised in
@@ -179,6 +223,9 @@ impl<'tcx> Frontend<'tcx> {
             marker_index: HashMap::new(),
             mono_fns: HashSet::new(),
             instance_names: HashMap::new(),
+            copy_names: HashMap::new(),
+            dict_traits: Vec::new(),
+            dict_names: HashMap::new(),
             instances_per_fn: HashMap::new(),
             pending: Vec::new(),
             opaque_adts: HashMap::new(),
@@ -187,6 +234,9 @@ impl<'tcx> Frontend<'tcx> {
             alias_tvars: None,
             adt_projs: HashMap::new(),
             proj_tvars: None,
+            fn_params: HashMap::new(),
+            alloc_sites: Vec::new(),
+            gen_calls: Vec::new(),
         }
     }
 
@@ -221,16 +271,6 @@ impl<'tcx> Frontend<'tcx> {
         i
     }
 
-    /// `x` (from the type-checking results of a generic body) at the concrete generic arguments
-    /// `args`, with projections normalised.
-    pub fn mono<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, args: GenericArgsRef<'tcx>, x: T) -> T {
-        let x = ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args);
-        match self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), x) {
-            Ok(n) => n,
-            Err(_) => x.skip_normalization(),
-        }
-    }
-
     /// The function to call for the local item `did` at the generic arguments `args`: an instance
     /// (queued for translation) if `did` is translated per instance and `args` are concrete,
     /// otherwise the item itself. `None` if `did` already has `MAX_INSTANCES` instances.
@@ -238,7 +278,7 @@ impl<'tcx> Frontend<'tcx> {
         // an instance at a type without a uRust model (e.g. a closure type) could not be
         // translated; the generic function, whose type variable it instantiates, is called instead
         if !self.mono_fns.contains(&did) || args.has_param() || !args.types().all(|t| self.ty_dry(t).1) {
-            return Some((did, None));
+            return Some((did, Inst::Generic));
         }
         let args = self.tcx.erase_and_anonymize_regions(args);
         if !self.instance_names.contains_key(&(did, args)) {
@@ -252,17 +292,70 @@ impl<'tcx> Frontend<'tcx> {
             let n = unique(names::global_name(&segs), |n| self.used_names.contains(n));
             self.used_names.insert(n.clone());
             self.instance_names.insert((did, args), n);
-            self.pending.push((did, Some(args)));
+            self.pending.push((did, Inst::Mono(args)));
         }
-        Some((did, Some(args)))
+        Some((did, Inst::Mono(args)))
     }
 
-    /// HOL name of a function (`def_name` of the item, or the name of the instance).
+    /// The copy of the trait default method `did` for the implementation `imp` (queued for
+    /// translation the first time), named after the implementation's items.
+    pub fn impl_copy(&mut self, did: DefId, imp: DefId) -> FnKey<'tcx> {
+        if !self.copy_names.contains_key(&(did, imp)) {
+            let mut segs = self.path_segments(imp);
+            segs.push(self.tcx.item_name(did).to_string());
+            let n = unique(names::global_name(&segs), |n| self.used_names.contains(n));
+            self.used_names.insert(n.clone());
+            self.copy_names.insert((did, imp), n);
+            self.pending.push((did, Inst::ImplCopy(imp)));
+        }
+        (did, Inst::ImplCopy(imp))
+    }
+
+    /// HOL name of a function (`def_name` of the item, or the name of the instance or copy).
     pub fn fn_name(&mut self, key: FnKey<'tcx>) -> String {
         match key.1 {
-            None => self.def_name(key.0),
-            Some(args) => self.instance_names[&(key.0, args)].clone(),
+            Inst::Generic => self.def_name(key.0),
+            Inst::Mono(args) => self.instance_names[&(key.0, args)].clone(),
+            Inst::ImplCopy(imp) => self.copy_names[&(key.0, imp)].clone(),
         }
+    }
+
+    /// The generic arguments `key` instantiates its item's generic parameters with, if any: an
+    /// instance's, or for a default method's copy the implementation's trait arguments (and its
+    /// own lifetimes, erased).
+    pub fn inst_args(&self, key: FnKey<'tcx>) -> Option<GenericArgsRef<'tcx>> {
+        match key.1 {
+            Inst::Generic => None,
+            Inst::Mono(args) => Some(args),
+            Inst::ImplCopy(imp) => {
+                let tr = self.tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization();
+                let parent = tr.args.len();
+                Some(ty::GenericArgs::for_item(self.tcx, key.0, |p, _| {
+                    if (p.index as usize) < parent { tr.args[p.index as usize] } else { self.tcx.lifetimes.re_erased.into() }
+                }))
+            }
+        }
+    }
+
+    /// The typing environment of the body of `key`: an instance has no generic parameters left,
+    /// a copy has those of its implementation.
+    pub fn inst_env(&self, key: FnKey<'tcx>) -> ty::TypingEnv<'tcx> {
+        match key.1 {
+            Inst::Generic => ty::TypingEnv::post_analysis(self.tcx, key.0),
+            Inst::Mono(_) => ty::TypingEnv::fully_monomorphized(),
+            Inst::ImplCopy(imp) => ty::TypingEnv::post_analysis(self.tcx, imp),
+        }
+    }
+
+    /// `x` (from the type-checking results of the body of `key.0`) as the body of `key` sees it:
+    /// at its generic arguments, normalised in its typing environment.
+    pub fn at_key<T: TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, key: FnKey<'tcx>, x: T) -> T {
+        let env = self.inst_env(key);
+        let x = match self.inst_args(key) {
+            Some(args) => ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args),
+            None => ty::Unnormalized::new_wip(x),
+        };
+        self.tcx.try_normalize_erasing_regions(env, x).unwrap_or_else(|_| x.skip_normalization())
     }
 
     // ------------------------------------------------------------------
@@ -321,6 +414,14 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(names::global_name(&self.path_segments(did)), |n| self.used_names.contains(n));
         self.used_names.insert(n.clone());
         self.names.insert(did, n.clone());
+        n
+    }
+
+    /// `base` made unique among the HOL names of constants and types, and reserved.
+    pub fn unique_global(&mut self, base: String) -> String {
+        let n = unique(base, |n| self.used_names.contains(n) || self.used_type_names.contains(n));
+        self.used_names.insert(n.clone());
+        self.used_type_names.insert(n.clone());
         n
     }
 
@@ -436,7 +537,13 @@ impl<'tcx> Frontend<'tcx> {
                     return false;
                 }
                 seen.push(t);
-                def.all_fields().any(|f| self.has_cell(field_ty(tcx, f, args, env), env, seen))
+                // a field that does not normalise (e.g. a projection on an `impl Trait` type, which
+                // the environment does not reveal) stays a projection, which has none
+                def.all_fields().any(|f| {
+                    let t = f.ty(tcx, args);
+                    let t = tcx.try_normalize_erasing_regions(env, t).unwrap_or_else(|_| t.skip_normalization());
+                    self.has_cell(tcx.erase_and_anonymize_regions(t), env, seen)
+                })
             }
             ty::Tuple(ts) => ts.iter().any(|a| self.has_cell(a, env, seen)),
             ty::Array(a, _) | ty::Slice(a) => self.has_cell(*a, env, seen),
@@ -600,7 +707,10 @@ impl<'tcx> Frontend<'tcx> {
                 }
             }
             ty::Never => "unit".into(),
-            ty::Param(p) => names::tvar_name(p.name.as_str()),
+            ty::Param(p) => match self.fn_params.get(&p.index) {
+                Some(f) => f.clone(),
+                None => names::tvar_name(p.name.as_str()),
+            },
             ty::Adt(def, args) => {
                 let did = def.did();
                 let targs: Vec<Ty<'tcx>> = args.types().collect();
@@ -721,9 +831,14 @@ impl<'tcx> Frontend<'tcx> {
         s
     }
 
-    pub fn need_alloc(&mut self, hol_ty: &str) {
-        if !self.alloc_types.iter().any(|t| t == hol_ty) {
-            self.alloc_types.push(hol_ty.to_string());
+    /// The locale's allocator for the HOL type `hol_ty` (its index in `alloc_types`), added if new.
+    pub fn need_alloc(&mut self, hol_ty: &str) -> usize {
+        match self.alloc_types.iter().position(|t| t == hol_ty) {
+            Some(k) => k,
+            None => {
+                self.alloc_types.push(hol_ty.to_string());
+                self.alloc_types.len() - 1
+            }
         }
     }
 
