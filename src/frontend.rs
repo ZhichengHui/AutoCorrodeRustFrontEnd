@@ -119,6 +119,9 @@ pub struct Frontend<'tcx> {
     fn_items: Vec<DefId>,
     /// `core::fmt::Error` (see `fmt_error_of`)
     fmt_error: Option<DefId>,
+    /// the standard library iterators and other ADTs that have models but no lang or diagnostic
+    /// item of their own (see `std_adts_of`)
+    std_adts: Vec<(DefId, &'static str)>,
     /// the formatting traits: the bounds of the `fmt::rt::Argument` constructors (`Display`,
     /// `Debug`, `LowerHex`, ..., `Pointer`), with their names
     pub fmt_traits: Vec<(DefId, String)>,
@@ -213,6 +216,7 @@ impl<'tcx> Frontend<'tcx> {
             alloc_types: Vec::new(),
             fn_items: Vec::new(),
             fmt_error: fmt_error_of(tcx),
+            std_adts: std_adts_of(tcx),
             fmt_traits: fmt_traits_of(tcx),
             opaques: Vec::new(),
             placeholders: Vec::new(),
@@ -507,12 +511,48 @@ impl<'tcx> Frontend<'tcx> {
             "Range"
         } else if lang(LangItem::RangeInclusiveStruct) {
             "RangeInclusive"
+        } else if lang(LangItem::RangeFrom) {
+            "RangeFrom"
+        } else if lang(LangItem::RangeTo) {
+            "RangeTo"
+        } else if lang(LangItem::RangeToInclusive) {
+            "RangeToInclusive"
+        } else if lang(LangItem::RangeFull) {
+            "RangeFull"
         } else if diag(Symbol::intern("Formatter")) {
             "Formatter"
         } else if Some(did) == self.fmt_error {
             "FmtError"
+        } else if diag(Symbol::intern("SliceIter")) {
+            "SliceIter"
+        } else if diag(Symbol::intern("Enumerate")) {
+            "Enumerate"
+        } else if let Some(&(_, n)) = self.std_adts.iter().find(|(d, _)| *d == did) {
+            n
         } else {
             return None;
+        })
+    }
+
+    /// The step function (AutoCorrode's `iter_step`, see `STD_MODELS.md`) of the iterator type `t`
+    /// for its `next` (or, if `back`, its `next_back`), when it has a model.
+    pub fn iter_step(&self, t: Ty<'tcx>, back: bool) -> Option<String> {
+        let ty::Adt(def, args) = t.kind() else { return None };
+        let inner = |i: usize| args.types().nth(i).expect("type argument of an iterator adapter");
+        Some(match (self.std_adt(def.did())?, back) {
+            ("SliceIter" | "Lines" | "SplitWhitespace" | "Chars", false) => "list_iter_next".into(),
+            ("SliceIter" | "Lines" | "SplitWhitespace" | "Chars", true) => "list_iter_next_back".into(),
+            ("ChunksExact", false) => "chunks_exact_next".into(),
+            ("Enumerate", false) => format!("(enumerate_next {})", self.iter_step(inner(0), false)?),
+            ("Zip", false) => format!("(zip_next {} {})", self.iter_step(inner(0), false)?, self.iter_step(inner(1), false)?),
+            ("Skip", false) => format!("(skip_next {})", self.iter_step(inner(0), false)?),
+            ("Take", false) => format!("(take_next {})", self.iter_step(inner(0), false)?),
+            ("TakeWhile", false) => format!("(take_while_next {})", self.iter_step(inner(0), false)?),
+            // `Map::next_back` is the inner `next_back`, mapped
+            ("Map", b) => format!("(map_next {})", self.iter_step(inner(0), b)?),
+            ("Rev", b) => self.iter_step(inner(0), !b)?,
+            ("Copied" | "Cloned", b) => self.iter_step(inner(0), b)?,
+            _ => return None,
         })
     }
 
@@ -731,6 +771,30 @@ impl<'tcx> Frontend<'tcx> {
                     Some("Range") | Some("RangeInclusive") => {
                         format!("{} range", paren_ty(&self.ty(targs[0])))
                     }
+                    // `a..`, `..b`, `..=b` by their only field; `..` has none
+                    Some("RangeFrom") | Some("RangeTo") | Some("RangeToInclusive") => self.ty(targs[0]),
+                    Some("RangeFull") => "unit".into(),
+                    // iterators by their states (see `iter_step` and `STD_MODELS.md`): the remaining
+                    // elements of a sequence, or an adapter's fields with the inner iterator's state
+                    Some("SliceIter") => format!("{} list", paren_ty(&self.ty(targs[0]))),
+                    Some("Lines") | Some("SplitWhitespace") => "String.literal list".into(),
+                    Some("Chars") => "char list".into(),
+                    Some("ChunksExact") => {
+                        let t = paren_ty(&self.ty(targs[0]));
+                        format!("({} list list \\<times> {} list \\<times> tnil)", t, t)
+                    }
+                    Some("Enumerate") | Some("Skip") | Some("Take") => {
+                        format!("({} \\<times> 64 word \\<times> tnil)", paren_ty(&self.ty(targs[0])))
+                    }
+                    Some("Zip") | Some("Map") => {
+                        format!("({} \\<times> {} \\<times> tnil)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    Some("TakeWhile") => {
+                        format!("({} \\<times> bool \\<times> {} \\<times> tnil)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    Some("Rev") | Some("Copied") | Some("Cloned") => self.ty(targs[0]),
+                    Some("ParseIntError") => "int_error_kind".into(),
+                    Some("TryFromSliceError") => "try_from_slice_error".into(),
                     _ => {
                         let name = if let Some(&why) = self.opaque_adts.get(&did) {
                             let n = self.tcx.def_path_str(did);
@@ -962,8 +1026,12 @@ impl<'tcx> Frontend<'tcx> {
     /// `ty`), how many it keeps (e.g. `Vec<T, A>` is `T list`).
     pub fn hol_kept_args(&self, did: DefId) -> Option<usize> {
         match self.std_adt(did)? {
-            "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" => Some(1),
-            "String" | "Ordering" | "Formatter" | "FmtError" => Some(0),
+            "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" | "RangeFrom" | "RangeTo" | "RangeToInclusive" => Some(1),
+            "String" | "Ordering" | "Formatter" | "FmtError" | "RangeFull" => Some(0),
+            // the iterators keep all their type arguments (see `ty`)
+            "SliceIter" | "ChunksExact" | "Enumerate" | "Skip" | "Take" | "Rev" | "Copied" | "Cloned" => Some(1),
+            "Zip" | "TakeWhile" | "Map" => Some(2),
+            "Lines" | "SplitWhitespace" | "Chars" | "ParseIntError" | "TryFromSliceError" => Some(0),
             _ => None,
         }
     }
@@ -980,6 +1048,12 @@ impl<'tcx> Frontend<'tcx> {
     // ------------------------------------------------------------------
     // External functions
     // ------------------------------------------------------------------
+
+    /// Whether the item `did` has const generic parameters of its own: it is translated only per
+    /// instance (see `translate::run`), where they are constants.
+    pub fn has_const_params(&self, did: DefId) -> bool {
+        self.tcx.generics_of(did).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }))
+    }
 
     /// Register (or look up) an external function, returning its HOL name.
     pub fn ext_fun(&mut self, did: DefId, foreign: bool) -> String {
@@ -1055,6 +1129,76 @@ fn fmt_error_of(tcx: TyCtxt<'_>) -> Option<DefId> {
         },
         _ => None,
     }
+}
+
+/// The standard library ADTs with models that have no lang or diagnostic item of their own,
+/// identified by the compiler as the result types of methods it identifies: the iterator adapters
+/// returned by methods of `Iterator`, the iterators returned by methods of the inherent impls of
+/// `str` and of slices (found through their methods with diagnostic items), and `ParseIntError`,
+/// the error type of `FromStr` for the integer types.
+fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
+    let mut out: Vec<(DefId, &'static str)> = vec![];
+    let result_adt = |f: DefId| match tcx.fn_sig(f).skip_binder().output().skip_binder().kind() {
+        ty::Adt(d, _) => Some(d.did()),
+        _ => None,
+    };
+    let mut methods_of = |owner: DefId, methods: &[(&str, &'static str)]| {
+        for &(m, n) in methods {
+            let item = tcx.associated_items(owner).filter_by_name_unhygienic(Symbol::intern(m)).find(|i| i.is_fn());
+            if let Some(d) = item.and_then(|i| result_adt(i.def_id)) {
+                out.push((d, n));
+            }
+        }
+    };
+    if let Some(it) = tcx.get_diagnostic_item(sym::Iterator) {
+        let adapters = [
+            ("zip", "Zip"),
+            ("skip", "Skip"),
+            ("take", "Take"),
+            ("take_while", "TakeWhile"),
+            ("map", "Map"),
+            ("rev", "Rev"),
+            ("copied", "Copied"),
+            ("cloned", "Cloned"),
+        ];
+        methods_of(it, &adapters);
+    }
+    if let Some(sw) = tcx.get_diagnostic_item(Symbol::intern("str_split_whitespace")) {
+        methods_of(tcx.parent(sw), &[("split_whitespace", "SplitWhitespace"), ("lines", "Lines"), ("chars", "Chars")]);
+    }
+    if let Some(si) = tcx.get_diagnostic_item(Symbol::intern("slice_iter")) {
+        methods_of(tcx.parent(si), &[("chunks_exact", "ChunksExact")]);
+    }
+    // `<u8 as FromStr>::Err`: the associated type `Err` of the implementation of `FromStr` (the
+    // trait of the method `from_str_method`) for `u8`
+    if let Some(from_str) = tcx.get_diagnostic_item(Symbol::intern("from_str_method")).map(|m| tcx.parent(m)) {
+        for &imp in tcx.all_impls(from_str).collect::<Vec<_>>().iter() {
+            if *tcx.type_of(imp).instantiate_identity().skip_normalization().kind() != ty::Uint(ty::UintTy::U8) { continue }
+            let err = tcx.associated_items(imp).filter_by_name_unhygienic(sym::Err).next();
+            if let Some(err) = err
+                && let ty::Adt(d, _) = tcx.type_of(err.def_id).instantiate_identity().skip_normalization().kind()
+            {
+                out.push((d.did(), "ParseIntError"));
+            }
+        }
+    }
+    // `TryFromSliceError`: the associated type `Error` of the implementation of `TryFrom<&[T]>`
+    // for arrays `[T; N]`
+    if let Some(try_from) = tcx.get_diagnostic_item(sym::TryFrom) {
+        for imp in tcx.all_impls(try_from).collect::<Vec<_>>() {
+            let tr = tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization();
+            let from_slice = matches!(tr.args.type_at(1).kind(), ty::Ref(_, s, _) if s.is_slice());
+            if !from_slice || !matches!(tr.args.type_at(0).kind(), ty::Array(..)) { continue }
+            let err = tcx.associated_items(imp).filter_by_name_unhygienic(Symbol::intern("Error")).next();
+            if let Some(err) = err
+                && let ty::Adt(d, _) = tcx.type_of(err.def_id).instantiate_identity().skip_normalization().kind()
+                && !out.iter().any(|(x, _)| *x == d.did())
+            {
+                out.push((d.did(), "TryFromSliceError"));
+            }
+        }
+    }
+    out
 }
 
 /// The traits bounding the type parameters of the constructors of `fmt::rt::Argument` (the lang

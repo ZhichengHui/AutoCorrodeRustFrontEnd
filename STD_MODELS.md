@@ -48,6 +48,9 @@
 | `is_some`、`is_none` | `urust_func_option_is_some`、`urust_func_option_is_none` | AutoCorrode `StdLib_Option` | 同上 |
 | `ok_or` | `ok_or` | AutoCorrode `StdLib_Option` | 同上 |
 | `take` | `take_mut_ref_option` | AutoCorrode `StdLib_Option` | 同上 |
+| `unwrap_or`、`unwrap_or_else`、`map`、`and_then`、`ok_or_else` | `option_unwrap_or`、`option_unwrap_or_else`、`option_map`、`option_and_then`、`option_ok_or_else`：闭包在 Rust 调用它的位置调用 | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
+| `copied`、`cloned`、`as_ref` | 恒等（`&T` 与 `T` 的 HOL 类型相同） | 前端写法 | 同上 |
+| `is_some_and` | `option_is_some_and` | 手写 | 同上 |
 
 ### Result
 | Rust | 模型 | 来源 | 位置 |
@@ -58,6 +61,7 @@
 | `is_ok`、`is_err` | `urust_func_result_is_ok`、`urust_func_result_is_err` | AutoCorrode `StdLib_Result` | 同上 |
 | `ok` | `ok` | AutoCorrode `StdLib_Result` | 同上 |
 | `unwrap_or` | `result_unwrap_or` | AutoCorrode `StdLib_Result` | 同上 |
+| `map`、`map_err` | `result_map`、`result_map_err` | 手写 `StdLib_Frontend_Models` | 同上 |
 
 ### Try（`?` 运算符）
 | Rust | 模型 | 来源 | 位置 |
@@ -75,6 +79,18 @@
 | `v[i]`（`Index`/`IndexMut`） | uRust 的列表下标 | AutoCorrode | `pv_unadj` 的 `Index` |
 | `<[T]>::iter()`（在 `for` 中） | 直接遍历列表 | AutoCorrode | `for_loop` |
 | `<[T]>::iter_mut()`、`for` 遍历 `&mut` 序列 | `iter_mut` | AutoCorrode `StdLib_Iterators` | `for_loop` |
+| `<[T]>::is_empty`、`Vec::is_empty`、`first`、`last` | `slice_is_empty`、`slice_first`、`slice_last` | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
+| `<[T]>::get(i)`（下标是 `usize`） | `slice_get`：越界时 `None` | 手写 | 同上 |
+| `<[T]>::get(r)`（`r` 是 `a..b`、`a..=b`、`..b`、`..=b`、`a..`、`..`） | `slice_get_range`（`range` 值）、`slice_get_to`、`slice_get_to_inclusive`、`slice_get_from`、`slice_get_full`（后四者的参数是区间唯一的字段或 `()`）：区间递减或超出切片时 `None`（`a..=usize::MAX` 也是 `None`） | 手写 | 同上 |
+| `<[T]>::copy_within(src, dest)`（`src` 是 `Range`、`RangeInclusive`） | `slice_copy_within`：复制 `src` 的元素到 `dest`（可以重叠）；`src` 递减、越界或目标越界时 panic | 手写 | 同上 |
+| `TryFrom<&[T]>`（及 `TryInto`）到 `[T; N]`、`&[T; N]` | `slice_try_into_array`：长度为 `N` 时 `Ok`，否则 `Err(TryFromSliceError)`；`core::array::TryFromSliceError` 为 `try_from_slice_error`。从 `&mut [T]`、到 `&mut [T; N]` 的转换没有模型（结果与切片别名） | 手写 | 同上 |
+| `TryFrom<Vec<T>>`、`TryFrom<Box<[T]>>`（及 `TryInto`）到 `[T; N]`、`Box<[T; N]>` | `vec_try_into_array`：长度为 `N` 时 `Ok`，否则 `Err` 为原值 | 手写 | 同上 |
+| `Vec::shrink_to_fit` | `vec_shrink_to_fit`：无操作（只改变容量，模型没有容量） | 手写 | 同上 |
+| `<[T]>::chunks_exact(n)` | `slice_chunks_exact`：`n` 为 0 时 panic；状态见“迭代器” | 手写 | 同上 |
+| `<[T]>::copy_from_slice`、`fill`、`reverse` | `slice_copy_from_slice`（长度不等时 panic）、`slice_fill`、`slice_reverse` | 手写 | 同上 |
+| `Vec::truncate`、`clear`、`resize`、`extend_from_slice` | `vec_truncate`、`vec_clear`、`vec_resize`、`vec_extend_from_slice` | 手写 | 同上 |
+| `Vec::into_boxed_slice` | 恒等 | 前端写法 | 同上 |
+| 作为调用参数（或方法的接收者）的 `&mut v[a..b]`（`a..b`、`a..`、`..b`、`..=b`、`..`）；`for` 遍历 `&mut v[a..b]`（循环体只能正常结束或跳出本循环） | 子切片复制到新的可变局部变量，引用它；调用（循环）之后用 `slice_splice` 写回 `v`。借用存活期间 Rust 不允许访问 `v`，切片的长度不变，所以与 Rust 一致。调用的结果类型含生命周期时（结果可能持有这个借用）、借用出现在其他位置时，仍是占位符 | 手写 `slice_splice` + 前端写法 | `borrow_mut`、`call_args`、`with_writeback`、`for_loop` |
 | `Vec::push` | `vec_push`：追加到末尾 | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
 | `Vec::pop` | `vec_pop`：空时 `None`，否则去掉并返回最后一个元素 | 手写 | 同上 |
 | `<[T]>::swap` | `slice_swap`：交换两个位置，越界时 panic | 手写 | 同上 |
@@ -126,7 +142,8 @@
 ### 转换 trait
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| `ToString::to_string`、`ToOwned::to_owned`、`From::from`、`Into::into`、`AsRef::as_ref`、`Borrow::borrow`（实参与结果的 HOL 类型相同时） | 恒等 | 前端写法 | `std_call` |
+| `ToString::to_string`、`ToOwned::to_owned`、`From::from`、`Into::into`、`AsRef::as_ref`、`Borrow::borrow`、`IntoIterator::into_iter`（实参与结果的 HOL 类型相同时，例如迭代器本身、切片的引用到 `slice::Iter`） | 恒等 | 前端写法 | `std_call` |
+| 整数之间、`bool` 到整数的 `From::from`、`Into::into`（标准库只为无损的转换实现它们） | 与 `as` 相同的转换 | 前端写法 | `std_call` |
 
 ### Range
 | Rust | 模型 | 来源 | 位置 |
@@ -134,14 +151,56 @@
 | `Range<T>`、`RangeInclusive<T>` | `T range` | AutoCorrode `Range_Type` | `Frontend::ty` |
 | `a..b`、`RangeInclusive::new` | uRust 的区间表达式 | AutoCorrode | `struct_expr`、`std_call` |
 | `for` 遍历区间 | uRust 的 `for` 循环 | AutoCorrode | `for_loop` |
+| `Range` 的字段 `start`、`end`（读取） | `range` 记录的选择函数 | AutoCorrode `Range_Type` | `pv_unadj` 的 `Field` |
+| `RangeFrom<T>`、`RangeTo<T>`、`RangeToInclusive<T>`（`a..`、`..b`、`..=b` 的值）；`RangeFull`（`..`） | 唯一的字段（类型 `T`）；`unit` | 前端写法 | `Frontend::ty`、`struct_expr`、`unit_ctor`、`pv_unadj` 的 `Field` |
 
 ### 整数的方法
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
 | 无符号和有符号整数的 `checked_add`、`checked_mul`、`saturating_sub`、`div_ceil` | 同名函数（有符号时按有符号数） | AutoCorrode `StdLib_Arithmetic` | `std_fn`/`std_call` |
 | 有符号整数的 `wrapping_add_unsigned` | 同名函数 | AutoCorrode `StdLib_Arithmetic` | 同上 |
+| 无符号和有符号整数的 `wrapping_add`、`wrapping_sub`、`wrapping_mul`、`trailing_zeros`、`leading_zeros`（按位的运算，与符号无关） | 同名函数（HOL word 的运算、`word_ctz`、`word_clz`） | 手写 `StdLib_Frontend_Models` | 同上 |
+| `from_be_bytes`、`from_le_bytes`、`to_be_bytes`、`to_le_bytes`；`from_ne_bytes`、`to_ne_bytes` 按小端；`to_le` 为恒等 | `from_be_bytes`（结果标注类型）等，`word_rcat`、`word_rsplit` | 手写 | 同上 |
+| 无符号整数的 `checked_sub`、`overflowing_sub`、`checked_shl` | 同名函数 | 手写 | 同上 |
+| 无符号整数的 `Ord::min`、`Ord::max`、`cmp::min`、`cmp::max` | `ord_min`、`ord_max`（相等时 `min` 取第一个、`max` 取第二个，与 Rust 相同） | 手写 | 同上 |
+| `mem::size_of::<T>()`（`T` 不含类型参数） | 由编译器给出的布局的字节数 | 前端写法 | 同上 |
 
-无符号整数的 `wrapping_add` 不再有模型：AutoCorrode 只剩有符号的 `wrapping_add_unsigned`，所以按外部函数生成模板。其他整数方法（`cast_signed`、`cast_unsigned`、`abs`、`signum`、`unsigned_abs`、`wrapping_sub` 等）没有模型，同样生成外部函数模板。
+平台假设：64 位、小端（`ne_bytes`）。有符号整数的 `checked_sub`、`overflowing_sub`、`min`、`max` 没有模型（HOL 中 word 的序是无符号的）。
+
+### 迭代器
+
+迭代器表示为它的状态；`next` 的模型是“步进函数”（AutoCorrode 的 `iter_step`：状态 ↦ 下一个元素（若有）和新状态），由前端按迭代器的类型组合（`Frontend::iter_step`）。数据源的状态是剩余的元素；适配器的状态是它的字段，第一个是内层迭代器的状态，与 Rust 的定义一致。适配器的 `next` 照 Rust 的实现调用内层的 `next`，所以带闭包的适配器也在 Rust 调用闭包的时刻调用。没有标准库的 lang 或 diagnostic item 的类型，由编译器确定为带 diagnostic item 的 trait 或类型的方法的结果类型（`std_adts_of`）。
+
+| Rust | 状态（HOL 类型） | `next`（步进函数） | 来源 | 位置 |
+|---|---|---|---|---|
+| `slice::Iter<T>`（`<[T]>::iter`，以及 `&[T]`、`&Vec<T>` 的 `into_iter`） | `T list`（剩余元素；`T` 的引用与 `T` 的 HOL 类型相同） | `list_iter_next`；`next_back` 为 `list_iter_next_back` | 手写 `StdLib_Frontend_Models` | `Frontend::ty`、`iter_step` |
+| `str::Lines`、`str::SplitWhitespace`、`str::Chars` | `String.literal list`、`char list`（剩余的行、词、字符；由 `str_lines` 等在创建时算出，`str` 不可变） | 同上 | 手写 | 同上 |
+| `slice::ChunksExact<T>` | `T list list × T list × tnil`（剩余的块、余数） | `chunks_exact_next` | 手写 | 同上 |
+| `Enumerate<I>` | `I × 64 word × tnil`（内层、计数） | `enumerate_next`：计数溢出时 panic | 手写 | 同上 |
+| `Zip<A, B>` | `A × B × tnil` | `zip_next`：只在 `A` 有元素时推进 `B`（Rust 的一般实现） | 手写 | 同上 |
+| `Skip<I>`、`Take<I>` | `I × 64 word × tnil` | `skip_next`（第一次 `next` 时用 `nth` 跳过）、`take_next` | 手写 | 同上 |
+| `TakeWhile<I, P>` | `I × bool × P × tnil`（内层、已结束、谓词） | `take_while_next` | 手写 | 同上 |
+| `Map<I, F>` | `I × F × tnil` | `map_next`（`next_back` 用内层的 `next_back`） | 手写 | 同上 |
+| `Rev<I>`、`Copied<I>`、`Cloned<I>` | `I` | 内层的 `next_back`（`Rev`）、内层的 `next` | 手写 | 同上 |
+| `Iterator::next(&mut it)` | `iter_ref_next(步进函数, it)`：读状态、步进、写回 | | 手写 | `iter_call` |
+| `enumerate`、`zip`、`skip`、`take`、`take_while`、`map`、`rev`、`copied`、`cloned` | 构造适配器的状态（`zip` 的参数经 `IntoIterator`，HOL 类型相同时为恒等） | | 前端写法 | `iter_call` |
+| `count`、`collect`（到 `Vec`） | `iter_count`、`iter_collect_list`（`iter_fold`：用 crate 的 `urust_fuel` 逐个调用步进函数，燃料耗尽时 panic “out of fuel”，与递归函数相同；`count` 计数溢出时 panic） | | 手写 | `iter_call` |
+| `for` 遍历上述迭代器 | Rust 的展开：`while let Some(p) = Iterator::next(&mut iter)` | | 前端写法 | `for_loop` |
+
+丢掉的语义：`Zip` 在两边都可随机访问时的特化实现（只影响带副作用的内层迭代器被推进的次数，这里的数据源都没有副作用）。其他适配器、`collect` 到其他类型等没有模型，生成外部函数模板。
+
+### str
+| Rust | 模型 | 来源 | 位置 |
+|---|---|---|---|
+| `lines`、`split_whitespace`、`chars` | `str_lines`（按 Rust 的实现：`split_inclusive('\n')`，去掉 `\n` 和其前的 `\r`）、`str_split_whitespace`（ASCII 的 Unicode 空白：9–13、32）、`str_chars` | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
+| `as_bytes` | `str_as_bytes`（ASCII 字符的码值） | 手写 | 同上 |
+| `starts_with`（模式为 `char` 或 `&str`） | `str_starts_with_char`、`str_starts_with_str` | 手写 | 同上 |
+| `parse::<F>`（`F` 为整数类型） | `str_parse_word`、`str_parse_sword`：按 `from_str_radix(s, 10)`（可选的 `+`，有符号时可选的 `-`；非数字先于溢出报错） | 手写 | 同上 |
+| `num::ParseIntError` | `int_error_kind`（它唯一的字段 `IntErrorKind`） | 手写 | `Frontend::ty` |
+
+由于 `str` 是 `String.literal`（只有 ASCII），这些模型都只处理 ASCII 字符串，与 Rust 在 ASCII 字符串上的行为一致。
+
+其他整数方法（`cast_signed`、`cast_unsigned`、`abs`、`signum`、`unsigned_abs` 等）没有模型，生成外部函数模板。
 
 ### panic 与进程终止
 | Rust | 模型 | 来源 | 位置 |

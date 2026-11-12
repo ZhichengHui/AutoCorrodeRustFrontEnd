@@ -145,8 +145,11 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     for &d in &bodies {
         fe.def_name(d);
     }
+    // a function with const generic parameters only at its instances (see `local_callee`)
     for &d in &bodies {
-        translate_item(&mut fe, (d, Inst::Generic));
+        if !fe.has_const_params(d) {
+            translate_item(&mut fe, (d, Inst::Generic));
+        }
     }
     // each local implementation's copies of the default methods it does not override (its
     // dictionaries' fields)
@@ -171,6 +174,11 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     for d in default_methods {
         if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
             fe.item_placeholder("trait default method (not called at a concrete type)", tcx.def_span(d));
+        }
+    }
+    for &d in &bodies {
+        if fe.has_const_params(d) && !fe.fun_defs.iter().any(|f| f.key.0 == d) {
+            fe.item_placeholder("function with const generic parameters (not called at constant arguments)", tcx.def_span(d));
         }
     }
 
@@ -388,7 +396,7 @@ fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefI
         let ld = did.expect_local();
         let mut v = GenericCalls { fe, tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
         v.visit_body(tcx.hir_body_owned_by(ld));
-        if v.dependent {
+        if v.dependent || fe.has_const_params(did) {
             mono.insert(did);
         }
         callees.push((did, v.callees));
@@ -529,7 +537,8 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         fn_placeholder(fe, &mut fd, "C-variadic function");
         return fd;
     }
-    if tcx.generics_of(did).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. })) {
+    // an instance has values for the const generic parameters (see `BodyTr::path_value`)
+    if !matches!(key.1, Inst::Mono(_)) && fe.has_const_params(did) {
         fn_placeholder(fe, &mut fd, "const generic parameter");
         return fd;
     }
