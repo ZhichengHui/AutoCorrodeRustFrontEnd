@@ -169,9 +169,15 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     while let Some(key) = fe.pending.pop() {
         translate_item(&mut fe, key);
     }
+    // a default method without copies or instances (not a dictionary field, and not called at a
+    // concrete type) is translated once, generically: in `Self` and the trait's parameters, with
+    // the dictionaries of the trait and of its own bounds (as Aeneas does)
     for d in default_methods {
         if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
-            fe.item_placeholder("trait default method (not called at a concrete type)", tcx.def_span(d));
+            translate_item(&mut fe, (d, Inst::Generic));
+            while let Some(key) = fe.pending.pop() {
+                translate_item(&mut fe, key);
+            }
         }
     }
 
@@ -901,34 +907,100 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str) -> String {
 
 /// The markers (`\u{1}<kind><n>\u{2}`) in `text`, with those in the dictionaries and arguments of
 /// the generic calls among them (see `GenCall`), transitively.
-fn markers_in(fe: &Frontend<'_>, text: &str, out: &mut Vec<(char, usize)>) {
+/// The markers in `text` (with those in the arguments of its calls), except the calls in `poly`
+/// (see `poly_rec_calls`), which are not emitted.
+fn markers_in(fe: &Frontend<'_>, text: &str, poly: &HashSet<usize>, out: &mut Vec<(char, usize)>) {
     let mut rest = text;
     while let Some(i) = rest.find('\u{1}') {
         let j = rest[i..].find('\u{2}').expect("a marker is closed") + i;
         let kind = rest[i + 1..].chars().next().expect("a marker has a kind");
         let n: usize = rest[i + 2..j].parse().expect("a marker has an index");
+        rest = &rest[j + 1..];
+        if matches!(kind, 'F' | 'V') && poly.contains(&n) {
+            continue;
+        }
         out.push((kind, n));
         if matches!(kind, 'F' | 'V') {
             let c = &fe.gen_calls[n];
             for t in c.dicts.iter().chain(c.args.iter().flatten()) {
-                markers_in(fe, t, out);
+                markers_in(fe, t, poly, out);
             }
         }
-        rest = &rest[j + 1..];
     }
 }
 
-/// Allocation records beyond this size are not built (polymorphic recursion would make them grow
-/// without bound).
-const MAX_ALLOCS: usize = 64;
+/// The calls of generic functions within recursive groups that HOL cannot define: a group is one
+/// definition (see `emit_funs`), in which each member is used at one type, so a call within the
+/// group must rename the callee's type parameters to the caller's, consistently over the group
+/// (one class of the renaming has at most one parameter of each member). A call at other type
+/// arguments (`f::<Vec<T>>` in `f<T>`, or at concrete types) is polymorphic recursion. Without such
+/// calls the allocation records (see `alloc_sets`) are finite: their types grow only along cycles.
+fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> HashSet<usize> {
+    let ids: Vec<FnKey<'tcx>> = defs.iter().map(|d| d.key).collect();
+    let by_id: HashMap<FnKey<'tcx>, usize> = defs.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+    let succ = |d: FnKey<'tcx>| -> Vec<FnKey<'tcx>> { defs[by_id[&d]].calls.iter().copied().collect() };
+    let mut poly = HashSet::new();
+    for comp in sccs(&ids, &succ) {
+        let group: HashSet<FnKey<'tcx>> = comp.iter().copied().collect();
+        // union-find over (member, type parameter index); each class lists its members
+        let mut class: HashMap<(FnKey<'tcx>, u32), usize> = HashMap::new();
+        let mut members: Vec<Vec<FnKey<'tcx>>> = vec![];
+        let node = |k: (FnKey<'tcx>, u32), class: &mut HashMap<(FnKey<'tcx>, u32), usize>, members: &mut Vec<Vec<FnKey<'tcx>>>| {
+            *class.entry(k).or_insert_with(|| {
+                members.push(vec![k.0]);
+                members.len() - 1
+            })
+        };
+        for &caller in &comp {
+            let mut ms = vec![];
+            markers_in(fe, &defs[by_id[&caller]].body, &poly, &mut ms);
+            for (kind, n) in ms {
+                if !matches!(kind, 'F' | 'V') || !group.contains(&fe.gen_calls[n].callee) {
+                    continue;
+                }
+                let (callee, kargs) = (fe.gen_calls[n].callee, fe.gen_calls[n].kargs);
+                let renaming: Option<Vec<(u32, u32)>> = kargs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, a)| a.as_type().map(|t| (i as u32, t)))
+                    .map(|(i, t)| match (t.kind(), caller.1) {
+                        (ty::Param(p), Inst::Generic | Inst::ImplCopy(_)) => Some((i, p.index)),
+                        _ => None,
+                    })
+                    .collect();
+                let consistent = renaming.is_some_and(|r| {
+                    r.into_iter().all(|(i, j)| {
+                        let (a, b) = (node((callee, i), &mut class, &mut members), node((caller, j), &mut class, &mut members));
+                        if a == b {
+                            return true;
+                        }
+                        if members[a].iter().any(|m| members[b].contains(m)) {
+                            return false;
+                        }
+                        let moved = std::mem::take(&mut members[b]);
+                        members[a].extend(moved);
+                        for c in class.values_mut() {
+                            if *c == b {
+                                *c = a;
+                            }
+                        }
+                        true
+                    })
+                });
+                if !consistent {
+                    poly.insert(n);
+                }
+            }
+        }
+    }
+    poly
+}
 
 /// The allocation records (see `BodyTr::alloc`): for each translation, the types with generic
 /// parameters of the cells allocated by its body and by the generic functions it calls (at its
-/// generic parameters), with their HOL types, in order; and the translations whose record would
-/// exceed `MAX_ALLOCS`.
+/// generic parameters), with their HOL types, in order.
 struct Allocs<'tcx> {
     sets: HashMap<FnKey<'tcx>, Vec<(Ty<'tcx>, String)>>,
-    overflow: HashSet<FnKey<'tcx>>,
     /// the datatypes' names
     names: HashMap<FnKey<'tcx>, String>,
 }
@@ -958,12 +1030,12 @@ fn hol_in<'tcx>(fe: &mut Frontend<'tcx>, d: &FunDef<'tcx>, t: Ty<'tcx>) -> Strin
     h
 }
 
-fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'tcx> {
+fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>], poly: &HashSet<usize>) -> Allocs<'tcx> {
     let mut sets: HashMap<FnKey<'tcx>, Vec<(Ty<'tcx>, String)>> = HashMap::new();
     let mut calls: Vec<Vec<usize>> = vec![];
     for d in defs {
         let mut ms = vec![];
-        markers_in(fe, &d.body, &mut ms);
+        markers_in(fe, &d.body, poly, &mut ms);
         let set = sets.entry(d.key).or_default();
         for &(k, n) in &ms {
             if k == 'A' {
@@ -975,7 +1047,6 @@ fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'t
         }
         calls.push(ms.iter().filter(|(k, _)| matches!(k, 'F' | 'V')).map(|&(_, n)| n).collect());
     }
-    let mut overflow = HashSet::new();
     loop {
         let mut changed = false;
         for (d, cs) in defs.iter().zip(&calls) {
@@ -985,10 +1056,6 @@ fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'t
                 for t in needed {
                     let ti = at_call(fe, d.key, kargs, t);
                     if !ti.has_param() || sets[&d.key].iter().any(|(u, _)| *u == ti) {
-                        continue;
-                    }
-                    if sets[&d.key].len() >= MAX_ALLOCS {
-                        overflow.insert(d.key);
                         continue;
                     }
                     let h = hol_in(fe, d, ti);
@@ -1003,11 +1070,11 @@ fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'t
     }
     let mut names = HashMap::new();
     for d in defs {
-        if !sets[&d.key].is_empty() && !overflow.contains(&d.key) {
+        if !sets[&d.key].is_empty() {
             names.insert(d.key, fe.unique_global(format!("{}_alloc", d.name)));
         }
     }
-    Allocs { sets, overflow, names }
+    Allocs { sets, names }
 }
 
 /// The type variables in the HOL types `tys`, in order, except those every record takes first.
@@ -1084,6 +1151,7 @@ fn subst_markers<'tcx>(
     body: &str,
     caller_scc: Option<&HashSet<FnKey<'tcx>>>,
     names: &HashMap<FnKey<'tcx>, String>,
+    poly: &HashMap<usize, String>,
 ) -> String {
     let mut out = String::new();
     let mut rest = body;
@@ -1099,13 +1167,16 @@ fn subst_markers<'tcx>(
                 let j = allocs.set(me).iter().position(|(u, _)| *u == t).expect("a cell's type is in its body's record");
                 format!("({}_{} {})", allocs.names[&me], j, ALLOC_PARAM)
             }
+            "F" if poly.contains_key(&idx) => {
+                format!("\\<epsilon>\\<open>(unimplemented (STR ''{}'') :: (_, _, _, _, _, _) expression)\\<close>", poly[&idx])
+            }
             "F" | "V" => {
                 let callee = fe.gen_calls[idx].callee;
                 // every marked callee is a local item with a body, hence translated
                 let name = names.get(&callee).cloned().expect("callee of a call marker is translated");
                 let rec = caller_scc.map(|s| s.contains(&callee)).unwrap_or(false);
                 let head = if rec { format!("rec_{}", name) } else { name.clone() };
-                let mut extra: Vec<String> = fe.gen_calls[idx].dicts.clone().iter().map(|d| subst_markers(fe, allocs, me, d, caller_scc, names)).collect();
+                let mut extra: Vec<String> = fe.gen_calls[idx].dicts.clone().iter().map(|d| subst_markers(fe, allocs, me, d, caller_scc, names, poly)).collect();
                 extra.extend(record_arg(fe, allocs, me, idx));
                 let f = if extra.is_empty() { head.clone() } else { format!("{} {}", head, extra.join(" ")) };
                 match fe.gen_calls[idx].args.clone() {
@@ -1114,7 +1185,7 @@ fn subst_markers<'tcx>(
                     None if extra.is_empty() => f,
                     None => format!("({})", f),
                     Some(args) => {
-                        let a: Vec<String> = args.iter().map(|x| subst_markers(fe, allocs, me, x, caller_scc, names)).collect();
+                        let a: Vec<String> = args.iter().map(|x| subst_markers(fe, allocs, me, x, caller_scc, names, poly)).collect();
                         if !extra.is_empty() {
                             crate::body::term_call(&f, &a)
                         } else if a.is_empty() {
@@ -1176,17 +1247,34 @@ fn indent(s: &str, n: usize) -> String {
 /// The definitions (and the allocation records' datatypes, for the types theory).
 fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
     let mut defs = std::mem::take(&mut fe.fun_defs);
-    let allocs = alloc_sets(fe, &defs);
+    let poly_calls = poly_rec_calls(fe, &defs);
+    let allocs = alloc_sets(fe, &defs, &poly_calls);
+    // the polymorphic-recursive calls are placeholders; one as a function value makes its whole
+    // definition one (its function type is not known here)
+    let mut poly: HashMap<usize, String> = HashMap::new();
+    for d in defs.iter_mut() {
+        let mut ms = vec![];
+        markers_in(fe, &d.body, &HashSet::new(), &mut ms);
+        for (kind, n) in ms {
+            if !poly_calls.contains(&n) || poly.contains_key(&n) {
+                continue;
+            }
+            let what = format!(
+                "call of `{}` at other type arguments within its recursive group (polymorphic recursion)",
+                fe.tcx.def_path_str(fe.gen_calls[n].callee.0)
+            );
+            let m = fe.placeholder(&what, Some(fe.tcx.def_span(d.key.0)));
+            d.comments.push(m.clone());
+            if kind == 'V' {
+                d.params = (0..d.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
+                d.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
+                break;
+            }
+            poly.insert(n, names::string_token(&m));
+        }
+    }
     let mut decls = String::new();
     for d in defs.iter_mut() {
-        if allocs.overflow.contains(&d.key) {
-            let m = fe.placeholder("mutable locals of generic types in polymorphic recursion (allocation record without bound)", Some(fe.tcx.def_span(d.key.0)));
-            d.params = (0..d.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
-            d.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
-            d.calls.clear();
-            d.comments.push(m);
-            continue;
-        }
         if let Some(n) = allocs.names.get(&d.key) {
             let (t, decl) = alloc_decl(fe, n, allocs.set(d.key));
             writeln!(decls, "(* Rust: allocators of the mutable locals of {} and the functions it calls *)", cmt(&d.rust_path)).unwrap();
@@ -1205,7 +1293,7 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
         let recursive = comp.len() > 1 || defs[by_id[&comp[0]]].calls.contains(&comp[0]);
         if !recursive {
             let d = &defs[by_id[&comp[0]]];
-            let body = subst_markers(fe, &allocs, d.key, &d.body, None, &names);
+            let body = subst_markers(fe, &allocs, d.key, &d.body, None, &names, &poly);
             out.push_str(&emit_def(fe, d, &body));
             continue;
         }
@@ -1223,7 +1311,7 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
         let bodies: Vec<String> = members
             .iter()
             .map(|d| {
-                let body = subst_markers(fe, &allocs, d.key, &d.body, Some(&set), &names);
+                let body = subst_markers(fe, &allocs, d.key, &d.body, Some(&set), &names, &poly);
                 format!("{}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>", lam(d), indent(&body, 4))
             })
             .collect();

@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 
-use crate::frontend::{FnKey, Frontend, Inst};
+use crate::frontend::{FnKey, Frontend, Inst, paren_ty};
 use crate::names;
 
 /// The type parameters every dictionary datatype takes first: those of `function_body` and of
@@ -87,9 +87,13 @@ impl<'tcx> Frontend<'tcx> {
 
     /// The methods of `tr` that are fields of its dictionaries: those without type parameters of
     /// their own (a field cannot be polymorphic: HOL has no rank-2 types; see `monomorphic_methods`)
-    /// whose signatures have no associated types other than the slots of the dictionaries of `tr`
-    /// (the type variables of a field's type; e.g. not `<Self::Item as HasAssoc>::Assoc` that a
-    /// method's own bound `where Self::Item: HasAssoc` names).
+    /// whose field types have no associated types other than the slots of the dictionaries of `tr`
+    /// (the type variables of a field's type): neither their signatures nor the dictionary types of
+    /// their own bounds (see `own_dict_bounds`; e.g. not `where Self::Item: HasAssoc`, whose
+    /// dictionaries have the slot `<Self::Item as HasAssoc>::Assoc`). Nor are those with an own bound
+    /// by a trait whose dictionaries contain those of `tr` (see `reaches_through_methods`; e.g.
+    /// `Iterator::rev`, `where Self: DoubleEndedIterator`, a subtrait of `Iterator`): the datatypes
+    /// would be mutually recursive through a function argument, which HOL does not admit.
     pub fn dict_methods(&self, tr: DefId) -> Vec<DefId> {
         if let Some(ms) = self.dict_methods_memo.borrow().get(&tr) {
             return ms.clone();
@@ -108,10 +112,17 @@ impl<'tcx> Frontend<'tcx> {
             .collect();
         self.monomorphic_methods(tr)
             .into_iter()
+            .filter(|&m| !self.own_dict_bounds(m).iter().any(|b| self.reaches_through_methods(b.def_id, tr, &mut vec![])))
             .filter(|&m| {
                 let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization());
-                sig.inputs_and_output.iter().all(|t| {
-                    let mut w = tcx.erase_and_anonymize_regions(t).walk();
+                let env = ty::TypingEnv::post_analysis(tcx, m);
+                let mut tys: Vec<Ty<'tcx>> = sig.inputs_and_output.to_vec();
+                for b in self.own_dict_bounds(m) {
+                    tys.extend(b.args.types());
+                    tys.extend(self.dict_slots(b).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
+                }
+                tys.iter().all(|t| {
+                    let mut w = tcx.erase_and_anonymize_regions(*t).walk();
                     while let Some(g) = w.next() {
                         if let Some(x) = g.as_type()
                             && let ty::Alias(_, a) = x.kind()
@@ -200,6 +211,22 @@ impl<'tcx> Frontend<'tcx> {
         }
         seen.push(from);
         self.trait_bounds(from).into_iter().any(|(r, _)| self.reaches(r.def_id, to, seen))
+    }
+
+    /// Does `from` reach the trait `to` through supertraits, associated type bounds and the own bounds
+    /// of its methods (see `own_dict_bounds`): may the dictionaries of `from` contain those of `to`
+    /// (as fields, or as arguments of method fields)?
+    fn reaches_through_methods(&self, from: DefId, to: DefId, seen: &mut Vec<DefId>) -> bool {
+        if from == to {
+            return true;
+        }
+        if seen.contains(&from) {
+            return false;
+        }
+        seen.push(from);
+        let own = self.monomorphic_methods(from).into_iter().flat_map(|m| self.own_dict_bounds(m));
+        let next: Vec<DefId> = self.trait_bounds(from).into_iter().map(|(r, _)| r.def_id).chain(own.map(|r| r.def_id)).collect();
+        next.into_iter().any(|t| self.reaches_through_methods(t, to, seen))
     }
 
     /// The bounds whose dictionaries are fields of the dictionaries of `tr` (see `trait_bounds`),
@@ -337,16 +364,48 @@ impl<'tcx> Frontend<'tcx> {
         out
     }
 
+    /// The bounds of the method `m` of its own (its `where` clauses, not those of its trait or
+    /// implementation) that are dictionary parameters (as in `dict_bounds`). A dictionary field of
+    /// a trait method takes them before the method's arguments (see `dict_decl`), as Aeneas's
+    /// method clauses.
+    pub fn own_dict_bounds(&self, m: DefId) -> Vec<ty::TraitRef<'tcx>> {
+        let tcx = self.tcx;
+        let mut out: Vec<ty::TraitRef<'tcx>> = vec![];
+        for (c, _) in tcx.clauses_of(m).instantiate_own_identity() {
+            let Some(p) = c.skip_normalization().as_trait_clause() else { continue };
+            let p = tcx.instantiate_bound_regions_with_erased(p);
+            if p.polarity != ty::ClausePolarity::Positive || !self.has_dict(p.def_id()) {
+                continue;
+            }
+            let r = tcx.erase_and_anonymize_regions(p.trait_ref);
+            if r.args.has_param() && !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     /// The dictionary parameters of the translation `key`, with their names: the bounds (see
-    /// `dict_bounds`) of a generic item, or of the implementation of a default method's copy; an
-    /// instance has none.
+    /// `dict_bounds`) of a generic item, or of the implementation of a default method's copy and
+    /// the method's own bounds (see `own_dict_bounds`) there; an instance has none.
     pub fn dict_params(&self, key: FnKey<'tcx>) -> Vec<(ty::TraitRef<'tcx>, String)> {
-        let owner = match key.1 {
-            Inst::Generic => key.0,
-            Inst::ImplCopy(imp) => imp,
+        let tcx = self.tcx;
+        let bounds = match key.1 {
+            Inst::Generic => self.dict_bounds(key.0),
+            Inst::ImplCopy(imp) => {
+                let mut bs = self.dict_bounds(imp);
+                let at = self.inst_args(key).expect("a copy has the arguments of its implementation");
+                for b in self.own_dict_bounds(key.0) {
+                    let b = tcx.erase_and_anonymize_regions(ty::EarlyBinder::bind(tcx, b).instantiate(tcx, at).skip_normalization());
+                    if !bs.contains(&b) {
+                        bs.push(b);
+                    }
+                }
+                bs
+            }
             Inst::Mono(_) => return vec![],
         };
-        self.dict_bounds(owner)
+        bounds
             .into_iter()
             .enumerate()
             .map(|(k, r)| {
@@ -431,8 +490,15 @@ impl<'tcx> Frontend<'tcx> {
             return;
         }
         done.push(tr);
+        // the datatypes of the dictionaries in its fields first: of its supertraits and associated
+        // type bounds, and of its methods' own bounds
         for p in self.dict_parents(tr) {
             self.dict_order(p.def_id, done, order);
+        }
+        for m in self.dict_methods(tr) {
+            for b in self.own_dict_bounds(m) {
+                self.dict_order(b.def_id, done, order);
+            }
         }
         order.push(tr);
     }
@@ -463,7 +529,13 @@ impl<'tcx> Frontend<'tcx> {
             let ps: Vec<String> = sig.inputs().iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(*t))).collect();
             let ret = self.ty(tcx.erase_and_anonymize_regions(sig.output()));
             let f = self.dict_field(tr, m);
-            fields.push((f, self.fun_type(&ps, &ret)));
+            let menv = ty::TypingEnv::post_analysis(tcx, m);
+            let mut t = String::new();
+            for b in self.own_dict_bounds(m) {
+                t.push_str(&format!("{} \\<Rightarrow> ", paren_ty(&self.dict_type(b, menv))));
+            }
+            t.push_str(&self.fun_type(&ps, &ret));
+            fields.push((f, t));
         }
         let env = ty::TypingEnv::post_analysis(tcx, tr);
         for (k, p) in self.dict_parents(tr).into_iter().enumerate() {

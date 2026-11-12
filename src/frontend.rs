@@ -402,12 +402,20 @@ impl<'tcx> Frontend<'tcx> {
     }
 
     /// The typing environment of the body of `key`: an instance has no generic parameters left,
-    /// a copy has those of its implementation.
+    /// a copy has those of its implementation, with the implementation's bounds and the method's
+    /// own (at the implementation's trait reference).
     pub fn inst_env(&self, key: FnKey<'tcx>) -> ty::TypingEnv<'tcx> {
+        let tcx = self.tcx;
         match key.1 {
-            Inst::Generic => ty::TypingEnv::post_analysis(self.tcx, key.0),
+            Inst::Generic => ty::TypingEnv::post_analysis(tcx, key.0),
             Inst::Mono(_) => ty::TypingEnv::fully_monomorphized(),
-            Inst::ImplCopy(imp) => ty::TypingEnv::post_analysis(self.tcx, imp),
+            Inst::ImplCopy(imp) => {
+                let at = self.inst_args(key).expect("a copy has the arguments of its implementation");
+                let own = tcx.clauses_of(key.0).instantiate_own(tcx, at).map(|(c, _)| c.skip_normalization());
+                let clauses: Vec<ty::Clause<'tcx>> = tcx.param_env(imp).caller_bounds().chain(own).collect();
+                let pe = ty::ParamEnv::new(tcx, ty::elaborate::elaborate(tcx, clauses));
+                ty::TypingEnv::new(pe, ty::TypingMode::non_body_analysis()).with_post_analysis_normalized(tcx)
+            }
         }
     }
 
