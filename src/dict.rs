@@ -27,6 +27,58 @@ pub struct DictDecl {
     pub tparams: Vec<String>,
 }
 
+/// Fields per datatype: the datatype package fails to prove the injectivity of a constructor with
+/// many fields of large types (e.g. the 16 of `Hasher`'s dictionaries).
+const MAX_FIELDS: usize = 8;
+
+/// The datatype `name` with the fields `fields` (name, HOL type) and type parameters `tparams`, with
+/// its constructor `name` and its selectors the field names. With more than `MAX_FIELDS` fields,
+/// the fields are grouped into datatypes of their own (`name_p<k>`, recursively), the datatype of
+/// `name` holds the groups (constructor `name_mk`, selectors `name_part<k>`), and the constructor
+/// and the selectors of the fields are abbreviations through the groups.
+fn record_decl(name: &str, tparams: &[String], fields: &[(String, String)]) -> String {
+    let head = format!("({}) {}", tparams.join(", "), name);
+    if fields.len() <= MAX_FIELDS {
+        let fs: Vec<String> = fields.iter().map(|(f, t)| format!("({}: \\<open>{}\\<close>)", f, t)).collect();
+        return format!("datatype {} =\n  {} {}\n\n", head, name, fs.join("\n    "));
+    }
+    let mut out = String::new();
+    let groups: Vec<&[(String, String)]> = fields.chunks(fields.len().div_ceil(MAX_FIELDS).max(MAX_FIELDS)).collect();
+    let mut parts = vec![];
+    for (k, g) in groups.iter().enumerate() {
+        let pn = format!("{}_p{}", name, k);
+        // the group's own fields, renamed (the field names are the abbreviations below)
+        let pf: Vec<(String, String)> = g.iter().enumerate().map(|(j, (_, t))| (format!("{}_{}", pn, j), t.clone())).collect();
+        out.push_str(&record_decl(&pn, tparams, &pf));
+        parts.push((format!("{}_part{}", name, k), format!("({}) {}", tparams.join(", "), pn), pn, pf));
+    }
+    let ps: Vec<String> = parts.iter().map(|(f, t, _, _)| format!("({}: \\<open>{}\\<close>)", f, t)).collect();
+    out.push_str(&format!("datatype {} =\n  {}_mk {}\n\n", head, name, ps.join("\n    ")));
+    let xs: Vec<String> = (0..fields.len()).map(|i| format!("x{}", i)).collect();
+    let mut i = 0;
+    let mut args = vec![];
+    for (_, _, pn, pf) in &parts {
+        args.push(format!("({} {})", pn, xs[i..i + pf.len()].join(" ")));
+        i += pf.len();
+    }
+    out.push_str(&format!(
+        "abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>{}. {}_mk {}\\<close>\n\n",
+        name,
+        name,
+        xs.join(" "),
+        name,
+        args.join(" ")
+    ));
+    let mut gi = fields.iter();
+    for (part, _, _, pf) in &parts {
+        for (sel, _) in pf {
+            let (f, _) = gi.next().expect("a field per group field");
+            out.push_str(&format!("abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>d. {} ({} d)\\<close>\n\n", f, f, sel, part));
+        }
+    }
+    out
+}
+
 impl<'tcx> Frontend<'tcx> {
     /// `Fn`, `FnMut`, `FnOnce`: a bound by one of them is the function value itself.
     pub fn is_fn_trait(&self, tr: DefId) -> bool {
@@ -42,10 +94,28 @@ impl<'tcx> Frontend<'tcx> {
             .filter(|i| i.is_fn())
             .filter(|i| {
                 let c = self.tcx.generics_of(i.def_id).own_counts();
-                c.types == 0 && c.consts == 0
+                c.types == 0 && c.consts == 0 && !self.has_rpitit(i.def_id)
             })
             .map(|i| i.def_id)
             .collect()
+    }
+
+    /// Does the signature of the trait method `m` have an `impl Trait` type (the result type of a
+    /// trait method may be one, a hidden associated type of the trait), which no field type
+    /// expresses?
+    fn has_rpitit(&self, m: DefId) -> bool {
+        let tcx = self.tcx;
+        let sig = tcx.fn_sig(m).instantiate_identity().skip_binder();
+        sig.inputs_and_output.iter().any(|t| {
+            t.walk().any(|g| match g.as_type().map(|x| *x.kind()) {
+                Some(ty::Alias(_, a)) => match a.kind {
+                    ty::AliasTyKind::Opaque { .. } => true,
+                    ty::AliasTyKind::Projection { def_id } => tcx.opt_rpitit_info(def_id).is_some(),
+                    _ => false,
+                },
+                _ => false,
+            })
+        })
     }
 
     /// The supertraits of `tr` (bounds on `Self`) and the bounds of its associated types (e.g.
@@ -56,7 +126,7 @@ impl<'tcx> Frontend<'tcx> {
         let mut clauses: Vec<(ty::Clause<'tcx>, bool)> =
             tcx.explicit_super_clauses_of(tr).skip_binder().iter().map(|(c, _)| (*c, true)).collect();
         for i in tcx.associated_items(tr).in_definition_order() {
-            if matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_params.is_empty() {
+            if matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_params.is_empty() && tcx.opt_rpitit_info(i.def_id).is_none() {
                 clauses.extend(tcx.explicit_item_self_bounds(i.def_id).skip_binder().iter().map(|(c, _)| (*c, false)));
             }
         }
@@ -113,7 +183,7 @@ impl<'tcx> Frontend<'tcx> {
         let mut out: Vec<Ty<'tcx>> = tcx
             .associated_items(r.def_id)
             .in_definition_order()
-            .filter(|i| matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_counts().types == 0)
+            .filter(|i| matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_counts().types == 0 && tcx.opt_rpitit_info(i.def_id).is_none())
             .map(|i| {
                 let own = tcx.generics_of(i.def_id).own_params.len();
                 let args = tcx.mk_args_from_iter(
@@ -220,11 +290,28 @@ impl<'tcx> Frontend<'tcx> {
     /// of the type its bound states (`F: Fn(u32) -> bool` is `32 word ⇒ (.., bool, ..) function_body`).
     pub fn fn_param_types(&mut self, owner: DefId) -> HashMap<u32, String> {
         let tcx = self.tcx;
+        let mut out = HashMap::new();
+        for (index, ins, ret) in self.fn_bounded_params(owner) {
+            let norm = |t: Ty<'tcx>| {
+                let t = tcx.erase_and_anonymize_regions(t);
+                tcx.try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, owner), ty::Unnormalized::new_wip(t)).unwrap_or(t)
+            };
+            let ps: Vec<String> = ins.iter().map(|t| self.ty(norm(*t))).collect();
+            let r = self.ty(norm(ret));
+            out.insert(index, self.fun_type(&ps, &r));
+        }
+        out
+    }
+
+    /// The type parameters of the generic item `owner` bounded by an `Fn` trait: their indices,
+    /// with the argument types and the result type their bounds state.
+    pub fn fn_bounded_params(&self, owner: DefId) -> Vec<(u32, Vec<Ty<'tcx>>, Ty<'tcx>)> {
+        let tcx = self.tcx;
         let ident = ty::GenericArgs::identity_for_item(tcx, owner);
         let clauses: Vec<ty::Clause<'tcx>> =
             tcx.clauses_of(owner).instantiate(tcx, ident).clauses.into_iter().map(|c| c.skip_normalization()).collect();
         let output = tcx.lang_items().fn_once_output();
-        let mut out = HashMap::new();
+        let mut out: Vec<(u32, Vec<Ty<'tcx>>, Ty<'tcx>)> = vec![];
         for c in &clauses {
             let Some(p) = c.as_trait_clause() else { continue };
             let p = tcx.instantiate_bound_regions_with_erased(p);
@@ -233,7 +320,7 @@ impl<'tcx> Frontend<'tcx> {
             }
             let ty::Param(param) = *p.self_ty().kind() else { continue };
             let ty::Tuple(ins) = *p.trait_ref.args.type_at(1).kind() else { continue };
-            if out.contains_key(&param.index) {
+            if out.iter().any(|(i, _, _)| *i == param.index) {
                 continue;
             }
             let ret = clauses
@@ -243,9 +330,7 @@ impl<'tcx> Frontend<'tcx> {
                 .find(|q| Some(q.projection_term.expect_projection_def_id().into()) == output && q.self_ty() == p.self_ty())
                 .and_then(|q| q.term.as_type());
             let Some(ret) = ret else { continue };
-            let ps: Vec<String> = ins.iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(t))).collect();
-            let r = self.ty(tcx.erase_and_anonymize_regions(ret));
-            out.insert(param.index, self.fun_type(&ps, &r));
+            out.push((param.index, ins.iter().collect(), ret));
         }
         out
     }
@@ -263,9 +348,7 @@ impl<'tcx> Frontend<'tcx> {
             for tr in order {
                 let d = self.dict_decl(tr);
                 writeln!(out, "(* Rust: dictionaries of the trait {} *)", tcx.def_path_str(tr)).unwrap();
-                let fields: Vec<String> =
-                    d.fields.iter().map(|(f, t)| format!("({}: \\<open>{}\\<close>)", f, t)).collect();
-                writeln!(out, "datatype ({}) {} =\n  {} {}\n", d.tparams.join(", "), d.name, d.name, fields.join("\n    ")).unwrap();
+                out.push_str(&record_decl(&d.name, &d.tparams, &d.fields));
             }
             k += 1;
         }

@@ -456,11 +456,6 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let name = fe.fn_name(key);
     // the dictionary parameters come first (see `crate::dict`)
     let dicts = if is_fn { fe.dict_params(key) } else { vec![] };
-    match key.1 {
-        Inst::Generic if is_fn => fe.fn_params = fe.fn_param_types(did),
-        Inst::ImplCopy(imp) => fe.fn_params = fe.fn_param_types(imp),
-        _ => {}
-    }
     let rust_path = match key.1 {
         Inst::Generic => tcx.def_path_str(did),
         Inst::Mono(args) => tcx.def_path_str_with_args(did, args),
@@ -482,8 +477,16 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
                     tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
                 }));
             }
+            // and so are those in the types of the `Fn` bounds (see `Frontend::fn_param_types`)
             let owner = match key.1 { Inst::ImplCopy(imp) => imp, _ => did };
+            for (_, ins, ret) in fe.fn_bounded_params(owner) {
+                all.extend(ins.into_iter().chain([ret]).map(|t| {
+                    let t = tcx.erase_and_anonymize_regions(t);
+                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
+                }));
+            }
             fe.proj_tvars = proj_tvars(fe, owner, &all);
+            fe.fn_params = fe.fn_param_types(owner);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");
         let env = fe.inst_env(key);

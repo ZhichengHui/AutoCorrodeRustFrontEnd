@@ -1840,6 +1840,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// A call of the local function `did` at the generic arguments `args`.
     fn local_call(&mut self, did: DefId, args: GenericArgsRef<'tcx>, argv: Vec<Tr>) -> R<Tr> {
         let (key, kargs) = self.local_callee(did, args)?;
+        // a recursive group is defined with fixed type arguments (`translate::emit_funs`): a
+        // generic function calling itself at other ones (polymorphic recursion) cannot be
+        if key == self.key && !matches!(key.1, Inst::Mono(_)) {
+            let owner = match key.1 {
+                Inst::ImplCopy(imp) => imp,
+                _ => key.0,
+            };
+            let ident = ty::GenericArgs::identity_for_item(self.tcx, owner);
+            if !self.tcx.erase_and_anonymize_regions(kargs).types().eq(ident.types()) {
+                return unsup("recursive call at other type arguments (polymorphic recursion)");
+            }
+        }
         let dicts = self.callee_dicts(key, kargs)?;
         self.calls.insert(key);
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
@@ -1916,6 +1928,24 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The dictionaries `key` takes (see `Frontend::dict_params`), for its bounds at the generic
     /// arguments `kargs` of their item.
     fn callee_dicts(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<Vec<String>> {
+        // a parameter of the callee bounded by an `Fn` trait is a function value (see
+        // `Frontend::fn_param_types`): its argument must be a closure, a function item, or such a
+        // parameter of the body (a function pointer, for one, is a placeholder type)
+        let owner = match key.1 {
+            Inst::Generic => Some(key.0),
+            Inst::ImplCopy(imp) => Some(imp),
+            Inst::Mono(_) => None,
+        };
+        for (i, _, _) in owner.map(|o| self.fe.fn_bounded_params(o)).unwrap_or_default() {
+            let fn_value = match *kargs.type_at(i as usize).kind() {
+                ty::Closure(..) | ty::FnDef(..) => true,
+                ty::Param(p) => self.fe.fn_params.contains_key(&p.index),
+                _ => false,
+            };
+            if !fn_value {
+                return unsup(format!("`Fn` parameter of a generic function instantiated with `{}`", kargs.type_at(i as usize)));
+            }
+        }
         let bounds: Vec<ty::TraitRef<'tcx>> = self.fe.dict_params(key).into_iter().map(|(r, _)| r).collect();
         let mut out = vec![];
         for b in bounds {
