@@ -185,6 +185,100 @@ pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, f: &ty::FieldDef, args: GenericArgsRef<
     tcx.erase_and_anonymize_regions(tcx.normalize_erasing_regions(env, f.ty(tcx, args)))
 }
 
+/// A HOL type written without redundant parentheses (every compound argument and operand
+/// parenthesised, nothing else), to compare types written differently; the string itself if it
+/// does not parse.
+pub fn canonical_hol_ty(s: &str) -> String {
+    // tokens: parentheses, commas, symbols (`\<times>`, `\<Rightarrow>`) and words
+    let mut toks: Vec<String> = vec![];
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' | ')' | ',' => {
+                if !cur.is_empty() { toks.push(std::mem::take(&mut cur)) }
+                toks.push(c.to_string());
+            }
+            c if c.is_whitespace() => {
+                if !cur.is_empty() { toks.push(std::mem::take(&mut cur)) }
+            }
+            '\\' => {
+                if !cur.is_empty() { toks.push(std::mem::take(&mut cur)) }
+                let mut sym = String::from("\\");
+                for d in chars.by_ref() {
+                    sym.push(d);
+                    if d == '>' { break }
+                }
+                toks.push(sym);
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() { toks.push(cur) }
+    enum T {
+        App(Vec<T>, String),
+        Name(String),
+        Bin(Box<T>, &'static str, Box<T>),
+    }
+    const TIMES: &str = "\\<times>";
+    const FUN: &str = "\\<Rightarrow>";
+    fn ty(t: &[String], i: &mut usize) -> Option<T> {
+        let l = prod(t, i)?;
+        if t.get(*i).map(|x| x.as_str()) == Some(FUN) {
+            *i += 1;
+            return Some(T::Bin(Box::new(l), "=>", Box::new(ty(t, i)?)));
+        }
+        Some(l)
+    }
+    fn prod(t: &[String], i: &mut usize) -> Option<T> {
+        let l = app(t, i)?;
+        if t.get(*i).map(|x| x.as_str()) == Some(TIMES) {
+            *i += 1;
+            return Some(T::Bin(Box::new(l), "*", Box::new(prod(t, i)?)));
+        }
+        Some(l)
+    }
+    fn app(t: &[String], i: &mut usize) -> Option<T> {
+        let w = t.get(*i)?.clone();
+        let mut args = if w == "(" {
+            *i += 1;
+            let mut v = vec![ty(t, i)?];
+            while t.get(*i)? == "," {
+                *i += 1;
+                v.push(ty(t, i)?);
+            }
+            if t.get(*i)? != ")" { return None }
+            *i += 1;
+            v
+        } else if w == ")" || w == "," || w == TIMES || w == FUN {
+            return None;
+        } else {
+            *i += 1;
+            vec![T::Name(w)]
+        };
+        // postfix type constructors
+        while let Some(c) = t.get(*i)
+            && !(c == "(" || c == ")" || c == "," || c == TIMES || c == FUN)
+        {
+            *i += 1;
+            args = vec![T::App(args, c.clone())];
+        }
+        if args.len() == 1 { args.pop() } else { None }
+    }
+    fn show(x: &T) -> String {
+        match x {
+            T::Name(n) => n.clone(),
+            T::App(a, c) => format!("({}) {}", a.iter().map(show).collect::<Vec<_>>().join(", "), c),
+            T::Bin(l, o, r) => format!("({} {} {})", show(l), o, show(r)),
+        }
+    }
+    let mut i = 0;
+    match ty(&toks, &mut i) {
+        Some(x) if i == toks.len() => show(&x),
+        _ => s.to_string(),
+    }
+}
+
 pub fn paren_ty(s: &str) -> String {
     if s.contains(' ') && !(s.starts_with('(') && balanced_outer(s)) { format!("({})", s) } else { s.to_string() }
 }
@@ -935,7 +1029,10 @@ impl<'tcx> Frontend<'tcx> {
 
     /// The locale's allocator for the HOL type `hol_ty` (its index in `alloc_types`), added if new.
     pub fn need_alloc(&mut self, hol_ty: &str) -> usize {
-        match self.alloc_types.iter().position(|t| t == hol_ty) {
+        // the same type may be written with different parentheses: one storage per type (else the
+        // overloading of `store_reference_const` is ambiguous)
+        let key = canonical_hol_ty(hol_ty);
+        match self.alloc_types.iter().position(|t| canonical_hol_ty(t) == key) {
             Some(k) => k,
             None => {
                 self.alloc_types.push(hol_ty.to_string());

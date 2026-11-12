@@ -420,7 +420,7 @@ impl<'a, 'tcx> Visitor<'tcx> for GenericCalls<'a, 'tcx> {
 
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
         // a value of a type with parameters (a temporary dropped at once, an argument, ...)
-        if self.fe.has_drop_impls && self.typeck.expr_ty(e).has_param() {
+        if self.fe.has_drop_impls && self.typeck.node_type_opt(e.hir_id).is_some_and(|t| t.has_param()) {
             self.dependent = true;
         }
         if let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) {
