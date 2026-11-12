@@ -86,6 +86,10 @@
 | `TryFrom<&[T]>`（及 `TryInto`）到 `[T; N]`、`&[T; N]` | `slice_try_into_array`：长度为 `N` 时 `Ok`，否则 `Err(TryFromSliceError)`；`core::array::TryFromSliceError` 为 `try_from_slice_error`。从 `&mut [T]`、到 `&mut [T; N]` 的转换没有模型（结果与切片别名） | 手写 | 同上 |
 | `TryFrom<Vec<T>>`、`TryFrom<Box<[T]>>`（及 `TryInto`）到 `[T; N]`、`Box<[T; N]>` | `vec_try_into_array`：长度为 `N` 时 `Ok`，否则 `Err` 为原值 | 手写 | 同上 |
 | `Vec::shrink_to_fit` | `vec_shrink_to_fit`：无操作（只改变容量，模型没有容量） | 手写 | 同上 |
+| `Vec::swap_remove` | `vec_swap_remove`：越界时 panic | 手写 | 同上 |
+| `Vec::dedup`（元素的 `PartialEq` 是结构相等，见下） | `vec_dedup`：去掉相邻的重复元素 | 手写 | 同上 |
+| `<[T]>::sort`（`T` 的 `Ord` 是整数、`bool`、`char` 的序，或派生的、字段都满足此条件的本地结构体的字典序） | `slice_sort_by`，比较函数由前端按类型给出（`ord_cmp`、`ordering_then`）：稳定插入排序，与 Rust 的稳定排序结果相同 | 手写 + 前端写法 | `ord_cmp_term` |
+| `<[T]>::chunks(n)` | `slice_chunks`：`n` 为 0 时 panic；状态见“迭代器” | 手写 | 同上 |
 | `<[T]>::chunks_exact(n)` | `slice_chunks_exact`：`n` 为 0 时 panic；状态见“迭代器” | 手写 | 同上 |
 | `<[T]>::copy_from_slice`、`fill`、`reverse` | `slice_copy_from_slice`（长度不等时 panic）、`slice_fill`、`slice_reverse` | 手写 | 同上 |
 | `Vec::truncate`、`clear`、`resize`、`extend_from_slice` | `vec_truncate`、`vec_clear`、`vec_resize`、`vec_extend_from_slice` | 手写 | 同上 |
@@ -184,10 +188,34 @@
 | `Rev<I>`、`Copied<I>`、`Cloned<I>` | `I` | 内层的 `next_back`（`Rev`）、内层的 `next` | 手写 | 同上 |
 | `Iterator::next(&mut it)` | `iter_ref_next(步进函数, it)`：读状态、步进、写回 | | 手写 | `iter_call` |
 | `enumerate`、`zip`、`skip`、`take`、`take_while`、`map`、`rev`、`copied`、`cloned` | 构造适配器的状态（`zip` 的参数经 `IntoIterator`，HOL 类型相同时为恒等） | | 前端写法 | `iter_call` |
+| `vec::IntoIter<T>`（`Vec` 按值的 `into_iter`） | `T list` | `list_iter_next`（`next_back` 同 `slice::Iter`） | 手写 | 同上 |
+| `slice::Chunks<T>` | `T list × 64 word × tnil`（剩余元素、块大小） | `chunks_next`（最后一块可以较短） | 手写 | 同上 |
+| `Filter<I, P>` | `I × P × tnil` | `filter_next`：内层的 `find`，带 crate 的燃料 | 手写 | 同上 |
+| 无符号整数的 `a..b`、`a..` 作为迭代器 | `range` 记录、下一个值 | `range_next`、`range_from_next`（溢出时 panic） | 手写 | 同上 |
+| `any(&mut self, f)`、`min`（无符号整数） | `iter_ref_any`（写回迭代器的状态）、`iter_min`（第一个最小的元素） | | 手写 | `iter_call` |
 | `count`、`collect`（到 `Vec`） | `iter_count`、`iter_collect_list`（`iter_fold`：用 crate 的 `urust_fuel` 逐个调用步进函数，燃料耗尽时 panic “out of fuel”，与递归函数相同；`count` 计数溢出时 panic） | | 手写 | `iter_call` |
 | `for` 遍历上述迭代器 | Rust 的展开：`while let Some(p) = Iterator::next(&mut iter)` | | 前端写法 | `for_loop` |
 
 丢掉的语义：`Zip` 在两边都可随机访问时的特化实现（只影响带副作用的内层迭代器被推进的次数，这里的数据源都没有副作用）。其他适配器、`collect` 到其他类型等没有模型，生成外部函数模板。
+
+### HashMap
+
+`HashMap<K, V, S>` 表示为键值对的列表 `(K × V × tnil) list`（键互不相同）。只为不暴露迭代顺序的方法提供模型，所以哈希和迭代顺序都观察不到；键用 HOL 的相等比较，只在 `K` 的 `PartialEq` 是结构相等时使用：整数、`bool`、`char`、`str`、`String`，它们的元组、数组、切片、`Vec`、`Option`，以及派生 `PartialEq` 且字段都满足此条件的本地类型（`structural_eq_ty`）。泛型代码中以含类型参数的键调用这些方法的函数按实例翻译（`GenericCalls`）。
+
+| Rust | 模型 | 来源 | 位置 |
+|---|---|---|---|
+| `HashMap::new`、`len`、`is_empty`、`contains_key`、`get`、`insert`（已有键时替换值、保留键）、`remove` | `hashmap_new` 等 | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
+| `get_mut`、`entry(k).or_insert(v)` | `hashmap_get_mut`、`hashmap_entry`、`hashmap_entry_or_insert`：引用由 `focus_nth` 和元组分量的透镜聚焦到值；`Entry` 表示为（表的引用、键） | 手写 | 同上 |
+
+迭代（`iter`、`keys`、`values` 等）没有模型。
+
+### 其他
+| Rust | 模型 | 来源 | 位置 |
+|---|---|---|---|
+| `c.encode_utf8(buf).as_bytes()` | `char_encode_utf8_bytes(c, buf)`：编码写入 `buf` 开头（太短时 panic），结果是编码的字节；中间的 `&mut str` 不出现 | 手写 | `encode_utf8_bytes` |
+| 无符号整数的 `PartialOrd::partial_cmp` | `partial_cmp_word`：`Some` 比较结果 | 手写 | `std_call` |
+| `Default::default()`：整数、`bool`、`char`、`Option`、`Vec`、`String`、这些类型的元组和数组，派生 `Default` 的本地结构体 | 各字段的默认值（`0`、`false`、`'\0'`、`None`、`[]`、`""`、构造子） | 前端写法 | `default_value` |
+| 派生 `Eq` 的隐藏方法 `assert_receiver_is_total_eq`（字典字段） | 无操作 | 前端写法 | `model_field` |
 
 ### str
 | Rust | 模型 | 来源 | 位置 |
