@@ -1875,7 +1875,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tr = tcx.trait_of_assoc(did).expect("a default method is a trait item");
         // only the methods that are dictionary fields have copies (see `translate::run`)
         if !self.fe.dict_methods(tr).contains(&did) {
-            return unsup("call of a trait default method that is not a dictionary field (with generic parameters of its own, or returning `impl Trait`)");
+            return unsup("call of a trait default method that is not a dictionary field (with generic parameters of its own, returning `impl Trait`, or with associated types in its signature other than the slots of its dictionaries)");
         }
         let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&args[..tcx.generics_of(tr).count()]));
         match self.select(r)? {
@@ -1938,6 +1938,29 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             };
             if !fn_value {
                 return unsup(format!("`Fn` parameter of a generic function instantiated with `{}`", kargs.type_at(i as usize)));
+            }
+        }
+        // the callee's signature types are normalised in its own typing environment (its associated
+        // types are the variables of its slots, see `translate::slot_tvars`); at the call they must be
+        // the types the call has in the body. They need not be: in `fn caller<T: Iterator +
+        // IntoIterator>`, `<T as IntoIterator>::Item` is a projection of its own (the bound, not the
+        // blanket implementation over `Iterator`), while the callee `fn callee<T: Iterator>(..) -> <T
+        // as IntoIterator>::Item` has `<T as Iterator>::Item` through that implementation
+        if key.1 == Inst::Generic && matches!(self.tcx.def_kind(key.0), DefKind::Fn | DefKind::AssocFn) {
+            let tcx = self.tcx;
+            let env = self.typing_env();
+            let norm = |x: ty::Unnormalized<'tcx, Ty<'tcx>>| {
+                tcx.erase_and_anonymize_regions(tcx.try_normalize_erasing_regions(env, x).unwrap_or_else(|_| x.skip_normalization()))
+            };
+            let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(key.0).instantiate_identity().skip_normalization());
+            for t in sig.inputs_and_output {
+                let callee_view = norm(ty::EarlyBinder::bind(tcx, self.fe.at_key(key, t)).instantiate(tcx, kargs));
+                if callee_view != norm(ty::EarlyBinder::bind(tcx, t).instantiate(tcx, kargs)) {
+                    return unsup(format!(
+                        "call of a generic function whose signature type `{}` is another type in the callee's typing environment",
+                        t
+                    ));
+                }
             }
         }
         let bounds: Vec<ty::TraitRef<'tcx>> = self.fe.dict_params(key).into_iter().map(|(r, _)| r).collect();
@@ -2152,7 +2175,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup("trait method call in generic code (a trait without dictionaries)");
         }
         if !self.fe.dict_methods(tr).contains(&did) {
-            return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, or is an internal method of the standard library) in generic code");
+            return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, has associated types in its signature other than the slots of its dictionaries, or is an internal method of the standard library) in generic code");
         }
         let d = self.dict_term(r)?;
         let f = self.fe.dict_field(tr, did);

@@ -86,8 +86,41 @@ impl<'tcx> Frontend<'tcx> {
     }
 
     /// The methods of `tr` that are fields of its dictionaries: those without type parameters of
-    /// their own (a field cannot be polymorphic: HOL has no rank-2 types).
+    /// their own (a field cannot be polymorphic: HOL has no rank-2 types; see `monomorphic_methods`)
+    /// whose signatures have no associated types other than the slots of the dictionaries of `tr`
+    /// (the type variables of a field's type; e.g. not `<Self::Item as HasAssoc>::Assoc` that a
+    /// method's own bound `where Self::Item: HasAssoc` names).
     pub fn dict_methods(&self, tr: DefId) -> Vec<DefId> {
+        let tcx = self.tcx;
+        let slots: Vec<ty::AliasTy<'tcx>> =
+            self.dict_slots(ty::TraitRef::identity(tcx, tr)).into_iter().filter_map(|s| self.proj_key(s)).collect();
+        self.monomorphic_methods(tr)
+            .into_iter()
+            .filter(|&m| {
+                let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization());
+                sig.inputs_and_output.iter().all(|t| {
+                    let mut w = tcx.erase_and_anonymize_regions(t).walk();
+                    while let Some(g) = w.next() {
+                        if let Some(x) = g.as_type()
+                            && let ty::Alias(_, a) = x.kind()
+                        {
+                            w.skip_current_subtree();
+                            if matches!(a.kind, ty::AliasTyKind::Projection { .. })
+                                && !self.proj_key(x).is_some_and(|k| slots.contains(&k))
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+            })
+            .collect()
+    }
+
+    /// The methods of `tr` without type or const parameters of their own, other than those with
+    /// `impl Trait` types and the standard library's internals.
+    fn monomorphic_methods(&self, tr: DefId) -> Vec<DefId> {
         self.tcx
             .associated_items(tr)
             .in_definition_order()
@@ -169,13 +202,17 @@ impl<'tcx> Frontend<'tcx> {
             .collect()
     }
 
-    /// Does a bound by `tr` take a dictionary: does it have a method field or a supertrait with a
-    /// dictionary (`Fn` bounds are function values instead)?
+    /// Does a bound by `tr` take a dictionary: does it have a method without type parameters of its
+    /// own, a supertrait with a dictionary, or an associated type (a trait with associated types
+    /// only has dictionaries without fields, whose slots are the type variables of its associated
+    /// types, see `translate::slot_tvars`)? `Fn` bounds are function values instead.
     pub fn has_dict(&self, tr: DefId) -> bool {
         if self.is_fn_trait(tr) {
             return false;
         }
-        !self.dict_methods(tr).is_empty() || !self.dict_parents(tr).is_empty()
+        // (not `dict_methods`, which needs the slots: a trait none of whose methods is a field has
+        // dictionaries without method fields)
+        !self.monomorphic_methods(tr).is_empty() || !self.dict_parents(tr).is_empty() || !self.own_slots(tr).is_empty()
     }
 
     /// The associated types of a trait reference that its dictionary datatype takes as type
@@ -183,17 +220,16 @@ impl<'tcx> Frontend<'tcx> {
     /// supertraits with dictionaries, in order.
     pub fn dict_slots(&self, r: ty::TraitRef<'tcx>) -> Vec<Ty<'tcx>> {
         let tcx = self.tcx;
-        let mut out: Vec<Ty<'tcx>> = tcx
-            .associated_items(r.def_id)
-            .in_definition_order()
-            .filter(|i| matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_counts().types == 0 && tcx.opt_rpitit_info(i.def_id).is_none())
+        let mut out: Vec<Ty<'tcx>> = self
+            .own_slots(r.def_id)
+            .into_iter()
             .map(|i| {
-                let own = tcx.generics_of(i.def_id).own_params.len();
+                let own = tcx.generics_of(i).own_params.len();
                 let args = tcx.mk_args_from_iter(
                     r.args.iter().chain((0..own).map(|_| tcx.lifetimes.re_erased.into())),
                 );
                 // with erased regions, as the types the slots stand for in (erased) signatures
-                tcx.erase_and_anonymize_regions(Ty::new_projection(tcx, ty::IsRigid::No, i.def_id, args))
+                tcx.erase_and_anonymize_regions(Ty::new_projection(tcx, ty::IsRigid::No, i, args))
             })
             .collect();
         for p in self.dict_parents(r.def_id) {
@@ -201,6 +237,25 @@ impl<'tcx> Frontend<'tcx> {
             out.extend(self.dict_slots(pr));
         }
         out
+    }
+
+    /// The associated types of `tr` that are slots of its dictionaries (see `is_slot`).
+    pub fn own_slots(&self, tr: DefId) -> Vec<DefId> {
+        self.tcx
+            .associated_items(tr)
+            .in_definition_order()
+            .filter(|i| matches!(i.kind, ty::AssocKind::Type { .. }) && self.is_slot(i.def_id))
+            .map(|i| i.def_id)
+            .collect()
+    }
+
+    /// Is the associated type `at` a slot of its trait's dictionaries: has it no type or const
+    /// parameters of its own (a slot cannot be a type constructor), and is it not the hidden type
+    /// of a method returning `impl Trait`?
+    pub fn is_slot(&self, at: DefId) -> bool {
+        let tcx = self.tcx;
+        tcx.generics_of(at).own_params.iter().all(|p| matches!(p.kind, ty::GenericParamDefKind::Lifetime))
+            && tcx.opt_rpitit_info(at).is_none()
     }
 
     /// The HOL name of the dictionary datatype of `tr` (also the name of its constructor).
@@ -387,10 +442,7 @@ impl<'tcx> Frontend<'tcx> {
         let map: HashMap<ty::AliasTy<'tcx>, String> = slots
             .iter()
             .zip(slot_vars.iter())
-            .filter_map(|(s, v)| match s.kind() {
-                ty::Alias(_, a) => Some((*a, v.clone())),
-                _ => None,
-            })
+            .map(|(s, v)| (self.proj_key(*s).expect("slots are projections"), v.clone()))
             .collect();
         self.proj_tvars = Some(map);
         let mut fields = vec![];

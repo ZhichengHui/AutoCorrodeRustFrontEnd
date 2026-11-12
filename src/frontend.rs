@@ -6,7 +6,7 @@ use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathData;
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
+use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeVisitableExt};
 use rustc_span::{Span, Symbol, sym};
 
 use crate::names;
@@ -640,6 +640,30 @@ impl<'tcx> Frontend<'tcx> {
         }
     }
 
+    /// The key of the alias type `t` in `proj_tvars`: with erased regions, and its projections
+    /// (also those in its arguments) not marked rigid, as normalisation marks some and not others
+    /// (e.g. the inner projection of a slot `<<I as A>::X as B>::Y` and of the same type written in
+    /// a signature).
+    pub fn proj_key(&self, t: Ty<'tcx>) -> Option<ty::AliasTy<'tcx>> {
+        struct NotRigid<'tcx>(TyCtxt<'tcx>);
+        impl<'tcx> ty::TypeFolder<TyCtxt<'tcx>> for NotRigid<'tcx> {
+            fn cx(&self) -> TyCtxt<'tcx> {
+                self.0
+            }
+            fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
+                let t = t.super_fold_with(self);
+                match t.kind() {
+                    ty::Alias(ty::IsRigid::Yes, a) => Ty::new_alias(self.0, ty::IsRigid::No, *a),
+                    _ => t,
+                }
+            }
+        }
+        match self.tcx.erase_and_anonymize_regions(t).fold_with(&mut NotRigid(self.tcx)).kind() {
+            ty::Alias(_, a) => Some(*a),
+            _ => None,
+        }
+    }
+
     /// The associated types of type parameters in the types `tys` (normalised in `did`'s typing
     /// environment), in order of occurrence: those written, and those the datatypes of local ADTs
     /// in them take as extra type parameters (see `adt_projs`).
@@ -775,7 +799,7 @@ impl<'tcx> Frontend<'tcx> {
                 // associated-type projections that can be resolved (e.g. `<V2 as Add>::Output`); lifetime
                 // parameters do not matter (HOL has no regions), so they are erased first
                 let t = self.tcx.erase_and_anonymize_regions(t);
-                if let ty::Alias(_, a) = t.kind() && let Some(v) = self.proj_tvars.as_ref().and_then(|m| m.get(a)) {
+                if let Some(m) = self.proj_tvars.as_ref() && let Some(v) = self.proj_key(t).and_then(|a| m.get(&a)) {
                     return v.clone();
                 }
                 if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
@@ -898,10 +922,7 @@ impl<'tcx> Frontend<'tcx> {
             projs
                 .iter()
                 .zip(proj_names.iter())
-                .map(|(p, v)| match p.kind() {
-                    ty::Alias(_, a) => (*a, v.clone()),
-                    _ => unreachable!("projections are aliases"),
-                })
+                .map(|(p, v)| (self.proj_key(*p).expect("projections are aliases"), v.clone()))
                 .collect(),
         );
         // modelled, checked without recording anything first

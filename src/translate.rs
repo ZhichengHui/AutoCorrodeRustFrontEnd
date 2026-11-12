@@ -412,43 +412,54 @@ fn proj_tvar(k: usize) -> String {
     format!("'proj{}", k)
 }
 
-fn alias_of(t: Ty<'_>) -> ty::AliasTy<'_> {
-    match t.kind() {
-        ty::Alias(_, a) => *a,
-        _ => unreachable!("projections are aliases"),
+/// The type variables of the associated types in a generic item (as in Aeneas): the slots of its
+/// dictionaries (see `Frontend::dict_slots`), normalised in its typing environment `env`. A slot that
+/// normalises to a type (`Item = u8` in a bound) is that type; the others are rigid projections,
+/// one variable each (as normalised, so that two ways of writing an associated type that the
+/// bounds make equal, e.g. `<I::IntoIter as Iterator>::Item` and `I::Item`, are one variable). A
+/// projection in the signature or the body, normalised in `env` (see `Frontend::ty`), is one of them:
+/// naming one needs a bound, whose dictionary parameter is in the signature, so that every variable
+/// occurs in the signature. A projection in the signature (or in the types of its `Fn` bounds, see
+/// `Frontend::fn_param_types`) that is no slot is a variable of its own: one of a generic
+/// associated type with type or const parameters (`F::Of<u32>`; a slot cannot be a type
+/// constructor), or one reached through an associated type bound that is no dictionary field (see
+/// `Frontend::dict_parents`, e.g. `<N::Child as Node>::Child` for `type Child: Node`).
+fn slot_tvars<'tcx>(
+    fe: &Frontend<'tcx>,
+    dicts: &[(ty::TraitRef<'tcx>, String)],
+    owner: DefId,
+    sig_tys: &[Ty<'tcx>],
+    env: ty::TypingEnv<'tcx>,
+) -> HashMap<ty::AliasTy<'tcx>, String> {
+    let tcx = fe.tcx;
+    let norm = |t: Ty<'tcx>| {
+        let t = tcx.erase_and_anonymize_regions(t);
+        tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
+    };
+    let slots = dicts.iter().flat_map(|(r, _)| fe.dict_slots(*r)).map(norm);
+    let mut sig: Vec<Ty<'tcx>> = sig_tys.to_vec();
+    for (_, ins, ret) in fe.fn_bounded_params(owner) {
+        sig.extend(ins.into_iter().chain([ret]).map(norm));
     }
-}
-
-/// A generic function is a HOL constant polymorphic also in the associated types of its type
-/// parameters in its signature (`T::Output` in `fn first<T: Index<usize>>(x: &T) -> &T::Output`):
-/// they are type variables, which each instance fixes (`Output = u32` at `T = Buf`). Independent
-/// variables cannot express that two associated types of the same type are equal through an
-/// implementation of another trait (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`),
-/// so with projections of two traits on the same type the signature's types are not modelled; the
-/// associated types of one trait (e.g. `<E as Engine>::Config` and `<E as Engine>::DecodeEstimate`)
-/// are independent. One occurring only in the body is not a variable (it would be an extra type
-/// variable of the definition).
-fn proj_tvars<'tcx>(fe: &Frontend<'tcx>, did: DefId, sig_tys: &[Ty<'tcx>]) -> Option<HashMap<ty::AliasTy<'tcx>, String>> {
-    let ps: Vec<ty::AliasTy<'tcx>> = fe.projections(did, sig_tys).into_iter().map(alias_of).collect();
-    // (self type, trait) of the projections
-    let owners: Vec<(Ty<'tcx>, DefId)> = ps
-        .iter()
-        .filter_map(|a| match a.kind {
-            ty::AliasTyKind::Projection { def_id } => Some((a.args.type_at(0), fe.tcx.parent(def_id))),
-            _ => None,
-        })
-        .collect();
-    if (1..owners.len()).all(|i| owners[..i].iter().all(|(s, t)| *s != owners[i].0 || *t == owners[i].1)) {
-        Some(ps.into_iter().enumerate().map(|(k, a)| (a, proj_tvar(k))).collect())
-    } else {
-        None
+    let others = fe.projections(owner, &sig);
+    let mut out: HashMap<ty::AliasTy<'tcx>, String> = HashMap::new();
+    for n in slots.chain(others) {
+        if let ty::Alias(_, a) = n.kind()
+            && matches!(a.kind, ty::AliasTyKind::Projection { .. })
+            && let Some(k) = fe.proj_key(n)
+            && !out.contains_key(&k)
+        {
+            let v = proj_tvar(out.len());
+            out.insert(k, v);
+        }
     }
+    out
 }
 
 /// Translate the function or constant `key` and record its definition.
 fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) {
     let mut fd = translate_fn(fe, key);
-    // the projections' type variables (see `proj_tvars`) and the function types of `Fn`-bounded
+    // the projections' type variables (see `slot_tvars`) and the function types of `Fn`-bounded
     // parameters are those of one definition; they are kept for its allocation record (see
     // `alloc_sets`)
     fd.proj_ctx = fe.proj_tvars.take();
@@ -478,23 +489,9 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
         if !matches!(key.1, Inst::Mono(_)) {
             fe.register_ext_adts(&tys);
-            // the associated types of the dictionaries' slots are type variables too
             let env = fe.inst_env(key);
-            let mut all = tys.clone();
-            for (r, _) in &dicts {
-                all.extend(fe.dict_slots(*r).into_iter().map(|t| {
-                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
-                }));
-            }
-            // and so are those in the types of the `Fn` bounds (see `Frontend::fn_param_types`)
             let owner = match key.1 { Inst::ImplCopy(imp) => imp, _ => did };
-            for (_, ins, ret) in fe.fn_bounded_params(owner) {
-                all.extend(ins.into_iter().chain([ret]).map(|t| {
-                    let t = tcx.erase_and_anonymize_regions(t);
-                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
-                }));
-            }
-            fe.proj_tvars = proj_tvars(fe, owner, &all);
+            fe.proj_tvars = Some(slot_tvars(fe, &dicts, owner, &tys, env));
             fe.proj_env = Some(env);
             fe.fn_params = fe.fn_param_types(owner);
         }
@@ -629,7 +626,9 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             // a group with associated types in fields has one member (see `run`)
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
-            fe.proj_tvars = Some(projs.into_iter().map(alias_of).zip(proj_names.iter().cloned()).collect());
+            fe.proj_tvars = Some(
+                projs.into_iter().map(|p| fe.proj_key(p).expect("projections are aliases")).zip(proj_names.iter().cloned()).collect(),
+            );
             fe.proj_env = Some(env);
             let has_const = tcx.generics_of(d).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
             let mut tparams = tparams.clone();
