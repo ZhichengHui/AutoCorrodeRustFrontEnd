@@ -229,35 +229,78 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             fe.item_placeholder(what, tcx.def_span(d));
         }
     };
+    let own_types = |d: DefId| -> Vec<Ty<'_>> { ty::GenericArgs::identity_for_item(tcx, d).types().collect() };
+    // the generic arguments of `d` that are the `k`-th type parameters of `e` at its `k`-th ones
+    // (the members of a group share their type parameters by position, see `emit_types`)
+    let at_params_of = |d: DefId, e: DefId| {
+        let tys = own_types(e);
+        let mut k = 0;
+        ty::GenericArgs::for_item(tcx, d, |p, _| match p.kind {
+            ty::GenericParamDefKind::Type { .. } => {
+                k += 1;
+                tys[k - 1].into()
+            }
+            _ => tcx.lifetimes.re_erased.into(),
+        })
+    };
     // associated types of an ADT's type parameters in its fields (`S::Unit` in
-    // `struct H<S: Shape> { u: S::Unit }`) become extra type parameters of its datatype; the
+    // `struct H<S: Shape> { u: S::Unit }`, normalised in its typing environment) become extra
+    // type parameters of its datatype; the members of a recursive group share them (the union of
+    // theirs, at the group's type parameters, in order), as they share their type parameters. The
     // groups come after the ADTs they use
     for comp in &adt_sccs {
+        // external ADTs in the fields first: their datatypes may take associated types too
         for &d in comp {
-            // external ADTs in the fields first: their datatypes may take associated types too
             fe.register_ext_adts(&fields[&d]);
-            let ps = fe.projections(d, &fields[&d]);
+        }
+        if comp.len() == 1 {
+            let ps = fe.projections(comp[0], &fields[&comp[0]]);
             if !ps.is_empty() {
-                fe.adt_projs.insert(d, ps);
+                fe.adt_projs.insert(comp[0], ps);
             }
+            continue;
+        }
+        // (members with other numbers of type parameters make the group a placeholder, see below;
+        // const parameters are not shared by position)
+        let shareable = comp.iter().all(|&d| {
+            own_types(d).len() == own_types(comp[0]).len()
+                && tcx.generics_of(d).own_params.iter().all(|p| !matches!(p.kind, ty::GenericParamDefKind::Const { .. }))
+        });
+        if !shareable {
+            if comp.iter().any(|&d| !fe.projections(d, &fields[&d]).is_empty()) {
+                opaque(
+                    fe,
+                    comp,
+                    "mutually recursive with associated types",
+                    "mutually recursive type with an associated type of a type parameter in a field, and with members of other generic parameters (declared as an abstract type)",
+                );
+            }
+            continue;
+        }
+        let mut union: Vec<Ty<'tcx>> = vec![];
+        for &d in comp {
+            for p in fe.projections(d, &fields[&d]) {
+                let q = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, at_params_of(d, comp[0])).skip_normalization();
+                let key = fe.proj_key(q);
+                if !union.iter().any(|u| fe.proj_key(*u) == key) {
+                    union.push(q);
+                }
+            }
+        }
+        if union.is_empty() {
+            continue;
+        }
+        for &d in comp {
+            let back = at_params_of(comp[0], d);
+            let ps = union.iter().map(|u| ty::EarlyBinder::bind(tcx, *u).instantiate(tcx, back).skip_normalization()).collect();
+            fe.adt_projs.insert(d, ps);
         }
     }
     // the datatypes of a HOL `datatype ... and ...` have the same type parameters, and each recurs
     // with exactly these, in order (`emit_types` names them after the first member): a group of
-    // ADTs with different numbers of type parameters, or in which an ADT `d` refers to a member
-    // with other type arguments than `d`'s own parameters, is a placeholder
-    let own_types = |d: DefId| -> Vec<Ty<'_>> { ty::GenericArgs::identity_for_item(tcx, d).types().collect() };
+    // ADTs with different numbers of type parameters (or const parameters), or in which an ADT `d`
+    // refers to a member with other type arguments than `d`'s own parameters, is a placeholder
     for comp in &adt_sccs {
-        // the members of a group would have to share their extra type parameters (see `adt_projs`)
-        if comp.len() > 1 && comp.iter().any(|d| fe.adt_projs.contains_key(d)) {
-            opaque(
-                fe,
-                comp,
-                "mutually recursive with associated types",
-                "mutually recursive type with an associated type of a type parameter in a field (declared as an abstract type)",
-            );
-            continue;
-        }
         let arity = own_types(comp[0]).len();
         let nonuniform = comp.iter().any(|&d| {
             let own = own_types(d);
@@ -743,7 +786,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             });
             let (own, env) = (ty::GenericArgs::identity_for_item(tcx, d), ty::TypingEnv::post_analysis(tcx, d));
             let shared_field_ty = |f: &ty::FieldDef| ty::EarlyBinder::bind(tcx, field_ty(tcx, f, own, env)).instantiate(tcx, to_shared).skip_normalization();
-            // a group with associated types in fields has one member (see `run`)
+            // the members of a group share their projections' type parameters (see `collect_adts`)
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
             fe.proj_tvars = Some(
