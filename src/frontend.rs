@@ -153,7 +153,7 @@ pub struct Frontend<'tcx> {
     /// finite values once shared references are values (e.g. `struct Node(&'static Node)`), or
     /// are in a recursive group with such a type. They are placeholders.
     pub opaque_adts: HashMap<DefId, &'static str>,
-    /// Structs translated as `datatype_record` (have lenses).
+    /// Structs translated as `scalable_datatype_record` (have lenses).
     pub record_adts: HashSet<DefId>,
     /// Local ADTs that contain `&mut` references (directly or through other ADTs):
     /// they take the type parameters `'addr, 'gv` first.

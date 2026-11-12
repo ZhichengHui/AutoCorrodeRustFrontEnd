@@ -666,7 +666,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 if v.fields.is_empty() {
                     decls.push(format!("{} = make_{}", head, tn));
                 } else if fe.record_adts.contains(&d) {
-                    let mut s = format!("datatype_record {} =\n", head);
+                    let mut s = format!("scalable_datatype_record {} =\n", head);
                     for (n, t) in fnames.iter().zip(ftys.iter()) {
                         writeln!(s, "  {} :: {}", n, cart(t)).unwrap();
                     }
