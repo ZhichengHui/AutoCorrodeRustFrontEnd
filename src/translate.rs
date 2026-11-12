@@ -320,25 +320,25 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     adt_sccs
 }
 
-/// The calls of a body that only an instance can translate (`dependent`): of trait methods with
-/// generic parameters of their own at arguments with the body's generic parameters (no dictionary
-/// field is polymorphic, see `crate::dict`); and the calls of local functions at such arguments
-/// (`callees`).
-struct GenericCalls<'tcx> {
+/// The calls of a body that only an instance can translate (`dependent`): of trait methods that are
+/// not dictionary fields (see `Frontend::dict_methods`: e.g. with generic parameters of their own)
+/// at arguments with the body's generic parameters; and the calls of local functions at such
+/// arguments (`callees`).
+struct GenericCalls<'a, 'tcx> {
+    fe: &'a Frontend<'tcx>,
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx ty::TypeckResults<'tcx>,
     dependent: bool,
     callees: Vec<DefId>,
 }
 
-impl<'tcx> GenericCalls<'tcx> {
+impl<'a, 'tcx> GenericCalls<'a, 'tcx> {
     fn call(&mut self, did: DefId, args: ty::GenericArgsRef<'tcx>) {
         if !args.has_param() {
             return;
         }
-        if self.tcx.trait_of_assoc(did).is_some() {
-            let c = self.tcx.generics_of(did).own_counts();
-            if c.types > 0 || c.consts > 0 {
+        if let Some(tr) = self.tcx.trait_of_assoc(did) {
+            if !self.fe.dict_methods(tr).contains(&did) {
                 self.dependent = true;
             }
         } else if did.is_local() {
@@ -347,7 +347,7 @@ impl<'tcx> GenericCalls<'tcx> {
     }
 }
 
-impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
+impl<'a, 'tcx> Visitor<'tcx> for GenericCalls<'a, 'tcx> {
     type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
@@ -368,18 +368,15 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
 }
 
 /// The generic functions translated per instance (besides once generically): the trait default
-/// methods with generic parameters of their own (they have no copies for implementations, see
-/// `run`), and the generic functions with a call only an instance translates (see
-/// `GenericCalls`), directly or through other such functions.
+/// methods that are not dictionary fields (they have no copies for implementations, see `run`),
+/// and the generic functions with a call only an instance translates (see `GenericCalls`),
+/// directly or through other such functions.
 fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefId]) -> HashSet<DefId> {
     let tcx = fe.tcx;
     let mut mono: HashSet<DefId> = default_methods
         .iter()
         .copied()
-        .filter(|&m| {
-            let c = tcx.generics_of(m).own_counts();
-            c.types > 0 || c.consts > 0
-        })
+        .filter(|&m| !fe.dict_methods(tcx.trait_of_assoc(m).expect("a default method is a trait item")).contains(&m))
         .collect();
     let mut callees: Vec<(DefId, Vec<DefId>)> = vec![];
     for &did in bodies {
@@ -387,7 +384,7 @@ fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefI
             continue;
         }
         let ld = did.expect_local();
-        let mut v = GenericCalls { tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
+        let mut v = GenericCalls { fe, tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
         v.visit_body(tcx.hir_body_owned_by(ld));
         if v.dependent {
             mono.insert(did);

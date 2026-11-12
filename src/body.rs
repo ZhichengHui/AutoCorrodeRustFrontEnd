@@ -62,8 +62,7 @@ pub fn term_call(f: &str, a: &[String]) -> String {
 
 /// A HOL term as an argument of an application: parenthesised unless it is a name.
 fn paren_term(t: &str) -> String {
-    let name = t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '\u{1}' || c == '\u{2}');
-    if name || (t.starts_with('(') && crate::frontend::balanced_outer(t)) { t.to_string() } else { format!("({})", t) }
+    if t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '\u{1}' || c == '\u{2}') { t.to_string() } else { format!("({})", t) }
 }
 
 /// The label of a loop as it precedes the uRust loop (`'l: `), or nothing.
@@ -1363,13 +1362,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let lv = self.val(l)?;
         let rv = self.val(r)?;
         if lt.is_bool() {
-            let tok = match op {
-                BinOpKind::BitAnd => "&&",
-                BinOpKind::BitOr => "||",
-                BinOpKind::BitXor => "!=",
-                _ => Self::binop_info(op).0,
-            };
-            let p = match tok { "&&" => 43, "||" => 42, _ => Self::binop_info(op).1 };
+            let (tok, p) = Self::bool_binop(op);
             if matches!(op, BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
                 return unsup("ordering comparison on `bool`");
             }
@@ -1882,7 +1875,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tr = tcx.trait_of_assoc(did).expect("a default method is a trait item");
         // only the methods that are dictionary fields have copies (see `translate::run`)
         if !self.fe.dict_methods(tr).contains(&did) {
-            return unsup("call of a trait default method with generic parameters of its own");
+            return unsup("call of a trait default method that is not a dictionary field (with generic parameters of its own, or returning `impl Trait`)");
         }
         let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&args[..tcx.generics_of(tr).count()]));
         match self.select(r)? {
@@ -1973,9 +1966,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// The dictionary of a built-in or derived implementation of `r` (`what`): its methods are
-    /// the models of their direct calls (see `std_call`): `clone` is the value itself (a value is
-    /// its clone), `clone_from` assigns, `eq` and `ne` of a type with itself are HOL (in)equality;
-    /// the dictionaries of the supertraits are fields. Other methods have no model.
+    /// their models (see `model_field`); a method without one makes it a placeholder. The
+    /// dictionaries of the supertraits are fields.
     fn model_dict(&mut self, r: ty::TraitRef<'tcx>, what: &str) -> R<String> {
         let tcx = self.tcx;
         let mut fields = vec![];
@@ -1983,7 +1975,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let Some(f) = self.model_field(r, m) else {
                 return unsup(format!("dictionary of the {} implementation of `{}`", what, r));
             };
-            fields.push(f);
+            fields.push(paren_term(&f));
         }
         for p in self.fe.dict_parents(r.def_id) {
             let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
@@ -1997,17 +1989,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `r`, as a function value, if its direct calls have one: `clone` is the value itself (a value
     /// is its clone), `clone_from` assigns, `eq` and `ne` of a type with itself are HOL
     /// (in)equality (see `binary`, `std_call`); on modelled integers of one type the comparisons and
-    /// arithmetic operators are uRust's (not the shifts, see `shift_amount`), and `cmp` is
-    /// AutoCorrode's; on `bool`, `&`, `|`, `^` are `&&`, `||`, `!=`.
+    /// the arithmetic and bitwise operators (not the shifts, see `shift_amount`) are uRust's, as
+    /// `binary` translates them, and `cmp` is AutoCorrode's; on `bool`, `&`, `|`, `^` are as in
+    /// `binary`. The methods are identified within their trait, which is a lang or diagnostic item.
     fn model_field(&mut self, r: ty::TraitRef<'tcx>, m: DefId) -> Option<String> {
         let tcx = self.tcx;
         let tr = r.def_id;
         let name = tcx.item_name(m);
-        let lam2 = |b: &str| format!("(\\<lambda>a b. FunctionBody \\<lbrakk> {} \\<rbrakk>)", b);
+        let lam2 = |b: String| format!("\\<lambda>a b. FunctionBody \\<lbrakk> {} \\<rbrakk>", b);
         if tcx.is_lang_item(tr, LangItem::Clone) {
             return match name.as_str() {
-                "clone" => Some("(\\<lambda>x. FunctionBody (literal x))".to_string()),
-                "clone_from" => Some("(\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>)".to_string()),
+                "clone" => Some("\\<lambda>x. FunctionBody (literal x)".to_string()),
+                "clone_from" => Some("\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>".to_string()),
                 _ => None,
             };
         }
@@ -2016,47 +2009,56 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
         if tcx.is_lang_item(tr, LangItem::PartialEq) && same {
             return match name.as_str() {
-                "eq" => Some(lam2("a == b")),
-                "ne" => Some(lam2("a != b")),
+                "eq" => Some(lam2("a == b".into())),
+                "ne" => Some(lam2("a != b".into())),
                 _ => None,
             };
         }
         let int = Self::int_suffix(this).is_some() && rhs.is_none_or(|t| t == this);
-        let ops: [(LangItem, &str, &str); 8] = [
-            (LangItem::Add, "add", "+"),
-            (LangItem::Sub, "sub", "-"),
-            (LangItem::Mul, "mul", "*"),
-            (LangItem::Div, "div", "/"),
-            (LangItem::Rem, "rem", "%"),
-            (LangItem::BitAnd, "bitand", "&"),
-            (LangItem::BitOr, "bitor", "|"),
-            (LangItem::BitXor, "bitxor", "^"),
-        ];
-        for (l, n, tok) in ops {
-            if tcx.is_lang_item(tr, l) && name.as_str() == n {
-                if int {
-                    return Some(lam2(&format!("a {} b", tok)));
-                }
-                if this.is_bool() && rhs == Some(this) && matches!(l, LangItem::BitAnd | LangItem::BitOr | LangItem::BitXor) {
-                    let t = match l { LangItem::BitAnd => "&&", LangItem::BitOr => "||", _ => "!=" };
-                    return Some(lam2(&format!("a {} b", t)));
-                }
-                return None;
-            }
-        }
-        if int && tcx.is_lang_item(tr, LangItem::PartialOrd) {
-            return match name.as_str() {
-                "lt" => Some(lam2("a < b")),
-                "le" => Some(lam2("a <= b")),
-                "gt" => Some(lam2("a > b")),
-                "ge" => Some(lam2("a >= b")),
-                _ => None,
-            };
-        }
         if int && tcx.is_diagnostic_item(sym::Ord, tr) && name.as_str() == "cmp" {
-            return Some(lam2("cmp(a, b)"));
+            return Some(lam2("cmp(a, b)".into()));
+        }
+        let op = Self::trait_binop(tcx, tr, name.as_str())?;
+        if int && !matches!(op, BinOpKind::Shl | BinOpKind::Shr) {
+            return Some(lam2(format!("a {} b", Self::binop_info(op).0)));
+        }
+        if this.is_bool() && rhs == Some(this) && matches!(op, BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor) {
+            return Some(lam2(format!("a {} b", Self::bool_binop(op).0)));
         }
         None
+    }
+
+    /// The binary operator the method `m` of the operator or comparison trait `tr` (a lang item)
+    /// implements.
+    fn trait_binop(tcx: TyCtxt<'tcx>, tr: DefId, m: &str) -> Option<BinOpKind> {
+        use BinOpKind as K;
+        let ops = [
+            (LangItem::Add, "add", K::Add),
+            (LangItem::Sub, "sub", K::Sub),
+            (LangItem::Mul, "mul", K::Mul),
+            (LangItem::Div, "div", K::Div),
+            (LangItem::Rem, "rem", K::Rem),
+            (LangItem::BitAnd, "bitand", K::BitAnd),
+            (LangItem::BitOr, "bitor", K::BitOr),
+            (LangItem::BitXor, "bitxor", K::BitXor),
+            (LangItem::Shl, "shl", K::Shl),
+            (LangItem::Shr, "shr", K::Shr),
+            (LangItem::PartialOrd, "lt", K::Lt),
+            (LangItem::PartialOrd, "le", K::Le),
+            (LangItem::PartialOrd, "gt", K::Gt),
+            (LangItem::PartialOrd, "ge", K::Ge),
+        ];
+        ops.into_iter().find(|(l, n, _)| tcx.is_lang_item(tr, *l) && *n == m).map(|(_, _, k)| k)
+    }
+
+    /// The uRust operator (with its precedence) of `&`, `|`, `^` on `bool`, and of the comparisons.
+    fn bool_binop(op: BinOpKind) -> (&'static str, u32) {
+        match op {
+            BinOpKind::BitAnd => ("&&", 43),
+            BinOpKind::BitOr => ("||", 42),
+            BinOpKind::BitXor => ("!=", Self::binop_info(op).1),
+            _ => Self::binop_info(op),
+        }
     }
 
     /// The dictionary for `r` in the dictionary `d` for the bound `p`: `d` itself, or a
@@ -2102,7 +2104,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     });
                     self.fn_value((im, Inst::Generic), iargs)?
                 }
-                Some(&im) => match self.model_field(r, m) {
+                // a standard-library implementation's method is its model, if it has one, as in
+                // direct calls (see `std_call`); other external ones are templates
+                Some(&im) => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
                     Some(f) => f,
                     None => self.fe.ext_fun(im, false),
                 },
@@ -2110,7 +2114,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let key = self.fe.impl_copy(m, imp);
                     self.fn_value(key, args)?
                 }
-                None => match self.model_field(r, m) {
+                None => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
                     Some(f) => f,
                     None => self.fe.ext_fun(m, false),
                 },
@@ -2146,6 +2150,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let r = ty::TraitRef::new_from_args(tcx, tr, tcx.mk_args(&gargs[..tcx.generics_of(tr).count()]));
         if !self.fe.has_dict(tr) {
             return unsup("trait method call in generic code (a trait without dictionaries)");
+        }
+        if !self.fe.dict_methods(tr).contains(&did) {
+            return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, or is an internal method of the standard library) in generic code");
         }
         let d = self.dict_term(r)?;
         let f = self.fe.dict_field(tr, did);

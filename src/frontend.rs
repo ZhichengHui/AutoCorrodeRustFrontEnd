@@ -184,7 +184,7 @@ pub fn paren_ty(s: &str) -> String {
     if s.contains(' ') && !(s.starts_with('(') && balanced_outer(s)) { format!("({})", s) } else { s.to_string() }
 }
 
-pub fn balanced_outer(s: &str) -> bool {
+fn balanced_outer(s: &str) -> bool {
     // true if s is "( ... )" with the outer parentheses matching each other
     let mut depth = 0i32;
     for (i, c) in s.char_indices() {
