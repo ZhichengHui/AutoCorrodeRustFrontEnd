@@ -1463,7 +1463,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ExprKind::Break(dest, Some(v)) => match dest.target_id.ok().and_then(|t| self.loop_results.get(&t).cloned()) {
                 Some(res) => {
                     let v = self.val(v)?;
-                    Ok(Tr::block(format!("{{ * {} = {}; {} }}", res, v.at(40), loop_jump("break", dest).s)))
+                    // the `break` ends the block, so that the block has its (any) type, as `break`
+                    let brk = loop_jump("break", dest).s;
+                    Ok(Tr::block(format!("{{ * {} = {}; {} }}", res, v.at(40), brk.trim_end_matches(';'))))
                 }
                 None => unsup("`break` with a value"),
             },
