@@ -338,7 +338,9 @@ impl<'a, 'tcx> GenericCalls<'a, 'tcx> {
             return;
         }
         if let Some(tr) = self.tcx.trait_of_assoc(did) {
-            if !self.fe.dict_methods(tr).contains(&did) {
+            // a call of a value of a type parameter bounded by an `Fn` trait is a call of a function
+            // value (see `Frontend::fn_param_types`)
+            if !self.fe.is_fn_trait(tr) && !self.fe.dict_methods(tr).contains(&did) {
                 self.dependent = true;
             }
         } else if did.is_local() {
