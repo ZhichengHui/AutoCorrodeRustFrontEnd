@@ -452,6 +452,7 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) {
     // parameters are those of one definition; they are kept for its allocation record (see
     // `alloc_sets`)
     fd.proj_ctx = fe.proj_tvars.take();
+    fe.proj_env = None;
     fd.fn_ctx = std::mem::take(&mut fe.fn_params);
     fe.fun_defs.push(fd);
 }
@@ -494,6 +495,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
                 }));
             }
             fe.proj_tvars = proj_tvars(fe, owner, &all);
+            fe.proj_env = Some(env);
             fe.fn_params = fe.fn_param_types(owner);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");
@@ -628,6 +630,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
             fe.proj_tvars = Some(projs.into_iter().map(alias_of).zip(proj_names.iter().cloned()).collect());
+            fe.proj_env = Some(env);
             let has_const = tcx.generics_of(d).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
             let mut tparams = tparams.clone();
             tparams.extend(proj_names);
@@ -686,6 +689,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             }
         }
         fe.proj_tvars = None;
+        fe.proj_env = None;
         if !decls.is_empty() {
             writeln!(out, "datatype {}\n", decls.join("\nand ")).unwrap();
         }

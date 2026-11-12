@@ -163,6 +163,10 @@ pub struct Frontend<'tcx> {
     pub adt_projs: HashMap<DefId, Vec<Ty<'tcx>>>,
     /// While a datatype is declared: its projections' type variables (see `adt_projs`).
     pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
+    /// While a generic item is translated: its typing environment, in which the associated types a
+    /// local ADT takes as type parameters are normalised at its uses (to the projections that
+    /// `proj_tvars` has, e.g. `<DP::VS as VersionSet>::V` to `DP::V`).
+    pub proj_env: Option<ty::TypingEnv<'tcx>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
     /// `Fn` traits (see `fn_param_types`).
     pub fn_params: HashMap<u32, String>,
@@ -234,6 +238,7 @@ impl<'tcx> Frontend<'tcx> {
             alias_tvars: None,
             adt_projs: HashMap::new(),
             proj_tvars: None,
+            proj_env: None,
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
             gen_calls: Vec::new(),
@@ -751,7 +756,11 @@ impl<'tcx> Frontend<'tcx> {
                         // a placeholder ADT is declared with the Rust type arguments only
                         if let Some(ps) = self.adt_projs.get(&did).cloned().filter(|_| !self.opaque_adts.contains_key(&did)) {
                             for p in ps {
-                                let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args).skip_normalization();
+                                let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
+                                let at = match self.proj_env {
+                                    Some(env) => self.tcx.try_normalize_erasing_regions(env, at).unwrap_or_else(|_| at.skip_normalization()),
+                                    None => at.skip_normalization(),
+                                };
                                 a.push(self.ty(at));
                             }
                         }
@@ -884,7 +893,7 @@ impl<'tcx> Frontend<'tcx> {
         let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
         let projs = self.projections(did, &all);
         let proj_names: Vec<String> = (0..projs.len()).map(|k| format!("'proj{}", k)).collect();
-        let saved = self.proj_tvars.take();
+        let saved = (self.proj_tvars.take(), self.proj_env.replace(env));
         self.proj_tvars = Some(
             projs
                 .iter()
@@ -923,7 +932,7 @@ impl<'tcx> Frontend<'tcx> {
             params.extend(proj_names.iter().cloned());
             (params, ctors, deps)
         });
-        self.proj_tvars = saved;
+        (self.proj_tvars, self.proj_env) = saved;
         if result.is_some() && !projs.is_empty() {
             self.adt_projs.insert(did, projs);
         }
