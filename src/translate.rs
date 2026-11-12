@@ -648,6 +648,13 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 writeln!(out, "(* {} *)\ntypedecl {}\n", cmt(&m), head).unwrap();
                 continue;
             }
+            // an enum without fields has no type parameters (they would be unused), hence no
+            // others in its group
+            if let Some((width, vals)) = fe.word_enum(d) {
+                let ctors: Vec<String> = (0..def.variants().len()).map(|vi| fe.variant_ctor_name(d, vi)).collect();
+                out.push_str(&word_enum_decl(&tn, width, &ctors, &vals));
+                continue;
+            }
             if def.is_enum() && def.variants().iter().any(|v| matches!(v.discr, ty::VariantDiscr::Explicit(_))) {
                 let m = fe.placeholder("explicit enum discriminants (dropped)", Some(tcx.def_span(d)));
                 writeln!(out, "(* {} *)", cmt(&m)).unwrap();
@@ -695,6 +702,15 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
         out.push_str(&after);
     }
     out
+}
+
+/// The `simple_word_enum` declaration of the enum `name` (see `Frontend::word_enum`): each
+/// constructor is its discriminant, a word of the given width. The plugin `word_conversion`
+/// would define functions `name_to_uN`, `name_try_from_uN`, whose names may be taken by
+/// translated functions (the frontend does not use them).
+fn word_enum_decl(name: &str, width: u64, ctors: &[String], vals: &[u128]) -> String {
+    let vs: Vec<String> = ctors.iter().zip(vals).map(|(c, v)| format!("{} = {}", c, v)).collect();
+    format!("simple_word_enum (plugins del: word_conversion) ({}) {} =\n    {}\n\n", width, name, vs.join("\n  | "))
 }
 
 /// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.
@@ -1183,6 +1199,15 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
         let ready: Vec<&String> =
             left.iter().copied().filter(|n| fe.ext_types[*n].deps.iter().all(|d| !left.contains(&d))).collect();
         let group = if ready.is_empty() { left.clone() } else { vec![ready[0]] };
+        // an enum without fields uses no other types, so it is a group of its own
+        if let [n] = group[..] && let Some((width, vals)) = &fe.ext_types[n].word {
+            let t = &fe.ext_types[n];
+            let ctors: Vec<String> = t.ctors.iter().map(|(c, _)| c.clone()).collect();
+            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
+            te.push_str(&word_enum_decl(n, *width, &ctors, vals));
+            left.retain(|m| *m != n);
+            continue;
+        }
         let mut decls = vec![];
         for n in &group {
             let t = &fe.ext_types[*n];

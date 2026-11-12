@@ -71,6 +71,9 @@ pub struct ExtType {
     pub params: Vec<String>,
     /// the external types its fields use
     pub deps: Vec<String>,
+    /// for an enum with constructors whose variants have no fields: it is a `simple_word_enum`
+    /// (see `Frontend::word_enum`)
+    pub word: Option<(u64, Vec<u128>)>,
 }
 
 /// An external (or foreign) function for which a template definition is emitted.
@@ -443,6 +446,25 @@ impl<'tcx> Frontend<'tcx> {
         n
     }
 
+    /// For an enum whose variants (at least one) all have no fields: the bit width of its
+    /// discriminant type and each variant's discriminant, as a word of that width. Such an enum
+    /// is a `simple_word_enum` (AutoCorrode), whose declaration scales with the number of
+    /// variants, unlike a `datatype` (distinctness of all pairs of constructors).
+    pub fn word_enum(&self, adt: DefId) -> Option<(u64, Vec<u128>)> {
+        let tcx = self.tcx;
+        let def = tcx.adt_def(adt);
+        if !def.is_enum() || def.variants().is_empty() || def.variants().iter().any(|v| !v.fields.is_empty()) {
+            return None;
+        }
+        let width = match def.repr().discr_type() {
+            rustc_abi::IntegerType::Pointer(_) => tcx.data_layout.pointer_size().bits(),
+            rustc_abi::IntegerType::Fixed(i, _) => i.size().bits(),
+        };
+        // `Discr::val` is the discriminant's bits in its type (e.g. `-1i8` is 0xff)
+        let mask = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+        Some((width, def.discriminants(tcx).map(|(_, d)| d.val & mask).collect()))
+    }
+
     pub fn variant_ctor_name(&mut self, adt: DefId, vidx: usize) -> String {
         let tn = self.adt_name(adt);
         let def = self.tcx.adt_def(adt);
@@ -565,7 +587,7 @@ impl<'tcx> Frontend<'tcx> {
         let name = format!("unsupported_{}", names::ident_chars(desc));
         if !self.ext_types.contains_key(&name) {
             let comment = self.placeholder(&format!("type {}", desc), None);
-            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
+            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None });
         }
         name
     }
@@ -885,15 +907,16 @@ impl<'tcx> Frontend<'tcx> {
             self.ext_types.contains_key(n) || self.used_type_names.contains(n)
         });
         let comment = format!("Rust: {}", self.tcx.def_path_str(did));
-        self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
+        self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None });
         self.ext_type_ids.insert(did, n.clone());
         // the fields' type parameters are the ADT's (see `ext_fun`)
         let fn_params = std::mem::take(&mut self.fn_params);
         let datatype = self.ext_datatype(did, &n);
         self.fn_params = fn_params;
         if let Some((params, ctors, deps)) = datatype {
+            let word = self.word_enum(did);
             let t = self.ext_types.get_mut(&n).expect("registered above");
-            (t.params, t.ctors, t.deps) = (params, ctors, deps);
+            (t.params, t.ctors, t.deps, t.word) = (params, ctors, deps, word);
         }
         n
     }

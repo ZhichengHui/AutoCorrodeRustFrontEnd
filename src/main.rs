@@ -5,6 +5,7 @@
 
 #![feature(rustc_private)]
 
+extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_driver;
 extern crate rustc_hir;
