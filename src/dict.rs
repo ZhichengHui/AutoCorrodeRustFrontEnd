@@ -192,7 +192,8 @@ impl<'tcx> Frontend<'tcx> {
                 let args = tcx.mk_args_from_iter(
                     r.args.iter().chain((0..own).map(|_| tcx.lifetimes.re_erased.into())),
                 );
-                Ty::new_projection(tcx, ty::IsRigid::No, i.def_id, args)
+                // with erased regions, as the types the slots stand for in (erased) signatures
+                tcx.erase_and_anonymize_regions(Ty::new_projection(tcx, ty::IsRigid::No, i.def_id, args))
             })
             .collect();
         for p in self.dict_parents(r.def_id) {
