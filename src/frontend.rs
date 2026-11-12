@@ -284,6 +284,12 @@ impl<'tcx> Frontend<'tcx> {
         if !self.mono_fns.contains(&did) || args.has_param() || !args.types().all(|t| self.ty_dry(t).1) {
             return Some((did, Inst::Generic));
         }
+        self.instance(did, args)
+    }
+
+    /// The instance of the local item `did` at the concrete generic arguments `args` (queued for
+    /// translation the first time). `None` if `did` already has `MAX_INSTANCES` instances.
+    pub fn instance(&mut self, did: DefId, args: GenericArgsRef<'tcx>) -> Option<FnKey<'tcx>> {
         let args = self.tcx.erase_and_anonymize_regions(args);
         if !self.instance_names.contains_key(&(did, args)) {
             let count = self.instances_per_fn.entry(did).or_insert(0);
@@ -527,6 +533,10 @@ impl<'tcx> Frontend<'tcx> {
             "SliceIter"
         } else if diag(Symbol::intern("Enumerate")) {
             "Enumerate"
+        } else if diag(sym::HashMap) {
+            "HashMap"
+        } else if diag(Symbol::intern("HashMapEntry")) {
+            "HashMapEntry"
         } else if let Some(&(_, n)) = self.std_adts.iter().find(|(d, _)| *d == did) {
             n
         } else {
@@ -540,9 +550,16 @@ impl<'tcx> Frontend<'tcx> {
         let ty::Adt(def, args) = t.kind() else { return None };
         let inner = |i: usize| args.types().nth(i).expect("type argument of an iterator adapter");
         Some(match (self.std_adt(def.did())?, back) {
-            ("SliceIter" | "Lines" | "SplitWhitespace" | "Chars", false) => "list_iter_next".into(),
-            ("SliceIter" | "Lines" | "SplitWhitespace" | "Chars", true) => "list_iter_next_back".into(),
+            ("SliceIter" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", false) => "list_iter_next".into(),
+            ("SliceIter" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", true) => "list_iter_next_back".into(),
             ("ChunksExact", false) => "chunks_exact_next".into(),
+            ("Chunks", false) => "chunks_next".into(),
+            // `Filter::next` is the inner `find`, which takes the crate's fuel
+            ("Filter", false) => format!("(filter_next urust_fuel {})", self.iter_step(inner(0), false)?),
+            // `a..` over an unsigned integer (its state is the next value, see `ty`)
+            ("RangeFrom", false) if matches!(inner(0).kind(), ty::Uint(_)) => "range_from_next".into(),
+            // `a..b` over an unsigned integer (a `range` record)
+            ("Range", false) if matches!(inner(0).kind(), ty::Uint(_)) => "range_next".into(),
             ("Enumerate", false) => format!("(enumerate_next {})", self.iter_step(inner(0), false)?),
             ("Zip", false) => format!("(zip_next {} {})", self.iter_step(inner(0), false)?, self.iter_step(inner(1), false)?),
             ("Skip", false) => format!("(skip_next {})", self.iter_step(inner(0), false)?),
@@ -776,7 +793,22 @@ impl<'tcx> Frontend<'tcx> {
                     Some("RangeFull") => "unit".into(),
                     // iterators by their states (see `iter_step` and `STD_MODELS.md`): the remaining
                     // elements of a sequence, or an adapter's fields with the inner iterator's state
-                    Some("SliceIter") => format!("{} list", paren_ty(&self.ty(targs[0]))),
+                    Some("SliceIter") | Some("VecIntoIter") => format!("{} list", paren_ty(&self.ty(targs[0]))),
+                    Some("Chunks") => format!("({} list \\<times> 64 word \\<times> tnil)", paren_ty(&self.ty(targs[0]))),
+                    Some("Filter") => {
+                        format!("({} \\<times> {} \\<times> tnil)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    // a hash map whose iteration order is not observed: its entries (see `STD_MODELS.md`)
+                    Some("HashMap") => {
+                        format!("(({} \\<times> {} \\<times> tnil) list)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    // an entry: the map (a reference to it) and the key
+                    Some("HashMapEntry") => format!(
+                        "(('addr, 'gv, ({} \\<times> {} \\<times> tnil) list) Global_Store.ref \\<times> {} \\<times> tnil)",
+                        paren_ty(&self.ty(targs[0])),
+                        paren_ty(&self.ty(targs[1])),
+                        paren_ty(&self.ty(targs[0]))
+                    ),
                     Some("Lines") | Some("SplitWhitespace") => "String.literal list".into(),
                     Some("Chars") => "char list".into(),
                     Some("ChunksExact") => {
@@ -1029,8 +1061,8 @@ impl<'tcx> Frontend<'tcx> {
             "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" | "RangeFrom" | "RangeTo" | "RangeToInclusive" => Some(1),
             "String" | "Ordering" | "Formatter" | "FmtError" | "RangeFull" => Some(0),
             // the iterators keep all their type arguments (see `ty`)
-            "SliceIter" | "ChunksExact" | "Enumerate" | "Skip" | "Take" | "Rev" | "Copied" | "Cloned" => Some(1),
-            "Zip" | "TakeWhile" | "Map" => Some(2),
+            "SliceIter" | "ChunksExact" | "Chunks" | "VecIntoIter" | "Enumerate" | "Skip" | "Take" | "Rev" | "Copied" | "Cloned" => Some(1),
+            "Zip" | "TakeWhile" | "Map" | "Filter" | "HashMap" | "HashMapEntry" => Some(2),
             "Lines" | "SplitWhitespace" | "Chars" | "ParseIntError" | "TryFromSliceError" => Some(0),
             _ => None,
         }
@@ -1157,6 +1189,7 @@ fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
             ("take", "Take"),
             ("take_while", "TakeWhile"),
             ("map", "Map"),
+            ("filter", "Filter"),
             ("rev", "Rev"),
             ("copied", "Copied"),
             ("cloned", "Cloned"),
@@ -1167,7 +1200,7 @@ fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
         methods_of(tcx.parent(sw), &[("split_whitespace", "SplitWhitespace"), ("lines", "Lines"), ("chars", "Chars")]);
     }
     if let Some(si) = tcx.get_diagnostic_item(Symbol::intern("slice_iter")) {
-        methods_of(tcx.parent(si), &[("chunks_exact", "ChunksExact")]);
+        methods_of(tcx.parent(si), &[("chunks_exact", "ChunksExact"), ("chunks", "Chunks")]);
     }
     // `<u8 as FromStr>::Err`: the associated type `Err` of the implementation of `FromStr` (the
     // trait of the method `from_str_method`) for `u8`
@@ -1179,6 +1212,20 @@ fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
                 && let ty::Adt(d, _) = tcx.type_of(err.def_id).instantiate_identity().skip_normalization().kind()
             {
                 out.push((d.did(), "ParseIntError"));
+            }
+        }
+    }
+    // `vec::IntoIter`: the associated type `IntoIter` of the implementation of `IntoIterator` for
+    // `Vec<T>` (by value)
+    if let (Some(into_iter), Some(vec)) = (tcx.get_diagnostic_item(sym::IntoIterator), tcx.get_diagnostic_item(sym::Vec)) {
+        for imp in tcx.all_impls(into_iter).collect::<Vec<_>>() {
+            let self_ty = tcx.type_of(imp).instantiate_identity().skip_normalization();
+            if !matches!(self_ty.kind(), ty::Adt(d, _) if d.did() == vec) { continue }
+            let it = tcx.associated_items(imp).filter_by_name_unhygienic(Symbol::intern("IntoIter")).next();
+            if let Some(it) = it
+                && let ty::Adt(d, _) = tcx.type_of(it.def_id).instantiate_identity().skip_normalization().kind()
+            {
+                out.push((d.did(), "VecIntoIter"));
             }
         }
     }

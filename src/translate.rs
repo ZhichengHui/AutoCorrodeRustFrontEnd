@@ -146,15 +146,10 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         fe.def_name(d);
     }
     // A function with const generic parameters only at its instances (see `local_callee`). A
-    // function translated per instance (see `mono_fns`) that the crate does not export is
-    // translated generically only when a definition refers to its generic version, or when it
-    // has no instance (see below): its generic version cannot translate what needs the instances.
-    let exported = tcx.effective_visibilities(());
-    let deferred: HashSet<DefId> = bodies
-        .iter()
-        .copied()
-        .filter(|&d| fe.mono_fns.contains(&d) && !fe.has_const_params(d) && d.as_local().is_some_and(|l| !exported.is_exported(l)))
-        .collect();
+    // function translated per instance (see `mono_fns`) is translated generically only when a
+    // definition refers to its generic version, or when it has no instance (see below): its
+    // generic version cannot translate what needs the instances.
+    let deferred: HashSet<DefId> = bodies.iter().copied().filter(|&d| fe.mono_fns.contains(&d) && !fe.has_const_params(d)).collect();
     for &d in &bodies {
         if !fe.has_const_params(d) && !deferred.contains(&d) {
             translate_item(&mut fe, (d, Inst::Generic));
@@ -370,6 +365,16 @@ struct GenericCalls<'a, 'tcx> {
 impl<'a, 'tcx> GenericCalls<'a, 'tcx> {
     fn call(&mut self, did: DefId, args: ty::GenericArgsRef<'tcx>) {
         if !args.has_param() {
+            return;
+        }
+        // a method of `HashMap` or of its `Entry`: its model needs the key's equality to be
+        // structural, which only an instance shows (see `BodyTr::std_call`)
+        let parent = self.tcx.parent(did);
+        if matches!(self.tcx.def_kind(parent), DefKind::Impl { of_trait: false })
+            && let ty::Adt(d, _) = self.tcx.type_of(parent).instantiate_identity().skip_normalization().kind()
+            && matches!(self.fe.std_adt(d.did()), Some("HashMap" | "HashMapEntry"))
+        {
+            self.dependent = true;
             return;
         }
         if let Some(tr) = self.tcx.trait_of_assoc(did) {
@@ -1199,8 +1204,14 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
             writeln!(te, "(* {} *)\ndatatype ({}) {} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
         }
     }
+    te.push_str("end\n");
     // the external ADTs declared with their constructors (see `ExtType::ctors`), each after the
-    // ones its fields use; types using each other are one datatype declaration
+    // ones its fields use; types using each other are one datatype declaration. They are complete
+    // translations, not templates: their own theory.
+    let mut tx = header(&format!("{}_TypesExternal", c));
+    writeln!(tx, "  imports {}_TypesExternal_Template\nbegin\n", c).unwrap();
+    tx.push_str(GROUND);
+    tx.push_str("text \\<open>External types declared with their constructors (all their fields have models).\\<close>\n\n");
     let mut left: Vec<&String> = fe.ext_types.iter().filter(|(_, t)| !t.ctors.is_empty()).map(|(n, _)| n).collect();
     let mut mks = String::new();
     while !left.is_empty() {
@@ -1216,7 +1227,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
                 .iter()
                 .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
                 .collect();
-            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
+            writeln!(tx, "(* {} *)", cmt(&t.comment)).unwrap();
             decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
             for (c, fs) in &t.ctors {
                 if !fs.is_empty() {
@@ -1224,14 +1235,14 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
                 }
             }
         }
-        writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+        writeln!(tx, "datatype {}\n", decls.join("\nand ")).unwrap();
         left.retain(|n| !group.contains(n));
     }
-    te.push_str(&mks);
-    te.push_str("end\n");
+    tx.push_str(&mks);
+    tx.push_str("end\n");
 
     let mut ty = header(&format!("{}_Types", c));
-    writeln!(ty, "  imports {}_TypesExternal_Template\nbegin\n", c).unwrap();
+    writeln!(ty, "  imports {}_TypesExternal\nbegin\n", c).unwrap();
     ty.push_str(GROUND);
     ty.push_str(&types_text);
     ty.push_str("end\n");
@@ -1295,6 +1306,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
 
     let files = [
         (format!("{}_TypesExternal_Template.thy", c), te),
+        (format!("{}_TypesExternal.thy", c), tx),
         (format!("{}_Types.thy", c), ty),
         (format!("{}_Locale.thy", c), lo),
         (format!("{}_FunsExternal_Template.thy", c), fx),

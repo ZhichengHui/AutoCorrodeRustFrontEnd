@@ -194,6 +194,8 @@ pub struct BodyTr<'a, 'tcx> {
     /// the results of a `let`'s initializer that borrow subslices, translated as their bounds (the
     /// range, if any, and the sequence's length; see `let_subslice`)
     given: HashMap<HirId, (Option<&'tcx hir::Expr<'tcx>>, Tr)>,
+    /// the mutable locals holding the values of the `loop`s being translated that produce one
+    loop_results: HashMap<HirId, String>,
 }
 
 /// The arguments of a call (or the iterable of a `for` loop) whose mutable borrows of subslices
@@ -230,6 +232,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             call_scope: None,
             write_back_after: HashMap::new(),
             given: HashMap::new(),
+            loop_results: HashMap::new(),
         }
     }
 
@@ -1369,6 +1372,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if let Some(t) = self.fmt_call(did, &arg_exprs, e)? {
                     return Ok(t);
                 }
+                if let Some(t) = self.encode_utf8_bytes(did, recv)? {
+                    return Ok(t);
+                }
                 let (argv, prelude, post) = self.call_args(&arg_exprs)?;
                 let c = self.call_def(did, gargs, argv, &arg_exprs, e)?;
                 self.with_writeback(c, prelude, post, e, &arg_exprs)
@@ -1453,7 +1459,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::AddrOf(..) => unsup("raw borrow"),
             ExprKind::Break(dest, None) => Ok(loop_jump("break", dest)),
-            ExprKind::Break(_, Some(_)) => unsup("`break` with a value"),
+            // `break v` out of a `loop` producing a value: the loop's result is set (see `loop_expr`)
+            ExprKind::Break(dest, Some(v)) => match dest.target_id.ok().and_then(|t| self.loop_results.get(&t).cloned()) {
+                Some(res) => {
+                    let v = self.val(v)?;
+                    Ok(Tr::block(format!("{{ * {} = {}; {} }}", res, v.at(40), loop_jump("break", dest).s)))
+                }
+                None => unsup("`break` with a value"),
+            },
             ExprKind::Continue(dest) => Ok(loop_jump("continue", dest)),
             ExprKind::Ret(v) => match v {
                 Some(v) => {
@@ -1598,7 +1611,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 self.const_use(did, e)
             }
             Res::Def(DefKind::Fn | DefKind::AssocFn, _) => self.fn_item_value(e),
-            Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) => unsup("constructor used as a function value"),
+            Res::Def(DefKind::Ctor(of, CtorKind::Fn), ctor) => self.ctor_value(of, ctor, e),
             // a const generic parameter in an instance: its value there (an integer or `bool`)
             Res::Def(DefKind::ConstParam, p) if let Inst::Mono(args) = self.key.1 => {
                 let i = self.tcx.generics_of(self.key.0).param_def_id_to_index(self.tcx, p).expect("const parameter of the item");
@@ -2218,7 +2231,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => unsup("constructor of a standard library type"),
             };
         }
-        if argv.len() > 8 { return unsup("constructor with more than 8 fields") }
+        if argv.len() > 8 {
+            if !adt.is_local() { return unsup("constructor with more than 8 fields") }
+            return Ok(self.ctor_many(adt, vidx, argv, vec![]));
+        }
         if !adt.is_local() {
             // an external ADT declared with its constructors (see `ExtType::ctors`)
             return match self.fe.ext_ctor(adt, vidx) {
@@ -2233,9 +2249,39 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::new(format!("{}({})", n, a.join(", ")), 999))
     }
 
+    /// A local constructor applied to more than 8 values (more than a uRust call or record
+    /// expression takes): the values bound in order (after `pre`), then the HOL constructor applied
+    /// to them.
+    fn ctor_many(&mut self, adt: DefId, vidx: usize, vals: Vec<Tr>, pre: Vec<String>) -> Tr {
+        let mut lets = pre;
+        let mut names = vec![];
+        for v in vals {
+            let n = self.fresh("fld");
+            lets.push(format!("let {} = {};", n, v.at(20)));
+            names.push(n);
+        }
+        let c = self.fe.variant_ctor_name(adt, vidx);
+        Tr::block(format!("{{\n{}\n\\<llangle>{} {}\\<rrangle>\n}}", lets.join("\n"), c, names.join(" ")))
+    }
+
     /// A call of the local function `did` at the generic arguments `args`.
     fn local_call(&mut self, did: DefId, args: GenericArgsRef<'tcx>, argv: Vec<Tr>) -> R<Tr> {
         let (key, kargs) = self.local_callee(did, args)?;
+        // a dictionary that cannot be built at this call (e.g. of a derived implementation whose
+        // methods have no model): the instance at the call's concrete arguments, which needs none
+        let dicts = self.callee_dicts(key, kargs);
+        if let Err(err) = &dicts
+            && key.1 == Inst::Generic
+            && !self.fe.is_trait_item(did)
+            && !args.has_param()
+            && args.types().all(|t| self.fe.ty_dry(t).1)
+        {
+            let Some(inst) = self.fe.instance(did, args) else { return Err(Unsup(err.0.clone())) };
+            self.calls.insert(inst);
+            let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
+            let m = self.fe.marker(inst);
+            return Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a));
+        }
         // a recursive group is defined with fixed type arguments (`translate::emit_funs`): a
         // generic function calling itself at other ones (polymorphic recursion) cannot be
         if key == self.key && !matches!(key.1, Inst::Mono(_)) {
@@ -2248,7 +2294,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 return unsup("recursive call at other type arguments (polymorphic recursion)");
             }
         }
-        let dicts = self.callee_dicts(key, kargs)?;
+        let dicts = dicts?;
         self.calls.insert(key);
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
         // an instance takes neither dictionaries nor an allocation record
@@ -2409,6 +2455,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 "clone_from" => Some("\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>".to_string()),
                 _ => None,
             };
+        }
+        // `Eq`'s hidden `assert_receiver_is_total_eq` (a compile-time check): does nothing
+        if tcx.is_diagnostic_item(sym::Eq, tr) && name.as_str() == "assert_receiver_is_total_eq" {
+            return Some("\\<lambda>x. FunctionBody (literal ())".to_string());
         }
         let this = r.self_ty();
         let rhs = r.args.types().nth(1);
@@ -2740,6 +2790,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         "zip" => Zip,
                         "skip" => Skip,
                         "take" => Take,
+                        "filter" => Filter,
+                        "any" => Any,
+                        "min" => Min,
                         "take_while" => TakeWhile,
                         "map" => Map,
                         "rev" | "copied" | "cloned" => Same,
@@ -2762,6 +2815,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 ty::Adt(def, _) => self.fe.std_adt(def.did())?,
                 ty::Slice(_) => "slice",
                 ty::Str => "str",
+                ty::Char => "char",
                 ty::Uint(_) => "uint",
                 ty::Int(_) => "int",
                 _ => return None,
@@ -2806,6 +2860,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("slice", "get") => SliceGet,
             ("slice", "copy_within") => SliceCopyWithin,
             ("slice", "chunks_exact") => Model("slice_chunks_exact"),
+            ("slice", "chunks") => Model("slice_chunks"),
             ("slice", "copy_from_slice") => Model("slice_copy_from_slice"),
             ("slice", "fill") => Model("slice_fill"),
             ("slice", "reverse") => Model("slice_reverse"),
@@ -2816,6 +2871,20 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("Vec", "into_boxed_slice") => Conversion,
             // the capacity is not modelled
             ("Vec", "shrink_to_fit") => Model("vec_shrink_to_fit"),
+            ("Vec", "swap_remove") => Model("vec_swap_remove"),
+            ("Vec", "dedup") => VecDedup,
+            ("slice", "sort") => SliceSort,
+            // a hash map whose iteration order is not observed (see `STD_MODELS.md`)
+            ("HashMap", "new") => ModelTyped("hashmap_new"),
+            ("HashMap", "len") => Model("hashmap_len"),
+            ("HashMap", "is_empty") => Model("hashmap_is_empty"),
+            ("HashMap", "contains_key") => HashMapKey("hashmap_contains_key"),
+            ("HashMap", "get") => HashMapKey("hashmap_get"),
+            ("HashMap", "get_mut") => HashMapKey("hashmap_get_mut"),
+            ("HashMap", "insert") => HashMapKey("hashmap_insert"),
+            ("HashMap", "remove") => HashMapKey("hashmap_remove"),
+            ("HashMap", "entry") => HashMapKey("hashmap_entry"),
+            ("HashMapEntry", "or_insert") => Model("hashmap_entry_or_insert"),
             ("str", "lines") => Model("str_lines"),
             ("str", "split_whitespace") => Model("str_split_whitespace"),
             ("str", "chars") => Model("str_chars"),
@@ -3009,6 +3078,35 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 None => None,
             },
             Iter(k) => self.iter_call(k, argv, arg_exprs, e),
+            // the key `K`: the first type argument of `HashMap<K, V, S>`; a borrowed key `&Q` must
+            // have its HOL type
+            HashMapKey(n) => {
+                let k = gargs.types().next().filter(|k| !k.has_param() && self.structural_eq_ty(*k, &mut vec![]));
+                let key_arg_ok = |this: &mut Self, k: Ty<'tcx>| {
+                    arg_exprs.get(1).is_none_or(|x| this.fe.ty(this.ty_adj(x).peel_refs()) == this.fe.ty(k))
+                };
+                match k {
+                    Some(k) if key_arg_ok(self, k) => Some(self.named_call(n, argv.to_vec())),
+                    _ => None,
+                }
+            }
+            SliceSort => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
+                ty::Slice(t) => {
+                    let c = self.ord_cmp_term(*t, &mut vec![]);
+                    c.map(|c| self.named_call("slice_sort_by", vec![Tr::atom(format!("\\<llangle>{}\\<rrangle>", c)), a(0)]))
+                }
+                _ => None,
+            },
+            VecDedup => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
+                ty::Adt(_, va) if self.structural_eq_ty(va.type_at(0), &mut vec![]) => Some(self.named_call("vec_dedup", vec![a(0)])),
+                _ => None,
+            },
+            PartialCmp => {
+                let l = self.ty_adj(arg_exprs[0]).peel_refs();
+                let r = self.ty_adj(arg_exprs[1]).peel_refs();
+                (matches!(l.kind(), ty::Uint(_)) && l == r).then(|| self.named_call("partial_cmp_word", vec![a(0), a(1)]))
+            }
+            DefaultFn if argv.is_empty() => self.default_value(self.ty_of(e), &mut vec![])?,
             // the models of AutoCorrode's `StdLib_Frontend_Models`
             VecPush => Some(self.named_call("vec_push", vec![a(0), a(1)])),
             VecPop => Some(self.named_call("vec_pop", vec![a(0)])),
@@ -3026,6 +3124,127 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(r)
     }
 
+    /// Whether `PartialEq` on `t` is structural (HOL's equality): on the primitive types, `str`,
+    /// `String`, and the tuples, arrays, slices, `Vec`s and `Option`s of such types, and on local
+    /// ADTs whose `PartialEq` is derived, with such fields. `seen`: the ADTs being checked.
+    fn structural_eq_ty(&self, t: Ty<'tcx>, seen: &mut Vec<DefId>) -> bool {
+        match t.kind() {
+            ty::Uint(_) | ty::Int(_) | ty::Bool | ty::Char | ty::Str => true,
+            ty::Ref(_, x, _) | ty::Slice(x) | ty::Array(x, _) => self.structural_eq_ty(*x, seen),
+            ty::Tuple(ts) => ts.iter().all(|x| self.structural_eq_ty(x, seen)),
+            ty::Adt(d, args) => match self.fe.std_adt(d.did()) {
+                Some("String") => true,
+                Some("Vec" | "Option") => self.structural_eq_ty(args.type_at(0), seen),
+                Some(_) => false,
+                None if d.did().is_local() => {
+                    if seen.contains(&d.did()) { return true }
+                    let Some(eq) = self.tcx.lang_items().eq_trait() else { return false };
+                    let first_fn = self.tcx.associated_items(eq).in_definition_order().find(|i| i.is_fn()).map(|i| i.def_id);
+                    let Some(m) = first_fn else { return false };
+                    let derived = matches!(
+                        self.resolve_instance(m, self.tcx.mk_args(&[t.into(), t.into()])),
+                        Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
+                    );
+                    seen.push(d.did());
+                    derived && d.all_fields().all(|f| self.structural_eq_ty(f.ty(self.tcx, args).skip_normalization(), seen))
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The HOL comparison (`'a => 'a => ordering`) of `Ord::cmp` on `t`: on unsigned and signed
+    /// integers, `bool` and `char` by their values, and on local structs whose `Ord` is derived,
+    /// lexicographically by their fields (with such comparisons).
+    fn ord_cmp_term(&mut self, t: Ty<'tcx>, seen: &mut Vec<DefId>) -> Option<String> {
+        match t.kind() {
+            ty::Uint(_) | ty::Bool => Some("ord_cmp".into()),
+            ty::Int(_) => Some("(\\<lambda>a b. ord_cmp (sint a) (sint b))".into()),
+            ty::Char => Some("(\\<lambda>a b. ord_cmp (of_char a :: nat) (of_char b))".into()),
+            ty::Adt(d, args) if d.is_struct() && d.did().is_local() && self.fe.record_adts.contains(&d.did()) && !seen.contains(&d.did()) => {
+                let ord = self.tcx.get_diagnostic_item(sym::Ord)?;
+                let cmp = self.tcx.associated_items(ord).filter_by_name_unhygienic(sym::cmp).next()?.def_id;
+                let derived = matches!(
+                    self.resolve_instance(cmp, self.tcx.mk_args(&[t.into()])),
+                    Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
+                );
+                if !derived { return None }
+                seen.push(d.did());
+                let mut parts = vec![];
+                for (i, f) in d.all_fields().enumerate() {
+                    let c = self.ord_cmp_term(f.ty(self.tcx, args).skip_normalization(), seen)?;
+                    let sel = self.fe.field_name(d.did(), 0, i);
+                    parts.push(format!("({} ({} a) ({} b))", c, sel, sel));
+                }
+                seen.pop();
+                let body = parts.iter().rev().fold(None, |acc: Option<String>, p| {
+                    Some(match acc {
+                        None => p.clone(),
+                        Some(r) => format!("(ordering_then {} {})", p, r),
+                    })
+                });
+                Some(format!("(\\<lambda>a b. {})", body.unwrap_or_else(|| "Equal".into())))
+            }
+            _ => None,
+        }
+    }
+
+    /// `Default::default()` of `t`: of the integer types, `bool`, `char`, `Option`, `Vec`, `String`,
+    /// tuples and arrays of such types, and of local structs whose `Default` is derived (the
+    /// defaults of their fields).
+    fn default_value(&mut self, t: Ty<'tcx>, seen: &mut Vec<DefId>) -> R<Option<Tr>> {
+        Ok(Some(match t.kind() {
+            ty::Uint(_) | ty::Int(_) => Self::int_lit(0, false, t)?,
+            ty::Bool => Tr::atom("false"),
+            ty::Char => Tr::atom("\\<llangle>CHR 0x00\\<rrangle>"),
+            ty::Tuple(ts) if ts.is_empty() => Tr::atom("()"),
+            ty::Tuple(ts) if ts.len() >= 2 => {
+                let mut vs = vec![];
+                for x in ts.iter() {
+                    let Some(v) = self.default_value(x, seen)? else { return Ok(None) };
+                    vs.push(v.at(11));
+                }
+                Tr::atom(format!("({})", vs.join(", ")))
+            }
+            ty::Array(x, n) => {
+                let Some(n) = n.try_to_target_usize(self.tcx) else { return Ok(None) };
+                let Some(v) = self.default_value(*x, seen)? else { return Ok(None) };
+                let n = Self::int_lit(n as u128, false, self.tcx.types.usize)?;
+                self.named_call("vec_from_elem", vec![v, n])
+            }
+            ty::Adt(d, args) => match self.fe.std_adt(d.did()) {
+                Some("Option") => {
+                    let h = self.hty(t);
+                    self.typed("dflt", Tr::atom("None"), &h)
+                }
+                Some("Vec") => {
+                    let h = self.hty(t);
+                    self.typed("dflt", Tr::atom("[]"), &h)
+                }
+                Some("String") => Tr::atom(format!("\\<llangle>STR {}{}\\<rrangle>", "''", "''")),
+                None if d.is_struct() && d.did().is_local() && !seen.contains(&d.did()) => {
+                    let Some(dflt) = self.tcx.get_diagnostic_item(Symbol::intern("default_fn")) else { return Ok(None) };
+                    let derived = matches!(
+                        self.resolve_instance(dflt, self.tcx.mk_args(&[t.into()])),
+                        Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
+                    );
+                    if !derived { return Ok(None) }
+                    seen.push(d.did());
+                    let mut vs = vec![];
+                    for f in d.all_fields() {
+                        let Some(v) = self.default_value(f.ty(self.tcx, args).skip_normalization(), seen)? else { return Ok(None) };
+                        vs.push(v);
+                    }
+                    seen.pop();
+                    self.ctor_call(d.did(), 0, vs)?
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        }))
+    }
+
     /// A method of `Iterator` (see `std_fn`) called on an iterator with a model (see
     /// `Frontend::iter_step`). An adapter's state is its fields, the inner iterator's state first
     /// (see `Frontend::ty`); the methods that run the iterator to its end take the crate's fuel.
@@ -3039,9 +3258,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let fuel = Tr::atom("\\<llangle>urust_fuel\\<rrangle>".to_string());
         use IterFn::*;
         match k {
-            // `next(&mut self)`: on the iterator itself (not through a further reference)
+            // `next(&mut self)`, `any(&mut self, f)`: on the iterator itself (not through a further
+            // reference)
             Next => match recv.kind() {
                 ty::Ref(_, it, m) if m.is_mut() => step(self, *it).map(|s| self.named_call("iter_ref_next", vec![s, a(0)])),
+                _ => None,
+            },
+            Any => match recv.kind() {
+                ty::Ref(_, it, m) if m.is_mut() => step(self, *it).map(|s| self.named_call("iter_ref_any", vec![fuel, s, a(1), a(0)])),
                 _ => None,
             },
             // the adapters take the iterator by value
@@ -3055,10 +3279,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let other = self.ty_adj(arg_exprs[1]).peel_refs();
                 (modelled(self, res) && self.fe.ty(other) == self.fe.ty(b)).then(|| tuple(vec![a(0).s, a(1).s]))
             }
-            Skip | Take | Map if modelled(self, res) => Some(tuple(vec![a(0).s, a(1).s])),
+            Skip | Take | Map | Filter if modelled(self, res) => Some(tuple(vec![a(0).s, a(1).s])),
             TakeWhile if modelled(self, res) => Some(tuple(vec![a(0).s, "False".into(), a(1).s])),
             Same if modelled(self, res) => Some(a(0)),
-            Count => step(self, recv).map(|s| self.named_call("iter_count", vec![fuel, s, a(0)])),
+            Count => step(self, recv).map(|s| self.named_call("iter_count", vec![fuel.clone(), s, a(0)])),
+            // the least of unsigned integers
+            Min => match res.kind() {
+                ty::Adt(_, oa) if matches!(oa.types().next().map(|t| *t.kind()), Some(ty::Uint(_))) => {
+                    step(self, recv).map(|s| self.named_call("iter_min", vec![fuel.clone(), s, a(0)]))
+                }
+                _ => None,
+            },
             Collect => match res.kind() {
                 ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("Vec") => {
                     step(self, recv).map(|s| self.named_call("iter_collect_list", vec![fuel, s, a(0)]))
@@ -3192,7 +3423,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         } else if def.is_enum() {
             self.ctor_call(adt, vidx, vals)?
         } else {
-            if nf > 8 { return unsup("struct with more than 8 fields") }
+            if nf > 8 { return Ok(self.ctor_many(adt, vidx, vals, pre)) }
             let n = self.fe.variant_call_name(adt, vidx);
             let fs: Vec<String> = (0..nf).map(|k| {
                 let fname = self.fe.field_name(adt, vidx, k);
@@ -3302,8 +3533,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, label: Option<Label>, src: LoopSource) -> R<Tr> {
         let lbl = loop_label(label);
         let t = self.ty_of(e);
+        // a `loop` producing a value: a mutable local holds it, set by the `break`s (it stays
+        // `undefined` if the loop runs out of fuel, as `let x;` without a value)
         if !(t.is_unit() || t.is_never()) {
-            return unsup("loop producing a value (`break` with a value)");
+            if !matches!(src, LoopSource::Loop) { return unsup("loop producing a value (`break` with a value)") }
+            let a = self.alloc(t)?;
+            let res = self.fresh("lres");
+            let h = self.hty(t);
+            let init = self.let_binding(&res, hir::Mutability::Mut, &a, &format!("\\<llangle>undefined :: {}\\<rrangle>", h));
+            self.loop_results.insert(e.hir_id, res.clone());
+            let body = self.block_seq(b.stmts, b.expr);
+            self.loop_results.remove(&e.hir_id);
+            return Ok(Tr::block(format!("{{\n{}\n{} {}loop {{\n{}\n}};\n* {}\n}}", init, FUEL, lbl, body?, res)));
         }
         match src {
             LoopSource::While => {
@@ -3951,6 +4192,47 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// A function item `f` used as a value: the closure `|a1, .., an| f(a1, .., an)` (for a
     /// local function, or a trait method resolved to a local implementation), with its type
     /// stated as for closures.
+    /// `c.encode_utf8(buf).as_bytes()`: `char_encode_utf8_bytes(c, buf)`, the bytes of the encoding,
+    /// also written to the buffer; the `&mut str` in between (which `String.literal` cannot hold
+    /// for a non-ASCII character) is not kept. `None` for other calls.
+    fn encode_utf8_bytes(&mut self, did: DefId, recv: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
+        let tcx = self.tcx;
+        let is = |d: DefId, owner_is_char: bool, name: &str| {
+            tcx.item_name(d).as_str() == name
+                && matches!(tcx.def_kind(tcx.parent(d)), DefKind::Impl { of_trait: false })
+                && self.fe.is_std(d)
+                && match tcx.type_of(tcx.parent(d)).instantiate_identity().skip_normalization().kind() {
+                    ty::Char => owner_is_char,
+                    ty::Str => !owner_is_char,
+                    _ => false,
+                }
+        };
+        if !is(did, false, "as_bytes") { return Ok(None) }
+        let ExprKind::MethodCall(_, c, [buf], _) = recv.kind else { return Ok(None) };
+        let Some(inner) = self.typeck.type_dependent_def_id(recv.hir_id) else { return Ok(None) };
+        if !is(inner, true, "encode_utf8") { return Ok(None) }
+        let (argv, prelude, post) = self.call_args(&[c, buf])?;
+        let call = self.named_call("char_encode_utf8_bytes", argv);
+        Ok(Some(self.with_writeback(call, prelude, post, recv, &[c, buf])?))
+    }
+
+    /// A tuple-like constructor used as a function value: the closure calling it (as for function
+    /// items, see `fn_item_value`).
+    fn ctor_value(&mut self, of: CtorOf, ctor: DefId, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        let tcx = self.tcx;
+        let (adt, vidx) = self.ctor_variant(of, ctor);
+        let ty::FnDef(..) = self.ty_of(e).kind() else { return unsup("constructor used as a function value") };
+        let sig = tcx.instantiate_bound_regions_with_erased(self.ty_of(e).fn_sig(tcx));
+        let ps: Vec<String> = sig.inputs().iter().map(|_| self.fresh("carg")).collect();
+        let tys: Vec<String> = sig.inputs().iter().map(|t| self.hty(*t)).collect();
+        let ret = self.hty(sig.output());
+        let call = self.ctor_call(adt, vidx, ps.iter().map(|p| Tr::atom(p.clone())).collect())?;
+        let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
+        let h = self.fe.fun_type(&tys, &ret);
+        let tmp = self.fresh("closure");
+        Ok(Tr::block(format!("{{ let {} = ( {} {{\n{}\n}}); \\<llangle>{} :: {}\\<rrangle> }}", tmp, head, call.s, tmp, h)))
+    }
+
     fn fn_item_value(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         let tcx = self.tcx;
         let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
@@ -4181,6 +4463,16 @@ enum StdFn {
     SliceCopyWithin,
     /// `TryInto::try_into`, `TryFrom::try_from` from a slice to an array
     TryIntoArray,
+    /// a method of `HashMap` taking a key (by its model's name), for keys with structural equality
+    HashMapKey(&'static str),
+    /// `<[T]>::sort` by the `Ord` of the elements
+    SliceSort,
+    /// `Vec::dedup` with structural equality
+    VecDedup,
+    /// `PartialOrd::partial_cmp` on unsigned integers
+    PartialCmp,
+    /// `Default::default` of a standard type, or derived
+    DefaultFn,
     /// `str::starts_with` with a `char` or a `&str` pattern
     StrStartsWith,
     /// `str::parse` into an integer type
@@ -4208,6 +4500,9 @@ enum IterFn {
     Same,
     Count,
     Collect,
+    Filter,
+    Any,
+    Min,
 }
 
 /// A lang item, or a diagnostic item by its name in the table of the standard library.
@@ -4243,6 +4538,8 @@ const STD_ITEMS: &[(Item, StdFn)] = &[
     (Item::Diag("cmp_ord_max"), StdFn::OrdMax),
     (Item::Diag("mem_size_of"), StdFn::SizeOf),
     (Item::Diag("try_from_fn"), StdFn::TryIntoArray),
+    (Item::Diag("cmp_partialord_cmp"), StdFn::PartialCmp),
+    (Item::Diag("default_fn"), StdFn::DefaultFn),
 ];
 
 /// `if c1 { b1 } else { if c2 { b2 } else { .. } }` for (condition, body) branches;
