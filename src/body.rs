@@ -237,7 +237,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // normalised as the signature is (`translate`): in a generic body, in the item's own typing
         // environment, which also reveals its `impl Trait` types; an instance's types are already
         let t = match self.key.1 {
-            Inst::Generic => crate::frontend::normalize(self.tcx, self.typing_env(), ty::Unnormalized::new_wip(t)).unwrap_or(t),
+            Inst::Generic => crate::frontend::normalize(self.tcx, self.typing_env(), ty::Unnormalized::new_wip(t)),
             _ => t,
         };
         self.fe.ty(t)
@@ -1871,7 +1871,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let env = self.typing_env();
         let args = tcx.erase_and_anonymize_regions(args);
-        match crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(args)) {
+        match crate::frontend::try_normalize(tcx, env, ty::Unnormalized::new_wip(args)) {
             Ok(args) => ty::Instance::try_resolve(tcx, env, did, args),
             Err(_) => Ok(None),
         }
@@ -1883,7 +1883,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let env = self.typing_env();
         let r = tcx.erase_and_anonymize_regions(r);
-        let r = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(r)).unwrap_or(r);
+        let r = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(r));
         tcx.codegen_select_candidate(env.as_query_input(r)).map_err(|_| Unsup(format!("implementation of `{}`", r)))
     }
 
@@ -1928,7 +1928,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let tcx = self.tcx;
             let env = self.typing_env();
             let norm = |x: ty::Unnormalized<'tcx, Ty<'tcx>>| {
-                tcx.erase_and_anonymize_regions(crate::frontend::normalize(tcx, env, x).unwrap_or_else(|_| x.skip_normalization()))
+                tcx.erase_and_anonymize_regions(crate::frontend::normalize(tcx, env, x))
             };
             let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(key.0).instantiate_identity().skip_normalization());
             for t in sig.inputs_and_output {
@@ -2069,7 +2069,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let norm = |x: ty::TraitRef<'tcx>| {
             let x = tcx.erase_and_anonymize_regions(x);
-            crate::frontend::normalize(tcx, self.typing_env(), ty::Unnormalized::new_wip(x)).unwrap_or(x)
+            crate::frontend::normalize(tcx, self.typing_env(), ty::Unnormalized::new_wip(x))
         };
         if norm(p) == norm(r) {
             return Some(d);

@@ -215,7 +215,7 @@ pub fn word_enum_consts(n: &str) -> Vec<String> {
 }
 
 pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, f: &ty::FieldDef, args: GenericArgsRef<'tcx>, env: ty::TypingEnv<'tcx>) -> Ty<'tcx> {
-    tcx.erase_and_anonymize_regions(normalize(tcx, env, f.ty(tcx, args)).expect("a field type normalises"))
+    tcx.erase_and_anonymize_regions(try_normalize(tcx, env, f.ty(tcx, args)).expect("a field type normalises"))
 }
 
 /// `x` normalised in `env`, with erased regions. The aliases in types from type checking (and in
@@ -224,12 +224,20 @@ pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, f: &ty::FieldDef, args: GenericArgsRef<
 /// types), so they are first made non-rigid, as rustc does for MIR after type checking
 /// (`rustc_mir_transform::post_analysis_normalize`). Otherwise an `impl Trait` type is not revealed,
 /// and a projection on one is not normalised.
-pub fn normalize<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
+pub fn try_normalize<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
     tcx: TyCtxt<'tcx>,
     env: ty::TypingEnv<'tcx>,
     x: ty::Unnormalized<'tcx, T>,
 ) -> Result<T, ty::normalize_erasing_regions::NormalizationError<'tcx>> {
     tcx.try_normalize_erasing_regions(env, ty::set_aliases_to_non_rigid(tcx, x.skip_normalization()))
+}
+
+/// `x` normalised in `env` (see `try_normalize`), or `x` itself (with erased regions) where it does
+/// not normalise, as rustc keeps such types in MIR: a projection whose bound `env` implies only
+/// through an equality the trait solver does not use (resolvo: `<<I as Interner>::SolvableId as
+/// SolverId>::Set` under `I: Interner<SolvableId = S>`, without `S: SolverId`) stays a projection.
+pub fn normalize<'tcx, T: TypeFoldable<TyCtxt<'tcx>> + Copy>(tcx: TyCtxt<'tcx>, env: ty::TypingEnv<'tcx>, x: ty::Unnormalized<'tcx, T>) -> T {
+    try_normalize(tcx, env, x).unwrap_or_else(|_| tcx.erase_and_anonymize_regions(x.skip_normalization()))
 }
 
 pub fn paren_ty(s: &str) -> String {
@@ -408,7 +416,7 @@ impl<'tcx> Frontend<'tcx> {
             Some(args) => ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args),
             None => ty::Unnormalized::new_wip(x),
         };
-        normalize(self.tcx, env, x).unwrap_or_else(|_| x.skip_normalization())
+        normalize(self.tcx, env, x)
     }
 
     // ------------------------------------------------------------------
@@ -621,7 +629,7 @@ impl<'tcx> Frontend<'tcx> {
                 // stays a projection, which has none
                 def.all_fields().any(|f| {
                     let t = f.ty(tcx, args);
-                    let t = normalize(tcx, env, t).unwrap_or_else(|_| t.skip_normalization());
+                    let t = normalize(tcx, env, t);
                     self.has_cell(tcx.erase_and_anonymize_regions(t), env, seen)
                 })
             }
@@ -753,7 +761,7 @@ impl<'tcx> Frontend<'tcx> {
                     ty::Adt(def, args) => {
                         for &p in self.adt_projs.get(&def.did()).into_iter().flatten() {
                             let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
-                            add(normalize(self.tcx, env, at).unwrap_or(at.skip_normalization()), &mut out);
+                            add(normalize(self.tcx, env, at), &mut out);
                         }
                     }
                     _ => {}
@@ -845,7 +853,7 @@ impl<'tcx> Frontend<'tcx> {
                             for p in ps {
                                 let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
                                 let at = match self.proj_env {
-                                    Some(env) => normalize(self.tcx, env, at).unwrap_or_else(|_| at.skip_normalization()),
+                                    Some(env) => normalize(self.tcx, env, at),
                                     None => at.skip_normalization(),
                                 };
                                 a.push(self.ty(at));
@@ -865,7 +873,7 @@ impl<'tcx> Frontend<'tcx> {
                 if let Some(m) = self.proj_tvars.as_ref() && let Some(v) = self.proj_key(t).and_then(|a| m.get(&a)) {
                     return v.clone();
                 }
-                if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = normalize(self.tcx, ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
+                if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = try_normalize(self.tcx, ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
                     if !matches!(n.kind(), ty::Alias(..)) {
                         return self.ty(n);
                     }
@@ -950,7 +958,8 @@ impl<'tcx> Frontend<'tcx> {
         let comment = format!("Rust: {}", self.tcx.def_path_str(did));
         self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None, plain_enum: false });
         self.ext_type_ids.insert(did, n.clone());
-        // the fields' type parameters are the ADT's (see `ext_fun`)
+        // the fields' type parameters are the ADT's (see `ext_fun`; `ext_datatype` sets its own
+        // projections' type variables and typing environment)
         let fn_params = std::mem::take(&mut self.fn_params);
         let datatype = self.ext_datatype(did, &n);
         self.fn_params = fn_params;
@@ -1097,13 +1106,14 @@ impl<'tcx> Frontend<'tcx> {
         self.used_names.insert(n.clone());
         let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
         // the signature's type parameters are the external function's, not those of the item being
-        // translated, whose `Fn`-bounded parameters (by index) do not apply
-        let fn_params = std::mem::take(&mut self.fn_params);
+        // translated: its `Fn`-bounded parameters (by index), its projections' type variables and its
+        // typing environment do not apply (the signature's projections are `alias_tvars`)
+        let saved = (std::mem::take(&mut self.fn_params), self.proj_tvars.take(), self.proj_env.take());
         self.alias_tvars = Some(0);
         let params: Vec<String> = sig.inputs().iter().map(|t| self.ty(*t)).collect();
         let ret = self.ty(sig.output());
         self.alias_tvars = None;
-        self.fn_params = fn_params;
+        (self.fn_params, self.proj_tvars, self.proj_env) = saved;
         let hol_type = self.fun_type(&params, &ret);
         let ef = ExtFun { hol_name: n.clone(), rust_path: self.tcx.def_path_str(did), hol_type, arity: params.len() };
         if foreign { self.foreign_funs.insert(n.clone(), ef); } else { self.ext_funs.insert(n.clone(), ef); }

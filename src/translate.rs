@@ -435,7 +435,7 @@ fn slot_tvars<'tcx>(
     let tcx = fe.tcx;
     let norm = |t: Ty<'tcx>| {
         let t = tcx.erase_and_anonymize_regions(t);
-        crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
+        crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(t))
     };
     let slots = dicts.iter().flat_map(|(r, _)| fe.dict_slots(*r)).map(norm);
     let mut sig: Vec<Ty<'tcx>> = sig_tys.to_vec();
@@ -944,8 +944,7 @@ impl<'tcx> Allocs<'tcx> {
 fn at_call<'tcx>(fe: &Frontend<'tcx>, caller: FnKey<'tcx>, kargs: ty::GenericArgsRef<'tcx>, t: Ty<'tcx>) -> Ty<'tcx> {
     let tcx = fe.tcx;
     let x = ty::EarlyBinder::bind(tcx, t).instantiate(tcx, kargs);
-    // (normalisation fails only on impossible bounds; rustc keeps such types as they are too)
-    tcx.erase_and_anonymize_regions(crate::frontend::normalize(tcx, fe.inst_env(caller), x).unwrap_or_else(|_| x.skip_normalization()))
+    tcx.erase_and_anonymize_regions(crate::frontend::normalize(tcx, fe.inst_env(caller), x))
 }
 
 /// The HOL type of `t` in the context of the definition `d` (its projections' type variables and
