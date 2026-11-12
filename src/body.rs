@@ -18,7 +18,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::traits;
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeckResults};
+use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
 use crate::frontend::{FnKey, Frontend, GenCall, Inst};
@@ -31,25 +31,6 @@ fn unsup<T>(msg: impl Into<String>) -> R<T> {
     Err(Unsup(msg.into()))
 }
 
-/// Replaces the `impl Trait` types by their hidden types (those containing themselves are kept).
-struct RevealOpaque<'tcx>(TyCtxt<'tcx>);
-
-impl<'tcx> ty::TypeFolder<TyCtxt<'tcx>> for RevealOpaque<'tcx> {
-    fn cx(&self) -> TyCtxt<'tcx> {
-        self.0
-    }
-
-    fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Alias(_, a) = t.kind()
-            && let ty::AliasTyKind::Opaque { def_id } = a.kind
-            && let Ok(h) = self.0.try_expand_impl_trait_type(def_id, a.args)
-        {
-            return h;
-        }
-        t.super_fold_with(self)
-    }
-}
-
 /// `f(args)` for the HOL term `f` of a function value and the uRust arguments `a`.
 pub fn term_call(f: &str, a: &[String]) -> String {
     if a.len() <= 8 {
@@ -58,6 +39,11 @@ pub fn term_call(f: &str, a: &[String]) -> String {
         let wrapped: Vec<String> = a.iter().map(|x| format!("\\<lbrakk>{}\\<rbrakk>", x)).collect();
         format!("\\<epsilon>\\<open>funcall{} ({}) {}\\<close>", a.len(), f, wrapped.join(" "))
     }
+}
+
+/// `λns. t`, or `t` without names.
+fn lambda(ns: &[String], t: String) -> String {
+    if ns.is_empty() { t } else { format!("\\<lambda>{}. {}", ns.join(" "), t) }
 }
 
 /// A HOL term as an argument of an application: parenthesised unless it is a name.
@@ -186,6 +172,9 @@ pub struct BodyTr<'a, 'tcx> {
     pub comments: Vec<String>,
     /// the dictionary parameters of the body (see `Frontend::dict_params`)
     dicts: Vec<(ty::TraitRef<'tcx>, String)>,
+    /// while a dictionary field of an implementation is built (see `impl_dict`): the dictionaries
+    /// for the method's own bounds that the field takes, as `λ`-bound names
+    own_dicts: Vec<(ty::TraitRef<'tcx>, String)>,
 }
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
@@ -207,6 +196,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
             dicts: fe_dicts,
+            own_dicts: vec![],
         }
     }
 
@@ -256,10 +246,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // normalised as the signature is (`translate`): in a generic body, in the item's own typing
         // environment, which also reveals its `impl Trait` types; an instance's types are already
         let t = match self.key.1 {
-            Inst::Generic => self
-                .tcx
-                .try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(t))
-                .unwrap_or(t),
+            Inst::Generic => crate::frontend::normalize(self.tcx, self.typing_env(), ty::Unnormalized::new_wip(t)),
             _ => t,
         };
         self.fe.ty(t)
@@ -1833,19 +1820,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// A call of the local function `did` at the generic arguments `args`.
     fn local_call(&mut self, did: DefId, args: GenericArgsRef<'tcx>, argv: Vec<Tr>) -> R<Tr> {
+        // (polymorphic recursion is found once the recursive groups are known, see
+        // `translate::poly_rec_calls`)
         let (key, kargs) = self.local_callee(did, args)?;
-        // a recursive group is defined with fixed type arguments (`translate::emit_funs`): a
-        // generic function calling itself at other ones (polymorphic recursion) cannot be
-        if key == self.key && !matches!(key.1, Inst::Mono(_)) {
-            let owner = match key.1 {
-                Inst::ImplCopy(imp) => imp,
-                _ => key.0,
-            };
-            let ident = ty::GenericArgs::identity_for_item(self.tcx, owner);
-            if !self.tcx.erase_and_anonymize_regions(kargs).types().eq(ident.types()) {
-                return unsup("recursive call at other type arguments (polymorphic recursion)");
-            }
-        }
         let dicts = self.callee_dicts(key, kargs)?;
         self.calls.insert(key);
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
@@ -1892,8 +1869,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn resolve_instance(&self, did: DefId, args: GenericArgsRef<'tcx>) -> Result<Option<ty::Instance<'tcx>>, rustc_span::ErrorGuaranteed> {
         let tcx = self.tcx;
         let env = self.typing_env();
-        let args = tcx.erase_and_anonymize_regions(args.fold_with(&mut RevealOpaque(tcx)));
-        match tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(args)) {
+        let args = tcx.erase_and_anonymize_regions(args);
+        match crate::frontend::try_normalize(tcx, env, ty::Unnormalized::new_wip(args)) {
             Ok(args) => ty::Instance::try_resolve(tcx, env, did, args),
             Err(_) => Ok(None),
         }
@@ -1904,8 +1881,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn select(&self, r: ty::TraitRef<'tcx>) -> R<&'tcx traits::ImplSource<'tcx, ()>> {
         let tcx = self.tcx;
         let env = self.typing_env();
-        let r = tcx.erase_and_anonymize_regions(r.fold_with(&mut RevealOpaque(tcx)));
-        let r = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(r)).unwrap_or(r);
+        let r = tcx.erase_and_anonymize_regions(r);
+        let r = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(r));
         tcx.codegen_select_candidate(env.as_query_input(r)).map_err(|_| Unsup(format!("implementation of `{}`", r)))
     }
 
@@ -1946,16 +1923,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // IntoIterator>`, `<T as IntoIterator>::Item` is a projection of its own (the bound, not the
         // blanket implementation over `Iterator`), while the callee `fn callee<T: Iterator>(..) -> <T
         // as IntoIterator>::Item` has `<T as Iterator>::Item` through that implementation
-        if key.1 == Inst::Generic && matches!(self.tcx.def_kind(key.0), DefKind::Fn | DefKind::AssocFn) {
+        // (a default method's copy: its signature at its implementation's trait reference, and `kargs`
+        // the implementation's arguments)
+        if !matches!(key.1, Inst::Mono(_)) && matches!(self.tcx.def_kind(key.0), DefKind::Fn | DefKind::AssocFn) {
             let tcx = self.tcx;
             let env = self.typing_env();
             let norm = |x: ty::Unnormalized<'tcx, Ty<'tcx>>| {
-                tcx.erase_and_anonymize_regions(tcx.try_normalize_erasing_regions(env, x).unwrap_or_else(|_| x.skip_normalization()))
+                tcx.erase_and_anonymize_regions(crate::frontend::normalize(tcx, env, x))
             };
             let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(key.0).instantiate_identity().skip_normalization());
             for t in sig.inputs_and_output {
+                let declared = match self.fe.inst_args(key) {
+                    Some(a) => ty::EarlyBinder::bind(tcx, t).instantiate(tcx, a).skip_normalization(),
+                    None => t,
+                };
                 let callee_view = norm(ty::EarlyBinder::bind(tcx, self.fe.at_key(key, t)).instantiate(tcx, kargs));
-                if callee_view != norm(ty::EarlyBinder::bind(tcx, t).instantiate(tcx, kargs)) {
+                if callee_view != norm(ty::EarlyBinder::bind(tcx, declared).instantiate(tcx, kargs)) {
                     return unsup(format!(
                         "call of a generic function whose signature type `{}` is another type in the callee's typing environment",
                         t
@@ -1972,9 +1955,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(out)
     }
 
-    /// The dictionary for the trait reference `r` in the body: one of the body's dictionary
-    /// parameters (or a supertrait's in one), or an implementation's.
+    /// The dictionary for the trait reference `r` in the body: in a dictionary field, one the field
+    /// takes for its method's own bounds (see `impl_dict`); one of the body's dictionary parameters
+    /// (or a supertrait's in one), or an implementation's.
     fn dict_term(&mut self, r: ty::TraitRef<'tcx>) -> R<String> {
+        for k in 0..self.own_dicts.len() {
+            let (p, n) = self.own_dicts[k].clone();
+            if let Some(d) = self.bound_dict(p, n, r) {
+                return Ok(d);
+            }
+        }
         match self.select(r)? {
             traits::ImplSource::UserDefined(d) => self.impl_dict(d.impl_def_id, d.args),
             traits::ImplSource::Param(_) => {
@@ -1998,7 +1988,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let Some(f) = self.model_field(r, m) else {
                 return unsup(format!("dictionary of the {} implementation of `{}`", what, r));
             };
-            fields.push(paren_term(&f));
+            let ns = self.own_dict_names(self.fe.own_dict_bounds(m).len());
+            fields.push(paren_term(&lambda(&ns, f)));
         }
         for p in self.fe.dict_parents(r.def_id) {
             let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
@@ -2091,7 +2082,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let norm = |x: ty::TraitRef<'tcx>| {
             let x = tcx.erase_and_anonymize_regions(x);
-            tcx.try_normalize_erasing_regions(self.typing_env(), ty::Unnormalized::new_wip(x)).unwrap_or(x)
+            crate::frontend::normalize(tcx, self.typing_env(), ty::Unnormalized::new_wip(x))
         };
         if norm(p) == norm(r) {
             return Some(d);
@@ -2120,35 +2111,72 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let implementors = tcx.impl_item_implementor_ids(imp);
         let mut fields = vec![];
         for m in self.fe.dict_methods(tr) {
-            let f = match implementors.get(&m) {
-                Some(&im) if imp.is_local() => {
-                    let iargs = ty::GenericArgs::for_item(tcx, im, |p, _| {
-                        if (p.index as usize) < args.len() { args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
-                    });
-                    self.fn_value((im, Inst::Generic), iargs)?
-                }
-                // a standard-library implementation's method is its model, if it has one, as in
-                // direct calls (see `std_call`); other external ones are templates
-                Some(&im) => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
-                    Some(f) => f,
-                    None => self.fe.ext_fun(im, false),
-                },
-                None if imp.is_local() && m.is_local() => {
-                    let key = self.fe.impl_copy(m, imp);
-                    self.fn_value(key, args)?
-                }
-                None => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
-                    Some(f) => f,
-                    None => self.fe.ext_fun(m, false),
-                },
-            };
-            fields.push(paren_term(&f));
+            // the method's own bounds at `r`, whose dictionaries the field takes
+            let margs = ty::GenericArgs::for_item(tcx, m, |p, _| {
+                if (p.index as usize) < r.args.len() { r.args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
+            });
+            let own = self.fe.own_dict_bounds(m);
+            let ns = self.own_dict_names(own.len());
+            let depth = self.own_dicts.len();
+            for (b, n) in own.into_iter().zip(&ns) {
+                let b = tcx.erase_and_anonymize_regions(ty::EarlyBinder::bind(tcx, b).instantiate(tcx, margs).skip_normalization());
+                self.own_dicts.push((b, n.clone()));
+            }
+            let f = self.impl_field(imp, args, r, m, &implementors);
+            self.own_dicts.truncate(depth);
+            fields.push(paren_term(&lambda(&ns, f?)));
         }
         for p in self.fe.dict_parents(tr) {
             let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
             fields.push(paren_term(&self.dict_term(p)?));
         }
         Ok(if fields.is_empty() { name } else { format!("{} {}", name, fields.join(" ")) })
+    }
+
+    /// `n` fresh names for the dictionaries of the own bounds of a trait method that its field takes
+    /// (see `impl_dict`).
+    fn own_dict_names(&mut self, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| {
+                self.fresh += 1;
+                format!("od{}", self.fresh)
+            })
+            .collect()
+    }
+
+    /// The value of the field for the method `m` of the dictionary of the implementation `imp` at
+    /// `args` (of the trait reference `r`), see `impl_dict`.
+    fn impl_field(
+        &mut self,
+        imp: DefId,
+        args: GenericArgsRef<'tcx>,
+        r: ty::TraitRef<'tcx>,
+        m: DefId,
+        implementors: &rustc_hir::def_id::DefIdMap<DefId>,
+    ) -> R<String> {
+        let tcx = self.tcx;
+        Ok(match implementors.get(&m) {
+            Some(&im) if imp.is_local() => {
+                let iargs = ty::GenericArgs::for_item(tcx, im, |p, _| {
+                    if (p.index as usize) < args.len() { args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
+                });
+                self.fn_value((im, Inst::Generic), iargs)?
+            }
+            // a standard-library implementation's method is its model, if it has one, as in
+            // direct calls (see `std_call`); other external ones are templates
+            Some(&im) => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
+                Some(f) => f,
+                None => self.fe.ext_fun(im, false),
+            },
+            None if imp.is_local() && m.is_local() => {
+                let key = self.fe.impl_copy(m, imp);
+                self.fn_value(key, args)?
+            }
+            None => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
+                Some(f) => f,
+                None => self.fe.ext_fun(m, false),
+            },
+        })
     }
 
     /// The local function `key` as a HOL function value, applied to its dictionaries for its
@@ -2177,9 +2205,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !self.fe.dict_methods(tr).contains(&did) {
             return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, has associated types in its signature other than the slots of its dictionaries, or is an internal method of the standard library) in generic code");
         }
-        let d = self.dict_term(r)?;
-        let f = self.fe.dict_field(tr, did);
-        let call = self.term_app(&format!("{} {}", f, paren_term(&d)), argv);
+        let mut f = format!("{} {}", self.fe.dict_field(tr, did), paren_term(&self.dict_term(r)?));
+        for b in self.fe.own_dict_bounds(did) {
+            let b = ty::EarlyBinder::bind(tcx, b).instantiate(tcx, gargs).skip_normalization();
+            f.push(' ');
+            f.push_str(&paren_term(&self.dict_term(b)?));
+        }
+        let call = self.term_app(&f, argv);
         Ok(self.result_stated(did, call, e))
     }
 
