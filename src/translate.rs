@@ -806,7 +806,16 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                         after.push_str(&ctor_fun(&format!("{}_mk", cn), &cn, &ftys, &head));
                     }
                 }
-                decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+                // a monomorphic enum that is not recursive (alone in its group, not in its own
+                // fields) is an `enum`, whose declaration scales with the number of variants
+                let self_field = def.all_fields().any(|f| field_ty(tcx, f, own, env).walk().any(|g| {
+                    matches!(g.as_type().map(|x| x.kind()), Some(ty::Adt(a, _)) if a.did() == d)
+                }));
+                if comp.len() == 1 && tparams.is_empty() && !self_field {
+                    out.push_str(&enum_decl(&head, &ctors));
+                } else {
+                    decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+                }
             }
         }
         fe.proj_tvars = None;
@@ -826,6 +835,14 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
 fn word_enum_decl(name: &str, width: u64, ctors: &[String], vals: &[u128]) -> String {
     let vs: Vec<String> = ctors.iter().zip(vals).map(|(c, v)| format!("{} = {}", c, v)).collect();
     format!("simple_word_enum (plugins del: word_conversion) ({}) {} =\n    {}\n\n", width, name, vs.join("\n  | "))
+}
+
+/// The `enum` declaration (AutoCorrode, `Enum_Theory`) of a monomorphic enum that is not
+/// recursive, with the given constructors (each with its argument types): unlike a `datatype`,
+/// it does not prove a theorem per pair of constructors, so its declaration scales with the number
+/// of variants.
+fn enum_decl(head: &str, ctors: &[String]) -> String {
+    format!("enum {} =\n    {}\n\n", head, ctors.join("\n  | "))
 }
 
 /// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.
@@ -1324,6 +1341,24 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
             let ctors: Vec<String> = t.ctors.iter().map(|(c, _)| c.clone()).collect();
             writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
             te.push_str(&word_enum_decl(n, *width, &ctors, vals));
+            left.retain(|m| *m != n);
+            continue;
+        }
+        // a plain enum (see `ExtType::plain_enum`) that is not in a cycle of external types
+        if let [n] = group[..] && fe.ext_types[n].plain_enum {
+            let t = &fe.ext_types[n];
+            let ctors: Vec<String> = t
+                .ctors
+                .iter()
+                .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
+                .collect();
+            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
+            te.push_str(&enum_decl(n, &ctors));
+            for (c, fs) in &t.ctors {
+                if !fs.is_empty() {
+                    mks.push_str(&ctor_fun(&format!("{}_mk", c), c, fs, n));
+                }
+            }
             left.retain(|m| *m != n);
             continue;
         }

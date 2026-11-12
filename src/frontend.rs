@@ -74,6 +74,9 @@ pub struct ExtType {
     /// for an enum with constructors whose variants have no fields: it is a `simple_word_enum`
     /// (see `Frontend::word_enum`)
     pub word: Option<(u64, Vec<u128>)>,
+    /// for an enum with constructors, without type parameters, not in its own fields: it is an
+    /// `enum` (Enum_Theory), see `translate::enum_decl`
+    pub plain_enum: bool,
 }
 
 /// An external (or foreign) function for which a template definition is emitted.
@@ -590,7 +593,7 @@ impl<'tcx> Frontend<'tcx> {
         let name = format!("unsupported_{}", names::ident_chars(desc));
         if !self.ext_types.contains_key(&name) {
             let comment = self.placeholder(&format!("type {}", desc), None);
-            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None });
+            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None, plain_enum: false });
         }
         name
     }
@@ -910,7 +913,7 @@ impl<'tcx> Frontend<'tcx> {
             self.ext_types.contains_key(n) || self.used_type_names.contains(n)
         });
         let comment = format!("Rust: {}", self.tcx.def_path_str(did));
-        self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None });
+        self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None, plain_enum: false });
         self.ext_type_ids.insert(did, n.clone());
         // the fields' type parameters are the ADT's (see `ext_fun`)
         let fn_params = std::mem::take(&mut self.fn_params);
@@ -918,8 +921,15 @@ impl<'tcx> Frontend<'tcx> {
         self.fn_params = fn_params;
         if let Some((params, ctors, deps)) = datatype {
             let word = self.word_enum(did);
+            let tcx = self.tcx;
+            let def = tcx.adt_def(did);
+            let (own, env) = (ty::GenericArgs::identity_for_item(tcx, did), ty::TypingEnv::post_analysis(tcx, did));
+            let self_field = def.all_fields().any(|f| {
+                field_ty(tcx, f, own, env).walk().any(|g| matches!(g.as_type().map(|x| x.kind()), Some(ty::Adt(a, _)) if a.did() == did))
+            });
+            let plain_enum = def.is_enum() && params.is_empty() && !self_field;
             let t = self.ext_types.get_mut(&n).expect("registered above");
-            (t.params, t.ctors, t.deps, t.word) = (params, ctors, deps, word);
+            (t.params, t.ctors, t.deps, t.word, t.plain_enum) = (params, ctors, deps, word, plain_enum);
         }
         n
     }
