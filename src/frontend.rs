@@ -95,6 +95,9 @@ pub struct FunDef<'tcx> {
     pub params: Vec<String>,
     /// Body (uRust, may contain call markers).
     pub body: String,
+    /// For a constant translated from its value (see `translate::const_data`): the value as
+    /// `urust_const_data` data; `body` is then empty.
+    pub data: Option<String>,
     pub calls: DefSet<'tcx>,
     pub comments: Vec<String>,
     /// how many of the parameters are dictionaries (they come first)

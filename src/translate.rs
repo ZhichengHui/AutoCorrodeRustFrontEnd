@@ -9,6 +9,7 @@ use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
+use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
@@ -514,6 +515,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         ret_ty,
         params: vec![],
         body: String::new(),
+        data: None,
         calls: crate::frontend::DefSet::default(),
         comments: vec![],
         n_dicts: dicts.len(),
@@ -561,6 +563,10 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         fn_placeholder(fe, &mut fd, "item without body");
         return fd;
     }
+    if let Some(data) = const_data(fe, did) {
+        fd.data = Some(data);
+        return fd;
+    }
     let body = tcx.hir_body_owned_by(ld);
     let mut bt = BodyTr::new(fe, key);
     let res = bt.fn_body(body);
@@ -576,6 +582,115 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         Err(Unsup(m)) => fn_placeholder(fe, &mut fd, &m),
     }
     fd
+}
+
+/// The value of the constant `did`, computed by rustc's const evaluation, as the data of an
+/// `urust_const_data` definition (a HOL value, elaborated against the constant's HOL type): the
+/// HOL term of a large table (e.g. an array of thousands of elements) written as an initialiser
+/// expression takes Isabelle's parser and type inference superlinear time. A generic constant
+/// or a trait's associated constant is not evaluated (rustc would abort). `None` when the
+/// evaluation fails or the value contains a part without a data form (see `value_data`): the
+/// constant is then translated from its initialiser.
+fn const_data<'tcx>(fe: &mut Frontend<'tcx>, did: DefId) -> Option<String> {
+    let tcx = fe.tcx;
+    if !matches!(tcx.def_kind(did), DefKind::Const | DefKind::AssocConst { .. })
+        || fe.is_trait_item(did)
+        || tcx.generics_of(did).requires_monomorphization(tcx)
+    {
+        return None;
+    }
+    let val = tcx.const_eval_poly(did).ok()?;
+    let t = tcx.type_of(did).instantiate_identity().skip_normalization();
+    let t = tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), ty::Unnormalized::new_wip(t)).ok()?;
+    let mut out = String::new();
+    value_data(fe, val, t, &mut out)?;
+    Some(out)
+}
+
+/// Append the HOL value of the constant value `val` of type `t` (see `Frontend::ty`) to `out`:
+/// integers as numbers, `bool` as `True` / `False`, arrays as lists, tuples as tuples ending in
+/// `TNil`, `()` as `()`, `Option` and `Result` by their HOL constructors, and local ADTs (not
+/// unions, not declared as abstract types) by their datatype constructors. Anything else
+/// (floats, `char`, references, pointers, other external or standard library types, ...) has
+/// no data form: `None`.
+fn value_data<'tcx>(fe: &mut Frontend<'tcx>, val: ConstValue, t: Ty<'tcx>, out: &mut String) -> Option<()> {
+    let tcx = fe.tcx;
+    // the fields of an aggregate value (array elements, tuple components, a variant's fields)
+    let fields = |val: ConstValue| tcx.try_destructure_mir_constant_for_user_output(val, t);
+    let list = |fe: &mut Frontend<'tcx>, fs: &[(ConstValue, Ty<'tcx>)], out: &mut String| -> Option<()> {
+        for (i, &(v, ft)) in fs.iter().enumerate() {
+            if i > 0 {
+                // lines of bounded length
+                let line = out.len() - out.rfind('\n').map_or(0, |k| k + 1);
+                out.push_str(if line > 100 { ",\n    " } else { ", " });
+            }
+            value_data(fe, v, ft, out)?;
+        }
+        Some(())
+    };
+    match t.kind() {
+        ty::Bool => out.push_str(if val.try_to_bool()? { "True" } else { "False" }),
+        ty::Int(_) | ty::Uint(_) => {
+            let s = val.try_to_scalar_int()?;
+            let bits = s.to_bits(s.size());
+            if t.is_signed() {
+                let shift = 128 - s.size().bits();
+                write!(out, "{}", (bits as i128) << shift >> shift).unwrap();
+            } else {
+                write!(out, "{}", bits).unwrap();
+            }
+        }
+        ty::Tuple(ts) if ts.is_empty() => out.push_str("()"),
+        // `(a, b)` is `a × b × tnil` (see `Frontend::ty`)
+        ty::Tuple(_) => {
+            out.push('(');
+            list(fe, fields(val)?.fields, out)?;
+            out.push_str(", TNil)");
+        }
+        ty::Array(..) => {
+            out.push('[');
+            list(fe, fields(val)?.fields, out)?;
+            out.push(']');
+        }
+        ty::Adt(def, _) => {
+            let adt = def.did();
+            if def.is_union() || fe.opaque_adts.contains_key(&adt) {
+                return None;
+            }
+            let local = match fe.std_adt(adt) {
+                Some("Option") | Some("Result") => false,
+                Some(_) => return None,
+                None if adt.is_local() => true,
+                None => return None,
+            };
+            let d = fields(val)?;
+            let vidx = d.variant.expect("an ADT value has a variant");
+            let name = if local {
+                fe.variant_ctor_name(adt, vidx.as_usize())
+            } else {
+                let vdid = def.variant(vidx).def_id;
+                let item = [LangItem::OptionSome, LangItem::OptionNone, LangItem::ResultOk, LangItem::ResultErr]
+                    .into_iter()
+                    .find(|&i| tcx.is_lang_item(vdid, i))
+                    .expect("a variant of Option or Result is a lang item");
+                match item {
+                    LangItem::OptionSome => "Some",
+                    LangItem::OptionNone => "None",
+                    LangItem::ResultOk => "Ok",
+                    _ => "Err",
+                }
+                .to_string()
+            };
+            out.push_str(&name);
+            if !d.fields.is_empty() {
+                out.push('(');
+                list(fe, d.fields, out)?;
+                out.push(')');
+            }
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 // ----------------------------------------------------------------------
@@ -1124,6 +1239,10 @@ fn emit_def(fe: &Frontend<'_>, d: &FunDef<'_>, body: &str) -> String {
         writeln!(out, "(* {} *)", cmt(c)).unwrap();
     }
     let ty = fe.fun_type(&d.param_tys, &d.ret_ty);
+    if let Some(data) = &d.data {
+        writeln!(out, "urust_const_data \"{}\" :: {} = {}\n", d.name, cart(&ty), cart(data)).unwrap();
+        return out;
+    }
     let lam = if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
     writeln!(
         out,
