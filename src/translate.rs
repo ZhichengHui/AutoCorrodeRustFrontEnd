@@ -1086,7 +1086,10 @@ fn group_tvars<'tcx>(fe: &Frontend<'tcx>, members: &[&FunDef<'tcx>], uf: &mut Re
             at_group.push(Ty::new_param(tcx, gid, rustc_span::Symbol::intern(&new)).into());
         }
         let at_group = tcx.mk_args(&at_group);
-        for (a, v) in d.proj_ctx.iter().flatten() {
+        // (in the order of their variables, for a deterministic numbering)
+        let mut projs: Vec<(&ty::AliasTy<'tcx>, &String)> = d.proj_ctx.iter().flatten().collect();
+        projs.sort_by_key(|(_, v)| v[5..].parse::<usize>().expect("projection variables are 'projN"));
+        for (a, v) in projs {
             let t = ty::EarlyBinder::bind(tcx, Ty::new_alias(tcx, ty::IsRigid::No, *a)).instantiate(tcx, at_group).skip_normalization();
             let key = fe.proj_key(t).expect("projections are aliases");
             let n = proj_names.len();
@@ -1185,11 +1188,14 @@ fn at_call<'tcx>(fe: &Frontend<'tcx>, caller: FnKey<'tcx>, kargs: ty::GenericArg
 /// The HOL type of `t` in the context of the definition `d` (its projections' type variables and
 /// `Fn`-bounded parameters).
 fn hol_in<'tcx>(fe: &mut Frontend<'tcx>, d: &FunDef<'tcx>, t: Ty<'tcx>) -> String {
-    let saved = (fe.proj_tvars.take(), std::mem::take(&mut fe.fn_params));
+    // (and its typing environment, in which the ADTs' projection arguments are normalised to its
+    // projections, as when it was translated, see `translate_fn`)
+    let env = (!matches!(d.key.1, Inst::Mono(_))).then(|| fe.inst_env(d.key));
+    let saved = (fe.proj_tvars.take(), std::mem::take(&mut fe.fn_params), std::mem::replace(&mut fe.proj_env, env));
     fe.proj_tvars = d.proj_ctx.clone();
     fe.fn_params = d.fn_ctx.clone();
     let h = fe.ty(t);
-    (fe.proj_tvars, fe.fn_params) = saved;
+    (fe.proj_tvars, fe.fn_params, fe.proj_env) = saved;
     h
 }
 
