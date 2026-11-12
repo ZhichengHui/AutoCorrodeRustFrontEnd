@@ -921,7 +921,10 @@ fn subst_markers<'tcx>(
                 extra.extend(record_arg(fe, allocs, me, idx));
                 let f = if extra.is_empty() { head.clone() } else { format!("{} {}", head, extra.join(" ")) };
                 match fe.gen_calls[idx].args.clone() {
-                    None => f,
+                    // a value applied to dictionaries or a record is an application: parenthesised, as
+                    // the marker it replaces is an argument without parentheses (see `paren_term`)
+                    None if extra.is_empty() => f,
+                    None => format!("({})", f),
                     Some(args) => {
                         let a: Vec<String> = args.iter().map(|x| subst_markers(fe, allocs, me, x, caller_scc, names)).collect();
                         if !extra.is_empty() {
