@@ -7,3 +7,5 @@ pub fn use_ref<F: Fn(u32) -> u32>(f: &F, x: u32) -> u32 { f(x) }
 pub fn use_ref_item(x: u32) -> u32 { use_ref(&twice, x) }
 pub fn swap_tmp<T: Copy>(a: &mut T, b: &mut T) { let mut t = *a; t = t; *a = *b; *b = t; }
 pub fn use_swap(mut a: u32, mut b: u32) -> u32 { swap_tmp(&mut a, &mut b); a }
+// an external generic function called in a function with an `Fn`-bounded parameter of the same index
+pub fn fill<F: Fn(u32) -> u32>(v: &mut Vec<u32>, f: F) { v.resize(3, f(0)); }

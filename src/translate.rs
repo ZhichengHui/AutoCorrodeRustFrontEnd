@@ -423,13 +423,22 @@ fn alias_of(t: Ty<'_>) -> ty::AliasTy<'_> {
 /// parameters in its signature (`T::Output` in `fn first<T: Index<usize>>(x: &T) -> &T::Output`):
 /// they are type variables, which each instance fixes (`Output = u32` at `T = Buf`). Independent
 /// variables cannot express that two associated types of the same type are equal through an
-/// implementation (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`), so with two of
-/// them the signature's types are not modelled. One occurring only in the body is not a variable
-/// (it would be an extra type variable of the definition).
+/// implementation of another trait (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`),
+/// so with projections of two traits on the same type the signature's types are not modelled; the
+/// associated types of one trait (e.g. `<E as Engine>::Config` and `<E as Engine>::DecodeEstimate`)
+/// are independent. One occurring only in the body is not a variable (it would be an extra type
+/// variable of the definition).
 fn proj_tvars<'tcx>(fe: &Frontend<'tcx>, did: DefId, sig_tys: &[Ty<'tcx>]) -> Option<HashMap<ty::AliasTy<'tcx>, String>> {
     let ps: Vec<ty::AliasTy<'tcx>> = fe.projections(did, sig_tys).into_iter().map(alias_of).collect();
-    let selves: Vec<Ty<'tcx>> = ps.iter().filter(|a| a.try_to_projection().is_some()).map(|a| a.args.type_at(0)).collect();
-    if (1..selves.len()).all(|i| !selves[..i].contains(&selves[i])) {
+    // (self type, trait) of the projections
+    let owners: Vec<(Ty<'tcx>, DefId)> = ps
+        .iter()
+        .filter_map(|a| match a.kind {
+            ty::AliasTyKind::Projection { def_id } => Some((a.args.type_at(0), fe.tcx.parent(def_id))),
+            _ => None,
+        })
+        .collect();
+    if (1..owners.len()).all(|i| owners[..i].iter().all(|(s, t)| *s != owners[i].0 || *t == owners[i].1)) {
         Some(ps.into_iter().enumerate().map(|(k, a)| (a, proj_tvar(k))).collect())
     } else {
         None
@@ -443,6 +452,7 @@ fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) {
     // parameters are those of one definition; they are kept for its allocation record (see
     // `alloc_sets`)
     fd.proj_ctx = fe.proj_tvars.take();
+    fe.proj_env = None;
     fd.fn_ctx = std::mem::take(&mut fe.fn_params);
     fe.fun_defs.push(fd);
 }
@@ -485,6 +495,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
                 }));
             }
             fe.proj_tvars = proj_tvars(fe, owner, &all);
+            fe.proj_env = Some(env);
             fe.fn_params = fe.fn_param_types(owner);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");
@@ -619,6 +630,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
             fe.proj_tvars = Some(projs.into_iter().map(alias_of).zip(proj_names.iter().cloned()).collect());
+            fe.proj_env = Some(env);
             let has_const = tcx.generics_of(d).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
             let mut tparams = tparams.clone();
             tparams.extend(proj_names);
@@ -677,6 +689,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             }
         }
         fe.proj_tvars = None;
+        fe.proj_env = None;
         if !decls.is_empty() {
             writeln!(out, "datatype {}\n", decls.join("\nand ")).unwrap();
         }

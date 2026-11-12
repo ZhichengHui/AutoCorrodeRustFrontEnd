@@ -163,6 +163,10 @@ pub struct Frontend<'tcx> {
     pub adt_projs: HashMap<DefId, Vec<Ty<'tcx>>>,
     /// While a datatype is declared: its projections' type variables (see `adt_projs`).
     pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
+    /// While a generic item is translated: its typing environment, in which the associated types a
+    /// local ADT takes as type parameters are normalised at its uses (to the projections that
+    /// `proj_tvars` has, e.g. `<DP::VS as VersionSet>::V` to `DP::V`).
+    pub proj_env: Option<ty::TypingEnv<'tcx>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
     /// `Fn` traits (see `fn_param_types`).
     pub fn_params: HashMap<u32, String>,
@@ -234,6 +238,7 @@ impl<'tcx> Frontend<'tcx> {
             alias_tvars: None,
             adt_projs: HashMap::new(),
             proj_tvars: None,
+            proj_env: None,
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
             gen_calls: Vec::new(),
@@ -751,7 +756,11 @@ impl<'tcx> Frontend<'tcx> {
                         // a placeholder ADT is declared with the Rust type arguments only
                         if let Some(ps) = self.adt_projs.get(&did).cloned().filter(|_| !self.opaque_adts.contains_key(&did)) {
                             for p in ps {
-                                let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args).skip_normalization();
+                                let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
+                                let at = match self.proj_env {
+                                    Some(env) => self.tcx.try_normalize_erasing_regions(env, at).unwrap_or_else(|_| at.skip_normalization()),
+                                    None => at.skip_normalization(),
+                                };
                                 a.push(self.ty(at));
                             }
                         }
@@ -854,7 +863,11 @@ impl<'tcx> Frontend<'tcx> {
         let comment = format!("Rust: {}", self.tcx.def_path_str(did));
         self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
         self.ext_type_ids.insert(did, n.clone());
-        if let Some((params, ctors, deps)) = self.ext_datatype(did, &n) {
+        // the fields' type parameters are the ADT's (see `ext_fun`)
+        let fn_params = std::mem::take(&mut self.fn_params);
+        let datatype = self.ext_datatype(did, &n);
+        self.fn_params = fn_params;
+        if let Some((params, ctors, deps)) = datatype {
             let t = self.ext_types.get_mut(&n).expect("registered above");
             (t.params, t.ctors, t.deps) = (params, ctors, deps);
         }
@@ -880,7 +893,7 @@ impl<'tcx> Frontend<'tcx> {
         let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
         let projs = self.projections(did, &all);
         let proj_names: Vec<String> = (0..projs.len()).map(|k| format!("'proj{}", k)).collect();
-        let saved = self.proj_tvars.take();
+        let saved = (self.proj_tvars.take(), self.proj_env.replace(env));
         self.proj_tvars = Some(
             projs
                 .iter()
@@ -919,7 +932,7 @@ impl<'tcx> Frontend<'tcx> {
             params.extend(proj_names.iter().cloned());
             (params, ctors, deps)
         });
-        self.proj_tvars = saved;
+        (self.proj_tvars, self.proj_env) = saved;
         if result.is_some() && !projs.is_empty() {
             self.adt_projs.insert(did, projs);
         }
@@ -987,10 +1000,14 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(base, |n| self.used_names.contains(n));
         self.used_names.insert(n.clone());
         let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
+        // the signature's type parameters are the external function's, not those of the item being
+        // translated, whose `Fn`-bounded parameters (by index) do not apply
+        let fn_params = std::mem::take(&mut self.fn_params);
         self.alias_tvars = Some(0);
         let params: Vec<String> = sig.inputs().iter().map(|t| self.ty(*t)).collect();
         let ret = self.ty(sig.output());
         self.alias_tvars = None;
+        self.fn_params = fn_params;
         let hol_type = self.fun_type(&params, &ret);
         let ef = ExtFun { hol_name: n.clone(), rust_path: self.tcx.def_path_str(did), hol_type, arity: params.len() };
         if foreign { self.foreign_funs.insert(n.clone(), ef); } else { self.ext_funs.insert(n.clone(), ef); }
