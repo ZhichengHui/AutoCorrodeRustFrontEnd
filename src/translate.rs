@@ -150,7 +150,7 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     // translated generically only when a definition refers to its generic version, or when it
     // has no instance (see below): its generic version cannot translate what needs the instances.
     let exported = tcx.effective_visibilities(());
-    let deferred: Vec<DefId> = bodies
+    let deferred: HashSet<DefId> = bodies
         .iter()
         .copied()
         .filter(|&d| fe.mono_fns.contains(&d) && !fe.has_const_params(d) && d.as_local().is_some_and(|l| !exported.is_exported(l)))
