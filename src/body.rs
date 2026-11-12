@@ -1796,9 +1796,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let args = self.node_args(e.hir_id);
         match self.resolve_instance(did, args) {
             Ok(Some(inst)) => {
-                // derived impls, and the std impls (Option, tuples, references, str, slices)
+                // derived impls, and the std impls (Option, tuples, references, str, slices); not
+                // on a type holding a `HashMap`, whose model (a list) has an order
                 let rd = inst.def_id();
-                self.tcx.impl_of_assoc(rd).is_some() && (self.derived(rd) || self.fe.is_std(rd))
+                self.tcx.impl_of_assoc(rd).is_some()
+                    && (self.derived(rd) || self.fe.is_std(rd))
+                    && !args.types().any(|t| self.holds_hashmap(t, &mut vec![]))
             }
             _ => false,
         }
@@ -2269,18 +2272,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let (key, kargs) = self.local_callee(did, args)?;
         // a dictionary that cannot be built at this call (e.g. of a derived implementation whose
         // methods have no model): the instance at the call's concrete arguments, which needs none
-        let dicts = self.callee_dicts(key, kargs);
-        if let Err(err) = &dicts
+        let mut key = key;
+        let mut dicts = self.callee_dicts(key, kargs);
+        if dicts.is_err()
             && key.1 == Inst::Generic
             && !self.fe.is_trait_item(did)
             && !args.has_param()
             && args.types().all(|t| self.fe.ty_dry(t).1)
+            && let Some(inst) = self.fe.instance(did, args)
         {
-            let Some(inst) = self.fe.instance(did, args) else { return Err(Unsup(err.0.clone())) };
-            self.calls.insert(inst);
-            let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
-            let m = self.fe.marker(inst);
-            return Ok(self.callee_app(&format!("\u{1}C{}\u{2}", m), &format!("\u{1}H{}\u{2}", m), &format!("\u{1}Z{}\u{2}", m), a));
+            key = inst;
+            dicts = Ok(vec![]);
         }
         // a recursive group is defined with fixed type arguments (`translate::emit_funs`): a
         // generic function calling itself at other ones (polymorphic recursion) cannot be
@@ -2463,7 +2465,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let this = r.self_ty();
         let rhs = r.args.types().nth(1);
         let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
-        if tcx.is_lang_item(tr, LangItem::PartialEq) && same {
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same && !self.holds_hashmap(this, &mut vec![]) {
             return match name.as_str() {
                 "eq" => Some(lam2("a == b".into())),
                 "ne" => Some(lam2("a != b".into())),
@@ -2889,6 +2891,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("str", "split_whitespace") => Model("str_split_whitespace"),
             ("str", "chars") => Model("str_chars"),
             ("str", "as_bytes") => Model("str_as_bytes"),
+            // only followed by `as_bytes` (see `encode_utf8_bytes`)
+            ("char", "encode_utf8") => CharEncodeUtf8,
             ("str", "starts_with") => StrStartsWith,
             ("str", "parse") => StrParse,
             // bitwise operations: also on signed integers, whose HOL type is a word type
@@ -2959,8 +2963,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         use StdFn::*;
         let r = match f {
             Clone => Some(a(0)),
-            Eq if same_operands(self) => Some(Self::mk_bin("==", 44, &a(0), &a(1))),
-            Ne if same_operands(self) => Some(Self::mk_bin("!=", 44, &a(0), &a(1))),
+            Eq if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut vec![]) => {
+                Some(Self::mk_bin("==", 44, &a(0), &a(1)))
+            }
+            Ne if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut vec![]) => {
+                Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
+            }
             // AutoCorrode's `cmp` needs an `order` on the operands' HOL type
             Cmp if !target.is_local() && self.hol_ordered(self.ty_adj(arg_exprs[0]).peel_refs()) => {
                 Some(self.named_call("cmp", vec![a(0), a(1)]))
@@ -3127,17 +3135,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// Whether `PartialEq` on `t` is structural (HOL's equality): on the primitive types, `str`,
     /// `String`, and the tuples, arrays, slices, `Vec`s and `Option`s of such types, and on local
     /// ADTs whose `PartialEq` is derived, with such fields. `seen`: the ADTs being checked.
-    fn structural_eq_ty(&self, t: Ty<'tcx>, seen: &mut Vec<DefId>) -> bool {
+    fn structural_eq_ty(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
         match t.kind() {
             ty::Uint(_) | ty::Int(_) | ty::Bool | ty::Char | ty::Str => true,
-            ty::Ref(_, x, _) | ty::Slice(x) | ty::Array(x, _) => self.structural_eq_ty(*x, seen),
+            // not `&mut T`: its HOL value is a reference, whose equality is the address's
+            ty::Ref(_, x, m) if !m.is_mut() => self.structural_eq_ty(*x, seen),
+            ty::Slice(x) | ty::Array(x, _) => self.structural_eq_ty(*x, seen),
             ty::Tuple(ts) => ts.iter().all(|x| self.structural_eq_ty(x, seen)),
             ty::Adt(d, args) => match self.fe.std_adt(d.did()) {
                 Some("String") => true,
                 Some("Vec" | "Option") => self.structural_eq_ty(args.type_at(0), seen),
                 Some(_) => false,
                 None if d.did().is_local() => {
-                    if seen.contains(&d.did()) { return true }
+                    if seen.contains(&t) { return true }
                     let Some(eq) = self.tcx.lang_items().eq_trait() else { return false };
                     let first_fn = self.tcx.associated_items(eq).in_definition_order().find(|i| i.is_fn()).map(|i| i.def_id);
                     let Some(m) = first_fn else { return false };
@@ -3145,8 +3155,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         self.resolve_instance(m, self.tcx.mk_args(&[t.into(), t.into()])),
                         Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
                     );
-                    seen.push(d.did());
-                    derived && d.all_fields().all(|f| self.structural_eq_ty(f.ty(self.tcx, args).skip_normalization(), seen))
+                    seen.push(t);
+                    let fields = derived && d.all_fields().all(|f| self.structural_eq_ty(f.ty(self.tcx, args).skip_normalization(), seen));
+                    seen.pop();
+                    fields
                 }
                 None => false,
             },
@@ -3163,13 +3175,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Int(_) => Some("(\\<lambda>a b. ord_cmp (sint a) (sint b))".into()),
             ty::Char => Some("(\\<lambda>a b. ord_cmp (of_char a :: nat) (of_char b))".into()),
             ty::Adt(d, args) if d.is_struct() && d.did().is_local() && self.fe.record_adts.contains(&d.did()) && !seen.contains(&d.did()) => {
+                // `sort` compares with `PartialOrd::lt`: both `Ord` and `PartialOrd` are derived
                 let ord = self.tcx.get_diagnostic_item(sym::Ord)?;
                 let cmp = self.tcx.associated_items(ord).filter_by_name_unhygienic(sym::cmp).next()?.def_id;
-                let derived = matches!(
-                    self.resolve_instance(cmp, self.tcx.mk_args(&[t.into()])),
-                    Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
-                );
-                if !derived { return None }
+                let lt = self.tcx.get_diagnostic_item(Symbol::intern("cmp_partialord_lt"))?;
+                let derived = |m: DefId, args: GenericArgsRef<'tcx>| {
+                    matches!(self.resolve_instance(m, args), Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd))
+                };
+                if !(derived(cmp, self.tcx.mk_args(&[t.into()])) && derived(lt, self.tcx.mk_args(&[t.into(), t.into()]))) {
+                    return None;
+                }
                 seen.push(d.did());
                 let mut parts = vec![];
                 for (i, f) in d.all_fields().enumerate() {
@@ -3321,6 +3336,26 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Uint(_) | ty::Int(_) => true,
             _ => false,
         }
+    }
+
+    /// Whether a value of type `t` holds a `HashMap` (also in the fields of local ADTs): its
+    /// model is a list in insertion order, so HOL's equality is not the map's.
+    fn holds_hashmap(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+        if seen.contains(&t) { return false }
+        seen.push(t);
+        let r = t.walk().any(|g| match g.kind() {
+            ty::GenericArgKind::Type(x) => match x.kind() {
+                ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("HashMap") => true,
+                ty::Adt(d, _) if d.did().is_local() && x != t => self.holds_hashmap(x, seen),
+                ty::Adt(d, args) if d.did().is_local() => {
+                    d.all_fields().any(|f| self.holds_hashmap(f.ty(self.tcx, args).skip_normalization(), seen))
+                }
+                _ => false,
+            },
+            _ => false,
+        });
+        seen.pop();
+        r
     }
 
     fn derived(&self, did: DefId) -> bool {
@@ -4189,28 +4224,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::block(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))
     }
 
-    /// A function item `f` used as a value: the closure `|a1, .., an| f(a1, .., an)` (for a
-    /// local function, or a trait method resolved to a local implementation), with its type
-    /// stated as for closures.
     /// `c.encode_utf8(buf).as_bytes()`: `char_encode_utf8_bytes(c, buf)`, the bytes of the encoding,
     /// also written to the buffer; the `&mut str` in between (which `String.literal` cannot hold
     /// for a non-ASCII character) is not kept. `None` for other calls.
     fn encode_utf8_bytes(&mut self, did: DefId, recv: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
-        let tcx = self.tcx;
-        let is = |d: DefId, owner_is_char: bool, name: &str| {
-            tcx.item_name(d).as_str() == name
-                && matches!(tcx.def_kind(tcx.parent(d)), DefKind::Impl { of_trait: false })
-                && self.fe.is_std(d)
-                && match tcx.type_of(tcx.parent(d)).instantiate_identity().skip_normalization().kind() {
-                    ty::Char => owner_is_char,
-                    ty::Str => !owner_is_char,
-                    _ => false,
-                }
-        };
-        if !is(did, false, "as_bytes") { return Ok(None) }
+        if self.std_fn(did) != Some(StdFn::Model("str_as_bytes")) { return Ok(None) }
         let ExprKind::MethodCall(_, c, [buf], _) = recv.kind else { return Ok(None) };
         let Some(inner) = self.typeck.type_dependent_def_id(recv.hir_id) else { return Ok(None) };
-        if !is(inner, true, "encode_utf8") { return Ok(None) }
+        if self.std_fn(inner) != Some(StdFn::CharEncodeUtf8) { return Ok(None) }
         let (argv, prelude, post) = self.call_args(&[c, buf])?;
         let call = self.named_call("char_encode_utf8_bytes", argv);
         Ok(Some(self.with_writeback(call, prelude, post, recv, &[c, buf])?))
@@ -4233,6 +4254,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::block(format!("{{ let {} = ( {} {{\n{}\n}}); \\<llangle>{} :: {}\\<rrangle> }}", tmp, head, call.s, tmp, h)))
     }
 
+    /// A function item `f` used as a value: the closure `|a1, .., an| f(a1, .., an)` (for a
+    /// local function, or a trait method resolved to a local implementation), with its type
+    /// stated as for closures.
     fn fn_item_value(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
         let tcx = self.tcx;
         let ty::FnDef(did, gargs) = *self.ty_of(e).kind() else { return unsup("function item used as a value") };
@@ -4473,6 +4497,8 @@ enum StdFn {
     PartialCmp,
     /// `Default::default` of a standard type, or derived
     DefaultFn,
+    /// `char::encode_utf8`
+    CharEncodeUtf8,
     /// `str::starts_with` with a `char` or a `&str` pattern
     StrStartsWith,
     /// `str::parse` into an integer type

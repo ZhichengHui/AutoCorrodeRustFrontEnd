@@ -146,10 +146,15 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         fe.def_name(d);
     }
     // A function with const generic parameters only at its instances (see `local_callee`). A
-    // function translated per instance (see `mono_fns`) is translated generically only when a
-    // definition refers to its generic version, or when it has no instance (see below): its
-    // generic version cannot translate what needs the instances.
-    let deferred: HashSet<DefId> = bodies.iter().copied().filter(|&d| fe.mono_fns.contains(&d) && !fe.has_const_params(d)).collect();
+    // function translated per instance (see `mono_fns`) that the crate does not export is
+    // translated generically only when a definition refers to its generic version, or when it
+    // has no instance (see below): its generic version cannot translate what needs the instances.
+    let exported = tcx.effective_visibilities(());
+    let deferred: HashSet<DefId> = bodies
+        .iter()
+        .copied()
+        .filter(|&d| fe.mono_fns.contains(&d) && !fe.has_const_params(d) && d.as_local().is_some_and(|l| !exported.is_exported(l)))
+        .collect();
     for &d in &bodies {
         if !fe.has_const_params(d) && !deferred.contains(&d) {
             translate_item(&mut fe, (d, Inst::Generic));
@@ -367,15 +372,25 @@ impl<'a, 'tcx> GenericCalls<'a, 'tcx> {
         if !args.has_param() {
             return;
         }
-        // a method of `HashMap` or of its `Entry`: its model needs the key's equality to be
-        // structural, which only an instance shows (see `BodyTr::std_call`)
+        // a method of `HashMap` or of its `Entry`, `<[T]>::sort`, `Vec::dedup`: their models need
+        // the equality or order of the key or element type to be structural or known, which only
+        // an instance shows (see `BodyTr::std_call`)
         let parent = self.tcx.parent(did);
-        if matches!(self.tcx.def_kind(parent), DefKind::Impl { of_trait: false })
-            && let ty::Adt(d, _) = self.tcx.type_of(parent).instantiate_identity().skip_normalization().kind()
-            && matches!(self.fe.std_adt(d.did()), Some("HashMap" | "HashMapEntry"))
-        {
-            self.dependent = true;
-            return;
+        if matches!(self.tcx.def_kind(parent), DefKind::Impl { of_trait: false }) && self.fe.is_std(did) {
+            let name = self.tcx.item_name(did);
+            let needs_instance = match self.tcx.type_of(parent).instantiate_identity().skip_normalization().kind() {
+                ty::Adt(d, _) => match self.fe.std_adt(d.did()) {
+                    Some("HashMap" | "HashMapEntry") => true,
+                    Some("Vec") => name.as_str() == "dedup",
+                    _ => false,
+                },
+                ty::Slice(_) => name.as_str() == "sort",
+                _ => false,
+            };
+            if needs_instance {
+                self.dependent = true;
+                return;
+            }
         }
         if let Some(tr) = self.tcx.trait_of_assoc(did) {
             // a call of a value of a type parameter bounded by an `Fn` trait is a call of a function
