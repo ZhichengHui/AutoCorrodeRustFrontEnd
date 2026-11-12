@@ -94,7 +94,9 @@
 | `<[T]>::copy_from_slice`、`fill`、`reverse` | `slice_copy_from_slice`（长度不等时 panic）、`slice_fill`、`slice_reverse` | 手写 | 同上 |
 | `Vec::truncate`、`clear`、`resize`、`extend_from_slice` | `vec_truncate`、`vec_clear`、`vec_resize`、`vec_extend_from_slice` | 手写 | 同上 |
 | `Vec::into_boxed_slice` | 恒等 | 前端写法 | 同上 |
-| 作为调用参数（或方法的接收者）的 `&mut v[a..b]`（`a..b`、`a..`、`..b`、`..=b`、`..`）；`for` 遍历 `&mut v[a..b]`（循环体只能正常结束或跳出本循环） | 子切片复制到新的可变局部变量，引用它；调用（循环）之后用 `slice_splice` 写回 `v`。借用存活期间 Rust 不允许访问 `v`，切片的长度不变，所以与 Rust 一致。`let x = &mut v[a..b]`（及结果都是同一序列的子切片或整体借用的 `if`）在 `x` 最后一次使用之后写回（条件见 `LANGUAGE_FEATURES.md`）。调用可能保留借用时（结果带生命周期，或其他参数是指向带生命周期之物的引用、按值传入的带生命周期的值）、借用出现在其他位置时，仍是占位符 | 手写 `slice_splice` + 前端写法 | `borrow_mut`、`call_args`、`with_writeback`、`for_loop` |
+| 可变位置（`&mut`、赋值的左边、可变的自动借用）中的子切片 `v[r]`（`r` 是 `a..b`、`a..=b`、`a..`、`..b`、`..=b`、`..` 或存放区间的变量），以及读取时基有副作用的开区间、存放在变量中的区间 | `slice_range_mut`（`range` 值）、`slice_range_from_mut`、`slice_range_to_mut`、`slice_range_to_inclusive_mut`（区间唯一的字段）：指向子切片的引用，即 `v` 的引用经 `sublist_focus a k` 聚焦到前 `a` 个、后 `k` 个元素之间的部分；区间递减或超出切片时 panic；`..` 是 `v` 的引用本身。这个 focus 满足 AutoCorrode 对 focus 的全部定律（固定位置 `a..b` 的 focus 不满足，见 AutoCorrode `StdLib_Slice` 中注释掉的 `slice_index_range`）；借用存活期间切片的长度不变，所以它总是聚焦在区间 `r` 的元素上，与 Rust 一致 | 手写 `StdLib_Frontend_Models` | `pv_unadj` 的 `Index`（`index_place`）、`mark_mut_place` |
+| `<[T]>::get_mut(i)`（下标是 `usize`）、`get_mut(r)`（`r` 是 `a..b`、`a..=b`） | `slice_get_mut`（`focus_nth` 的引用）、`slice_get_range_mut`（`sublist_focus` 的引用）：越界时 `None` | 手写 | `std_fn`/`std_call` |
+| `<[T]>::iter_mut()` 作为值 | `slice_iter_mut_list`：各元素的引用的列表（`slice::IterMut` 的状态，见“迭代器”） | 手写 | 同上 |
 | `Vec::push` | `vec_push`：追加到末尾 | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
 | `Vec::pop` | `vec_pop`：空时 `None`，否则去掉并返回最后一个元素 | 手写 | 同上 |
 | `<[T]>::swap` | `slice_swap`：交换两个位置，越界时 panic | 手写 | 同上 |
@@ -154,6 +156,7 @@
 |---|---|---|---|
 | `Range<T>`、`RangeInclusive<T>` | `T range` | AutoCorrode `Range_Type` | `Frontend::ty` |
 | `a..b`、`RangeInclusive::new` | uRust 的区间表达式 | AutoCorrode | `struct_expr`、`std_call` |
+| 整数区间的 `contains(&x)`（`Range`、`RangeInclusive`） | `contains` | AutoCorrode `StdLib_Range` | `std_fn`/`std_call` |
 | `for` 遍历区间 | uRust 的 `for` 循环 | AutoCorrode | `for_loop` |
 | `Range` 的字段 `start`、`end`（读取） | `range` 记录的选择函数 | AutoCorrode `Range_Type` | `pv_unadj` 的 `Field` |
 | `RangeFrom<T>`、`RangeTo<T>`、`RangeToInclusive<T>`（`a..`、`..b`、`..=b` 的值）；`RangeFull`（`..`） | 唯一的字段（类型 `T`）；`unit` | 前端写法 | `Frontend::ty`、`struct_expr`、`unit_ctor`、`pv_unadj` 的 `Field` |
@@ -191,7 +194,9 @@
 | `vec::IntoIter<T>`（`Vec` 按值的 `into_iter`） | `T list` | `list_iter_next`（`next_back` 同 `slice::Iter`） | 手写 | 同上 |
 | `slice::Chunks<T>` | `T list × 64 word × tnil`（剩余元素、块大小） | `chunks_next`（最后一块可以较短） | 手写 | 同上 |
 | `Filter<I, P>` | `I × P × tnil` | `filter_next`：内层的 `find`，带 crate 的燃料 | 手写 | 同上 |
-| 无符号整数的 `a..b`、`a..` 作为迭代器 | `range` 记录、下一个值 | `range_next`、`range_from_next`（溢出时 panic） | 手写 | 同上 |
+| 无符号整数的 `a..b`、`a..=b`、`a..` 作为迭代器 | `range` 记录、下一个值 | `range_next`、`range_next_back`（耗尽的 `a..=b`，即 Rust 的 `exhausted`，表示为空的 `b..b`）、`range_from_next`（溢出时 panic） | 手写 | 同上 |
+| `slice::IterMut<T>` | 剩余元素的引用的列表 | `list_iter_next`、`list_iter_next_back` | 手写 | 同上 |
+| `for_each(f)` | `iter_for_each`：按顺序对每个元素调用 `f`（`iter_fold`，带 crate 的燃料） | | 手写 | `iter_call` |
 | `any(&mut self, f)`、`min`（无符号整数） | `iter_ref_any`（写回迭代器的状态）、`iter_min`（第一个最小的元素） | | 手写 | `iter_call` |
 | `count`、`collect`（到 `Vec`） | `iter_count`、`iter_collect_list`（`iter_fold`：用 crate 的 `urust_fuel` 逐个调用步进函数，燃料耗尽时 panic “out of fuel”，与递归函数相同；`count` 计数溢出时 panic） | | 手写 | `iter_call` |
 | `for` 遍历上述迭代器 | Rust 的展开：`while let Some(p) = Iterator::next(&mut iter)` | | 前端写法 | `for_loop` |
@@ -258,3 +263,4 @@
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
 | `mem::drop` | 丢弃这个值 | 前端写法 | `std_call` |
+| `mem::swap(x, y)`、`mem::replace(dest, v)` | `mem_swap`、`mem_replace`（返回旧值） | 手写 | `std_fn`/`std_call` |

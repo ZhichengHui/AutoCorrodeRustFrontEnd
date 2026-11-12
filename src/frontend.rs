@@ -550,16 +550,17 @@ impl<'tcx> Frontend<'tcx> {
         let ty::Adt(def, args) = t.kind() else { return None };
         let inner = |i: usize| args.types().nth(i).expect("type argument of an iterator adapter");
         Some(match (self.std_adt(def.did())?, back) {
-            ("SliceIter" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", false) => "list_iter_next".into(),
-            ("SliceIter" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", true) => "list_iter_next_back".into(),
+            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", false) => "list_iter_next".into(),
+            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", true) => "list_iter_next_back".into(),
             ("ChunksExact", false) => "chunks_exact_next".into(),
             ("Chunks", false) => "chunks_next".into(),
             // `Filter::next` is the inner `find`, which takes the crate's fuel
             ("Filter", false) => format!("(filter_next urust_fuel {})", self.iter_step(inner(0), false)?),
             // `a..` over an unsigned integer (its state is the next value, see `ty`)
             ("RangeFrom", false) if matches!(inner(0).kind(), ty::Uint(_)) => "range_from_next".into(),
-            // `a..b` over an unsigned integer (a `range` record)
-            ("Range", false) if matches!(inner(0).kind(), ty::Uint(_)) => "range_next".into(),
+            // `a..b`, `a..=b` over an unsigned integer (a `range` record), from either end
+            ("Range" | "RangeInclusive", false) if matches!(inner(0).kind(), ty::Uint(_)) => "range_next".into(),
+            ("Range" | "RangeInclusive", true) if matches!(inner(0).kind(), ty::Uint(_)) => "range_next_back".into(),
             ("Enumerate", false) => format!("(enumerate_next {})", self.iter_step(inner(0), false)?),
             ("Zip", false) => format!("(zip_next {} {})", self.iter_step(inner(0), false)?, self.iter_step(inner(1), false)?),
             ("Skip", false) => format!("(skip_next {})", self.iter_step(inner(0), false)?),
@@ -794,6 +795,8 @@ impl<'tcx> Frontend<'tcx> {
                     // iterators by their states (see `iter_step` and `STD_MODELS.md`): the remaining
                     // elements of a sequence, or an adapter's fields with the inner iterator's state
                     Some("SliceIter") | Some("VecIntoIter") => format!("{} list", paren_ty(&self.ty(targs[0]))),
+                    // the references to the remaining elements
+                    Some("SliceIterMut") => format!("(('addr, 'gv, {}) Global_Store.ref list)", self.ty(targs[0])),
                     Some("Chunks") => format!("({} list \\<times> 64 word \\<times> tnil)", paren_ty(&self.ty(targs[0]))),
                     Some("Filter") => {
                         format!("({} \\<times> {} \\<times> tnil)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
@@ -1061,7 +1064,7 @@ impl<'tcx> Frontend<'tcx> {
             "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" | "RangeFrom" | "RangeTo" | "RangeToInclusive" => Some(1),
             "String" | "Ordering" | "Formatter" | "FmtError" | "RangeFull" => Some(0),
             // the iterators keep all their type arguments (see `ty`)
-            "SliceIter" | "ChunksExact" | "Chunks" | "VecIntoIter" | "Enumerate" | "Skip" | "Take" | "Rev" | "Copied" | "Cloned" => Some(1),
+            "SliceIter" | "SliceIterMut" | "ChunksExact" | "Chunks" | "VecIntoIter" | "Enumerate" | "Skip" | "Take" | "Rev" | "Copied" | "Cloned" => Some(1),
             "Zip" | "TakeWhile" | "Map" | "Filter" | "HashMap" | "HashMapEntry" => Some(2),
             "Lines" | "SplitWhitespace" | "Chars" | "ParseIntError" | "TryFromSliceError" => Some(0),
             _ => None,
@@ -1200,7 +1203,7 @@ fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
         methods_of(tcx.parent(sw), &[("split_whitespace", "SplitWhitespace"), ("lines", "Lines"), ("chars", "Chars")]);
     }
     if let Some(si) = tcx.get_diagnostic_item(Symbol::intern("slice_iter")) {
-        methods_of(tcx.parent(si), &[("chunks_exact", "ChunksExact"), ("chunks", "Chunks")]);
+        methods_of(tcx.parent(si), &[("chunks_exact", "ChunksExact"), ("chunks", "Chunks"), ("iter_mut", "SliceIterMut")]);
     }
     // `<u8 as FromStr>::Err`: the associated type `Err` of the implementation of `FromStr` (the
     // trait of the method `from_str_method`) for `u8`

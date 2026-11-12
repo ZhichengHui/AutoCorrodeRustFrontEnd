@@ -87,3 +87,13 @@ fn scaled<const K: u32, const ROUND: bool>(x: u32) -> u32 {
 pub fn scale_both(x: u32) -> u32 { scaled::<4, true>(x) + scaled::<2, false>(x) }
 
 pub fn word_size() -> usize { core::mem::size_of::<u64>() }
+
+pub fn mark(v: &mut [u8], a: usize, b: usize) -> u8 {
+    v[a..b].iter_mut().for_each(|p| *p = 8);
+    if let Some(x) = v.get_mut(a) {
+        *x += 1;
+    }
+    let mut s = 3u8;
+    core::mem::swap(&mut s, &mut v[0]);
+    core::mem::replace(&mut v[1], s)
+}

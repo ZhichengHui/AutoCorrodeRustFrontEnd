@@ -177,7 +177,9 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         }
     }
     // instances called from the translated bodies, and from those instances; then the deferred
-    // generic versions that are referred to or whose functions have no instance (and what they call)
+    // generic versions that are referred to or whose functions have no instance (and what they call);
+    // a default method that no local implementation uses (nor these): generically, with the
+    // dictionary of `Self` (for the implementations outside the crate)
     loop {
         while let Some(key) = fe.pending.pop() {
             translate_item(&mut fe, key);
@@ -191,16 +193,13 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
                     && (fe.fun_defs.iter().any(|f| f.calls.0.contains(&g)) || !fe.fun_defs.iter().any(|f| f.key.0 == d))
             })
             .collect();
-        if needed.is_empty() {
+        let unused_defaults: Vec<DefId> =
+            default_methods.iter().copied().filter(|&d| !fe.fun_defs.iter().any(|f| f.key.0 == d)).collect();
+        if needed.is_empty() && unused_defaults.is_empty() {
             break;
         }
-        for d in needed {
+        for d in needed.into_iter().chain(unused_defaults) {
             translate_item(&mut fe, (d, Inst::Generic));
-        }
-    }
-    for d in default_methods {
-        if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
-            fe.item_placeholder("trait default method (not called at a concrete type)", tcx.def_span(d));
         }
     }
     for &d in &bodies {

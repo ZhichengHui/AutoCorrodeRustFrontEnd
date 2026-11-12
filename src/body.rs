@@ -186,28 +186,10 @@ pub struct BodyTr<'a, 'tcx> {
     pub comments: Vec<String>,
     /// the dictionary parameters of the body (see `Frontend::dict_params`)
     dicts: Vec<(ty::TraitRef<'tcx>, String)>,
-    /// the arguments of the call being translated (see `call_args`)
-    call_scope: Option<CallScope>,
-    /// the write-backs of subslices borrowed by `let` (see `let_subslice`), by the statement after
-    /// which they come
-    write_back_after: HashMap<HirId, String>,
-    /// the results of a `let`'s initializer that borrow subslices, translated as their bounds (the
-    /// range, if any, and the sequence's length; see `let_subslice`)
-    given: HashMap<HirId, (Option<&'tcx hir::Expr<'tcx>>, Tr)>,
+    /// the indexing expressions in places borrowed mutably or assigned (see `mark_mut_place`)
+    mut_places: HashSet<HirId>,
     /// the mutable locals holding the values of the `loop`s being translated that produce one
     loop_results: HashMap<HirId, String>,
-}
-
-/// The arguments of a call (or the iterable of a `for` loop) whose mutable borrows of subslices
-/// are copied in before it and written back after it (see `borrow_mut`).
-#[derive(Default)]
-struct CallScope {
-    /// the place whose mutable borrow is the argument being translated
-    current: Option<HirId>,
-    /// the copies into fresh mutable locals, for the argument being translated
-    pre: Vec<String>,
-    /// the write-backs, after the call
-    post: Vec<String>,
 }
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
@@ -229,9 +211,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
             dicts: fe_dicts,
-            call_scope: None,
-            write_back_after: HashMap::new(),
-            given: HashMap::new(),
+            mut_places: HashSet::new(),
             loop_results: HashMap::new(),
         }
     }
@@ -401,13 +381,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             match st.kind {
                 StmtKind::Item(_) => {}
                 StmtKind::Let(l) => {
-                    let (mut pre, post) = match self.let_subslice(l, &stmts[i + 1..], tail)? {
-                        Some(copy_in) => (copy_in, String::new()),
-                        None => self.let_stmt(l)?,
-                    };
-                    if let Some(wb) = self.write_back_after.remove(&st.hir_id) {
-                        pre = format!("{}\n{}", pre, wb);
-                    }
+                    let (pre, post) = self.let_stmt(l)?;
                     let rest = self.block_seq(&stmts[i + 1..], tail)?;
                     parts.push(format!("{}\n{}{}", pre, rest, post));
                     return Ok(join_seq(parts));
@@ -420,9 +394,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     }
                     let s = self.stmt_expr(e);
                     parts.push(s);
-                    if let Some(wb) = self.write_back_after.remove(&st.hir_id) {
-                        parts.push(wb);
-                    }
                 }
             }
         }
@@ -546,18 +517,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 } else {
                     unsup("let without initializer and with a non-identifier pattern")
                 }
-            }
-            // `let _ = &mut v[a..b];` (a bounds check): the borrow ends at once, nothing is written
-            // through it, so the subslice's value (with the same bounds check) stands for it
-            Some(init)
-                if matches!(l.pat.kind, PatKind::Wild)
-                    && let ExprKind::AddrOf(hir::BorrowKind::Ref, m, x) = init.kind
-                    && m.is_mut()
-                    && matches!(x.kind, ExprKind::Index(..))
-                    && self.in_subslice(x) =>
-            {
-                let v = self.val(x)?;
-                Ok((format!("let _ = {};", v.at(20)), String::new()))
             }
             Some(init) => {
                 let mut iv = self.expr(init);
@@ -743,26 +702,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn pv_adjusted(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<PV> {
-        // a result of the initializer of a `let` that borrows a subslice: its bounds (see
-        // `let_subslice`), translated where Rust evaluates them
-        if let Some((r, len)) = self.given.remove(&e.hir_id) {
-            let (lo, hi) = match r {
-                Some(r) => {
-                    let Some((lo, hi, incl)) = self.range_bounds(r, len)? else { return unsup("range index") };
-                    (lo, if incl { Tr::new(format!("{} + 1_usize", hi.at(49)), 49) } else { hi })
-                }
-                None => (Tr::atom("0_usize"), len),
-            };
-            return Ok(PV::Val(Tr::atom(format!("({}, {})", lo.at(20), hi.at(20)))));
-        }
-        // a subslice auto-borrowed mutably as a method's receiver (`v[a..b].fill(x)`), before it is
-        // translated as a value (see `subslice_copy_in`)
-        if let [adj] = self.typeck.expr_adjustments(e)
-            && matches!(adj.kind, Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Mut { .. })))
-            && self.in_subslice(e)
-            && let Some(r) = self.subslice_copy_in(e)?
+        // a place auto-borrowed mutably (a method's receiver, `v[a..b].fill(x)`)
+        if self
+            .typeck
+            .expr_adjustments(e)
+            .iter()
+            .any(|a| matches!(a.kind, Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Mut { .. }))))
         {
-            return Ok(PV::Val(r));
+            self.mark_mut_place(e);
         }
         let mut pv = self.pv_unadj(e)?;
         let mut cur = self.ty_of(e);
@@ -840,8 +787,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         .map(|(_, k)| k)
     }
 
-    /// Whether the place `e` is, or lies inside, a subslice `v[a..b]` of a sequence. The subslice
-    /// is a value (a list), so a mutable borrow of such a place would refer to a temporary copy.
+    /// Whether the place `e` is, or lies inside, a subslice `v[a..b]` of a sequence.
     fn in_subslice(&self, mut e: &'tcx hir::Expr<'tcx>) -> bool {
         loop {
             match e.kind {
@@ -860,18 +806,31 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `&mut` of a place is the reference to it; `&mut` of a temporary value allocates a
     /// fresh mutable local holding the value (Rust's temporary) and yields its reference.
     fn borrow_mut(&mut self, e: &'tcx hir::Expr<'tcx>, pv: PV, t: Ty<'tcx>) -> R<PV> {
-        // a place in a subslice: the writes through the borrow would be lost (a subslice that is
-        // itself an argument of a call is copied in before, see `subslice_copy_in`)
-        if self.in_subslice(e) {
-            return unsup("mutable borrow of a subslice");
-        }
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
+            // a place in a subslice of a value (not of a place, see `index_place`): the writes
+            // through the borrow would be lost
+            PV::Val(_) if self.in_subslice(e) => unsup("mutable borrow of a subslice of a value"),
             PV::Val(v) => {
                 let a = self.alloc(t)?;
                 let tmp = self.fresh("tmp");
                 let b = self.let_binding(&tmp, hir::Mutability::Mut, &a, &v.at(20));
                 Ok(PV::Val(Tr::block(format!("{{ {} {} }}", b, tmp))))
+            }
+        }
+    }
+
+    /// Marks the indexing expressions of the place `e` (through fields, indexing and
+    /// dereferences): a subslice in it is then a reference into the sequence (see `index_place`).
+    fn mark_mut_place(&mut self, mut e: &'tcx hir::Expr<'tcx>) {
+        loop {
+            match e.kind {
+                ExprKind::Index(b, _, _) => {
+                    self.mut_places.insert(e.hir_id);
+                    e = b;
+                }
+                ExprKind::Field(b, _) | ExprKind::Unary(UnOp::Deref, b) => e = b,
+                _ => return,
             }
         }
     }
@@ -919,290 +878,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             bt_adj = *inner;
         }
         Ok(bpv)
-    }
-
-    /// The mutable borrow of the subslice `e` = `base[range]` when it is the argument being
-    /// translated (see `call_args`): the subslice is copied into a fresh mutable local, whose
-    /// reference is the argument, and written back into `base` after the call or loop. While the
-    /// borrow lives, Rust allows no other access to `base`, and a slice keeps its length. The
-    /// reference to `base` is evaluated once, before the range (as Rust does): the locals it reads
-    /// may change before the write-back. `None` if this does not apply.
-    fn subslice_copy_in(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
-        let ExprKind::Index(base, idx, _) = e.kind else { return Ok(None) };
-        let applies = self.call_scope.as_ref().is_some_and(|s| s.current == Some(e.hir_id))
-            && self.list_like(self.ty_adj(base).peel_refs())
-            && self.range_literal(idx).is_some();
-        if !applies { return Ok(None) }
-        let PV::Ref(r) = self.index_base(base)? else { return Ok(None) };
-        let b = self.fresh("base");
-        let bind_base = format!("let {} = {};", b, r.at(20));
-        let Some((lo, hi, incl)) = self.range_bounds(idx, Tr::atom(format!("len(* {})", b)))? else { return Ok(None) };
-        let lo_v = self.fresh("lo");
-        let tmp = self.fresh("sub");
-        let a = self.alloc(self.ty_of(e))?;
-        let init = format!("(* {})[{} {} {}]", b, lo_v, if incl { "..=" } else { ".." }, hi.at(42));
-        let copy = self.let_binding(&tmp, hir::Mutability::Mut, &a, &init);
-        let back = self.named_call(
-            "slice_splice",
-            vec![Tr::new(format!("* {}", b), 98), Tr::atom(lo_v.clone()), Tr::new(format!("* {}", tmp), 98)],
-        );
-        let s = self.call_scope.as_mut().expect("call scope");
-        s.pre.push(bind_base);
-        s.pre.push(format!("let {} = {};", lo_v, lo.at(20)));
-        s.pre.push(copy);
-        s.post.push(format!("* {} = {};", b, back.at(40)));
-        Ok(Some(Tr::atom(tmp)))
-    }
-
-    /// The result expressions of `e`: the tails of its blocks and the branches of its `if`s; `false`
-    /// if a block has no tail or an `if` no `else`.
-    fn result_leaves(e: &'tcx hir::Expr<'tcx>, out: &mut Vec<&'tcx hir::Expr<'tcx>>) -> bool {
-        match e.kind {
-            ExprKind::Block(b, None) => b.expr.is_some_and(|t| Self::result_leaves(t, out)),
-            ExprKind::If(_, t, Some(el)) => Self::result_leaves(t, out) && Self::result_leaves(el, out),
-            ExprKind::DropTemps(x) => Self::result_leaves(x, out),
-            _ => {
-                out.push(e);
-                true
-            }
-        }
-    }
-
-    /// The innermost block containing the node `hid` (the `let` declaring a local, or a `let`).
-    fn let_block(&self, hid: HirId) -> Option<HirId> {
-        self.tcx.hir_parent_iter(hid).find_map(|(h, n)| matches!(n, hir::Node::Block(_)).then_some(h))
-    }
-
-    /// `let x = e;` (`x` a slice or array reference, whose length is fixed) where every result of
-    /// `e` (see `result_leaves`) mutably borrows a subslice of, or the whole of, the same local
-    /// sequence `b` declared earlier in this block (and not a reference): the subslice is copied
-    /// into a fresh mutable local, `x` is its reference, and the copy is written back into `b` after
-    /// the last statement using `x` (see `block_seq`). The statements up to there must not use `b`,
-    /// may only pass `x` directly as a call's argument (see `borrow_kept_in_calls`), and their
-    /// `let`s bind types without lifetimes: then the borrow ends there. A `return` or `break` out of
-    /// the block ends `b` too. `None` if this does not apply.
-    fn let_subslice(
-        &mut self,
-        l: &'tcx hir::LetStmt<'tcx>,
-        later: &'tcx [hir::Stmt<'tcx>],
-        tail: Option<&'tcx hir::Expr<'tcx>>,
-    ) -> R<Option<String>> {
-        let (Some(init), None) = (l.init, l.els) else { return Ok(None) };
-        let PatKind::Binding(hir::BindingMode(hir::ByRef::No, hir::Mutability::Not), xh, _, None) = l.pat.kind else { return Ok(None) };
-        let ty::Ref(_, slice_ty, m) = *self.node_ty(xh).kind() else { return Ok(None) };
-        if !m.is_mut() || !matches!(slice_ty.kind(), ty::Slice(_) | ty::Array(..)) { return Ok(None) }
-        // the results: `&mut b[range]` or `&mut b`, for one local `b`
-        let mut leaves = vec![];
-        if !Self::result_leaves(init, &mut leaves) { return Ok(None) }
-        let local = |e: &hir::Expr<'_>| match e.kind {
-            ExprKind::Path(hir::QPath::Resolved(None, p)) => match p.res {
-                Res::Local(h) => Some(h),
-                _ => None,
-            },
-            _ => None,
-        };
-        let mut base: Option<(HirId, &'tcx hir::Expr<'tcx>)> = None;
-        let mut parts = vec![];
-        for leaf in &leaves {
-            let ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, p) = leaf.kind else { return Ok(None) };
-            let (b, r) = match p.kind {
-                ExprKind::Index(b, r, _) if self.range_literal(r).is_some() => (b, Some(r)),
-                _ => (p, None),
-            };
-            let Some(bh) = local(b) else { return Ok(None) };
-            if base.is_some_and(|(h, _)| h != bh) || !self.list_like(self.node_ty(bh)) || self.node_ty(bh).is_ref() {
-                return Ok(None);
-            }
-            base = Some((bh, b));
-            parts.push((leaf.hir_id, r));
-        }
-        let Some((bh, b)) = base else { return Ok(None) };
-        if self.let_block(bh) != self.let_block(l.hir_id) { return Ok(None) }
-        // the statements using `x` (also in closures), up to the last one, not using `b`; not the
-        // block's tail
-        let tcx = self.tcx;
-        let uses = |e: &'tcx hir::Expr<'tcx>| uses_local(tcx, e, xh);
-        if tail.is_some_and(uses) { return Ok(None) }
-        let stmt_expr = |s: &'tcx hir::Stmt<'tcx>| match s.kind {
-            StmtKind::Let(l2) => l2.init,
-            StmtKind::Expr(e) | StmtKind::Semi(e) => Some(e),
-            StmtKind::Item(_) => None,
-        };
-        let last = later.iter().rposition(|s| stmt_expr(s).is_some_and(uses));
-        for s in &later[..last.map_or(0, |j| j + 1)] {
-            if let StmtKind::Let(l2) = s.kind {
-                if l2.els.is_some() || self.has_lifetime(self.node_ty(l2.pat.hir_id)) { return Ok(None) }
-            }
-            if let Some(e) = stmt_expr(s)
-                && (uses_local(tcx, e, bh) || !self.borrow_kept_in_calls(e, xh))
-            {
-                return Ok(None);
-            }
-        }
-        // the copy-in: the bounds of the subslice chosen by `e` (translated at the result, see
-        // `pv_adjusted`), the copy, `x`
-        let (Ok(bref), Ok(a)) = (self.place(b), self.alloc(slice_ty)) else { return Ok(None) };
-        let len = Tr::atom(format!("len(* {})", bref.at(200)));
-        for (leaf, r) in parts {
-            self.given.insert(leaf, (r, len.clone()));
-        }
-        let bounds = self.val(init);
-        let left = !self.given.is_empty();
-        self.given.clear();
-        if left { return unsup("mutable borrow of a subslice in a `let`") }
-        let bounds = bounds?;
-        let (bn, lo, sub) = (self.fresh("bnds"), self.fresh("lo"), self.fresh("sub"));
-        let copy = self.let_binding(&sub, hir::Mutability::Mut, &a, &format!("(* {})[{} .. {}.1]", bref.at(200), lo, bn));
-        let bind_x = self.bind_pattern(l.pat, Tr::atom(sub.clone()))?;
-        let back = self.named_call(
-            "slice_splice",
-            vec![Tr::new(format!("* {}", bref.at(200)), 98), Tr::atom(lo.clone()), Tr::new(format!("* {}", sub), 98)],
-        );
-        let wb = format!("* {} = {};", bref.at(200), back.at(40));
-        let mut pre = format!("let {} = {};\nlet {} = {}.0;\n{}\n{}", bn, bounds.at(20), lo, bn, copy, bind_x);
-        match last {
-            Some(j) => {
-                self.write_back_after.insert(later[j].hir_id, wb);
-            }
-            None => pre = format!("{}\n{}", pre, wb),
-        }
-        Ok(Some(pre))
-    }
-
-    fn has_lifetime(&self, t: Ty<'tcx>) -> bool {
-        t.walk().any(|g| matches!(g.kind(), ty::GenericArgKind::Lifetime(_)))
-    }
-
-    /// Whether a callee could keep a borrow passed to it in an argument of type `t`: `t` is a
-    /// reference to something with a lifetime, or not a reference but has a lifetime (e.g. a
-    /// struct holding a reference to a vector of references).
-    fn arg_keeps(&self, t: Ty<'tcx>) -> bool {
-        match t.kind() {
-            ty::Ref(_, inner, _) => self.has_lifetime(*inner),
-            _ => self.has_lifetime(t),
-        }
-    }
-
-    /// In `e`: the local `x` occurs only as an argument (or receiver) of calls; a call with an
-    /// argument containing `x` has no other argument referring to something with a lifetime, and
-    /// its result has no lifetime unless it is (borrowed as) an argument of another call.
-    fn borrow_kept_in_calls(&self, e: &'tcx hir::Expr<'tcx>, x: HirId) -> bool {
-        struct V<'a, 'b, 'tcx> {
-            tr: &'a BodyTr<'b, 'tcx>,
-            x: HirId,
-            ok: bool,
-        }
-        impl<'tcx> Visitor<'tcx> for V<'_, '_, 'tcx> {
-            fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
-                let tcx = self.tr.tcx;
-                let arg_of_call = |h: HirId| {
-                    matches!(tcx.parent_hir_node(h), hir::Node::Expr(p) if match p.kind {
-                        ExprKind::Call(_, args) => args.iter().any(|a| a.hir_id == h),
-                        ExprKind::MethodCall(_, r, args, _) => r.hir_id == h || args.iter().any(|a| a.hir_id == h),
-                        _ => false,
-                    })
-                };
-                match e.kind {
-                    ExprKind::Path(hir::QPath::Resolved(None, p)) if p.res == Res::Local(self.x) && !arg_of_call(e.hir_id) => {
-                        self.ok = false;
-                    }
-                    // a closure capturing `x` could keep it
-                    ExprKind::Closure(c) if tcx.upvars_mentioned(c.def_id).is_some_and(|u| u.contains_key(&self.x)) => {
-                        self.ok = false;
-                    }
-                    _ => {}
-                }
-                let args: Vec<&'tcx hir::Expr<'tcx>> = match e.kind {
-                    ExprKind::Call(_, args) => args.iter().collect(),
-                    ExprKind::MethodCall(_, r, args, _) => std::iter::once(r).chain(args).collect(),
-                    _ => vec![],
-                };
-                if args.iter().any(|a| uses_local(tcx, a, self.x)) {
-                    if args.iter().any(|a| !uses_local(tcx, a, self.x) && self.tr.arg_keeps(self.tr.ty_adj(a))) {
-                        self.ok = false;
-                    }
-                    // a result with a lifetime: at once an argument, perhaps borrowed
-                    if self.tr.has_lifetime(self.tr.ty_of(e)) {
-                        let h = match tcx.parent_hir_node(e.hir_id) {
-                            hir::Node::Expr(p) if matches!(p.kind, ExprKind::AddrOf(..)) => p.hir_id,
-                            _ => e.hir_id,
-                        };
-                        if !arg_of_call(h) {
-                            self.ok = false;
-                        }
-                    }
-                }
-                intravisit::walk_expr(self, e);
-            }
-        }
-        let mut v = V { tr: self, x, ok: true };
-        v.visit_expr(e);
-        v.ok
-    }
-
-    /// The values of the arguments `es` of a call, in order, and, if an argument mutably borrows a
-    /// subslice (see `borrow_mut`), the statements that bind the arguments in order (each after
-    /// the copy-in of its subslice) and the write-backs that follow the call (see
-    /// `with_writeback`); the values are then the bound names.
-    fn call_args(&mut self, es: &[&'tcx hir::Expr<'tcx>]) -> R<(Vec<Tr>, Vec<String>, Vec<String>)> {
-        let outer = self.call_scope.replace(CallScope::default());
-        let r = self.call_args_scoped(es);
-        self.call_scope = outer;
-        r
-    }
-
-    fn call_args_scoped(&mut self, es: &[&'tcx hir::Expr<'tcx>]) -> R<(Vec<Tr>, Vec<String>, Vec<String>)> {
-        let mut vals = vec![];
-        let mut copies = vec![];
-        for e in es {
-            // the place whose mutable borrow is the argument: explicit (`&mut v[a..b]`), or the
-            // auto-borrow of a method's receiver (`v[a..b].fill(x)`)
-            let target = match e.kind {
-                ExprKind::AddrOf(hir::BorrowKind::Ref, m, x) if m.is_mut() => x.hir_id,
-                _ => e.hir_id,
-            };
-            self.call_scope.as_mut().expect("call scope").current = Some(target);
-            let v = self.val(e)?;
-            let s = self.call_scope.as_mut().expect("call scope");
-            s.current = None;
-            copies.push(std::mem::take(&mut s.pre));
-            vals.push(v);
-        }
-        let post = std::mem::take(&mut self.call_scope.as_mut().expect("call scope").post);
-        if post.is_empty() {
-            return Ok((vals, vec![], vec![]));
-        }
-        let mut prelude = vec![];
-        let mut argv = vec![];
-        for (v, c) in vals.into_iter().zip(copies) {
-            prelude.extend(c);
-            let n = self.fresh("arg");
-            prelude.push(format!("let {} = {};", n, v.at(20)));
-            argv.push(Tr::atom(n));
-        }
-        Ok((argv, prelude, post))
-    }
-
-    /// The call `c` (of the expression `e`, with the arguments `args`) preceded by `prelude` and
-    /// followed by the write-backs `post` (see `call_args`). The borrows of the subslices end with
-    /// the call, unless the callee can keep them: in its result (its type has a lifetime), or
-    /// through an argument referring to something with a lifetime (e.g. `refs.push(&mut v[..2])`
-    /// with `refs: Vec<&mut [u8]>`).
-    fn with_writeback(
-        &mut self,
-        c: Tr,
-        prelude: Vec<String>,
-        post: Vec<String>,
-        e: &'tcx hir::Expr<'tcx>,
-        args: &[&'tcx hir::Expr<'tcx>],
-    ) -> R<Tr> {
-        if post.is_empty() { return Ok(c) }
-        let keeps = self.has_lifetime(self.ty_of(e)) || args.iter().any(|a| self.arg_keeps(self.ty_adj(a)));
-        if keeps {
-            return unsup("mutable borrow of a subslice that the call may keep");
-        }
-        let res = self.fresh("res");
-        Ok(Tr::block(format!("{{\n{}\nlet {} = {};\n{}\n{}\n}}", prelude.join("\n"), res, c.at(20), post.join("\n"), res)))
     }
 
     fn pv_unadj(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<PV> {
@@ -1301,6 +976,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 let is_range = self.range_kind(self.ty_adj(idx).peel_refs()).is_some();
                 let bpv = self.index_base(base)?;
+                if let PV::Ref(r) = &bpv
+                    && let Some(p) = self.index_place(e, base, idx, r)?
+                {
+                    return Ok(PV::Ref(p));
+                }
+                // an open range on a value with side effects (`&f()[..6]`): the value is bound first
+                if let PV::Val(v) = &bpv
+                    && matches!(self.range_literal(idx), Some((RangeKind::From | RangeKind::To | RangeKind::ToInclusive | RangeKind::Full, _)))
+                    && !self.is_simple(base)
+                {
+                    let tmp = self.fresh("base");
+                    let bind = format!("let {} = {};", tmp, v.at(20));
+                    let Some((lo, hi, incl)) = self.range_bounds(idx, Tr::atom(format!("len({})", tmp)))? else { return unsup("range index") };
+                    let sub = format!("{}[{} {} {}]", tmp, lo.at(42), if incl { "..=" } else { ".." }, hi.at(42));
+                    return Ok(PV::Val(Tr::block(format!("{{ {} {} }}", bind, sub))));
+                }
                 let i = match self.open_range(base, idx, &bpv)? {
                     Some(i) => i,
                     None => {
@@ -1323,6 +1014,31 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
+    /// `base[idx]` with a range `idx` and the reference `r` to `base` (a sequence): the reference
+    /// to the subslice (a focus on the elements between the ones before and the ones after it, see
+    /// AutoCorrode's `slice_range_mut`), in a place borrowed mutably or assigned (see
+    /// `mark_mut_place`), for an open range on a base with side effects (see `open_range`), and for
+    /// a range held in a variable; `None` otherwise (the subslice is a value). A slice keeps its
+    /// length, so the focus stays on the elements of the range while the borrow lives.
+    fn index_place(&mut self, e: &'tcx hir::Expr<'tcx>, base: &'tcx hir::Expr<'tcx>, idx: &'tcx hir::Expr<'tcx>, r: &Tr) -> R<Option<Tr>> {
+        let Some(kind) = self.range_kind(self.ty_adj(idx).peel_refs()) else { return Ok(None) };
+        let literal = self.range_literal(idx).is_some() || matches!(kind, RangeKind::Inclusive);
+        let open = matches!(kind, RangeKind::From | RangeKind::To | RangeKind::ToInclusive | RangeKind::Full);
+        if !(self.mut_places.contains(&e.hir_id) || (open && !self.is_simple(base)) || !literal) {
+            return Ok(None);
+        }
+        let model = match kind {
+            RangeKind::Range | RangeKind::Inclusive => "slice_range_mut",
+            RangeKind::From => "slice_range_from_mut",
+            RangeKind::To => "slice_range_to_mut",
+            RangeKind::ToInclusive => "slice_range_to_inclusive_mut",
+            // the whole sequence (`..` has no effect)
+            RangeKind::Full => return Ok(Some(r.clone())),
+        };
+        let i = self.val(idx)?;
+        Ok(Some(self.named_call(model, vec![r.clone(), i])))
+    }
+
     /// A sequence index `a..`, `..b`, `..=b` or `..` written as the closed uRust range
     /// `a .. len(base)`, `0 .. b`, `0 ..= b`, `0 .. len(base)`. The missing end repeats the base,
     /// so only a base without side effects qualifies; `None` for every other index.
@@ -1342,6 +1058,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// The place denoted by an expression; must be a reference.
     fn place(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        self.mark_mut_place(e);
         let mut pv = self.pv_adjusted(e)?;
         // overloaded compound assignment auto-borrows its left-hand side: go back to the place
         let mut t = self.ty_adj(e);
@@ -1375,9 +1092,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if let Some(t) = self.encode_utf8_bytes(did, recv)? {
                     return Ok(t);
                 }
-                let (argv, prelude, post) = self.call_args(&arg_exprs)?;
-                let c = self.call_def(did, gargs, argv, &arg_exprs, e)?;
-                self.with_writeback(c, prelude, post, e, &arg_exprs)
+                let argv = self.vals(arg_exprs.iter().copied())?;
+                self.call_def(did, gargs, argv, &arg_exprs, e)
             }
             ExprKind::Tup(es) => {
                 if es.is_empty() { return Ok(Tr::atom("()")) }
@@ -1443,10 +1159,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::AddrOf(hir::BorrowKind::Ref, m, x) => {
                 if m.is_mut() {
-                    // `&mut v[a..b]` as a call's argument (before `x` is translated as a value)
-                    if self.in_subslice(x) && let Some(r) = self.subslice_copy_in(x)? {
-                        return Ok(r);
-                    }
+                    self.mark_mut_place(x);
                     let t = self.ty_adj(x);
                     let pv = self.pv_adjusted(x)?;
                     match self.borrow_mut(x, pv, t)? {
@@ -1883,9 +1596,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let ty::FnDef(_, gargs) = *self.ty_of(callee).kind() else { return unsup("call target") };
                 let gargs = self.tcx.instantiate_bound_regions_with_erased(gargs);
                 let arg_exprs: Vec<&'tcx hir::Expr<'tcx>> = args.iter().collect();
-                let (argv, prelude, post) = self.call_args(&arg_exprs)?;
-                let c = self.call_def(did, gargs, argv, &arg_exprs, e)?;
-                self.with_writeback(c, prelude, post, e, &arg_exprs)
+                let argv = self.vals(arg_exprs.iter().copied())?;
+                self.call_def(did, gargs, argv, &arg_exprs, e)
             }
             Res::Def(DefKind::Ctor(of, CtorKind::Fn), ctor) => {
                 let (adt, vidx) = self.ctor_variant(of, ctor);
@@ -2796,6 +2508,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         "take" => Take,
                         "filter" => Filter,
                         "any" => Any,
+                        "for_each" => ForEach,
                         "min" => Min,
                         "take_while" => TakeWhile,
                         "map" => Map,
@@ -2863,6 +2576,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("slice", "last") => Model("slice_last"),
             ("slice", "get") => SliceGet,
             ("slice", "copy_within") => SliceCopyWithin,
+            ("Range" | "RangeInclusive", "contains") => RangeContains,
+            ("slice", "get_mut") => SliceGetMut,
             ("slice", "chunks_exact") => Model("slice_chunks_exact"),
             ("slice", "chunks") => Model("slice_chunks"),
             ("slice", "copy_from_slice") => Model("slice_copy_from_slice"),
@@ -3028,6 +2743,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 };
                 m.map(|m| self.named_call(m, vec![a(0), a(1)]))
             }
+            SliceGetMut if self.ty_adj(arg_exprs[1]).peel_refs().is_usize() => Some(self.named_call("slice_get_mut", vec![a(0), a(1)])),
+            SliceGetMut if matches!(self.range_kind(self.ty_adj(arg_exprs[1]).peel_refs()), Some(RangeKind::Range | RangeKind::Inclusive)) => {
+                Some(self.named_call("slice_get_range_mut", vec![a(0), a(1)]))
+            }
+            // `iter_mut()` as a value (in a `for` loop, see `for_loop`)
+            SliceIterMut => Some(self.named_call("slice_iter_mut_list", vec![a(0)])),
+            // of an integer range (AutoCorrode's `contains`)
+            RangeContains => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
+                ty::Adt(_, ra) if ra.type_at(0).is_integral() && ra.type_at(0) == self.ty_adj(arg_exprs[1]).peel_refs() => {
+                    Some(self.named_call("contains", vec![a(0), a(1)]))
+                }
+                _ => None,
+            },
             SliceCopyWithin => match self.ty_adj(arg_exprs[1]).peel_refs().kind() {
                 ty::Adt(d, _) if matches!(self.fe.std_adt(d.did()), Some("Range" | "RangeInclusive")) => {
                     Some(self.named_call("slice_copy_within", vec![a(0), a(1), a(2)]))
@@ -3177,14 +2905,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Int(_) => Some("(\\<lambda>a b. ord_cmp (sint a) (sint b))".into()),
             ty::Char => Some("(\\<lambda>a b. ord_cmp (of_char a :: nat) (of_char b))".into()),
             ty::Adt(d, args) if d.is_struct() && d.did().is_local() && self.fe.record_adts.contains(&d.did()) && !seen.contains(&d.did()) => {
-                // `sort` compares with `PartialOrd::lt`: both `Ord` and `PartialOrd` are derived
+                // `sort` compares with `PartialOrd::lt`: `Ord` and `PartialOrd` are derived, and
+                // `lt` is derived or `PartialOrd`'s default (through the derived `partial_cmp`)
                 let ord = self.tcx.get_diagnostic_item(sym::Ord)?;
                 let cmp = self.tcx.associated_items(ord).filter_by_name_unhygienic(sym::cmp).next()?.def_id;
                 let lt = self.tcx.get_diagnostic_item(Symbol::intern("cmp_partialord_lt"))?;
-                let derived = |m: DefId, args: GenericArgsRef<'tcx>| {
-                    matches!(self.resolve_instance(m, args), Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd))
+                let partial_cmp = self.tcx.get_diagnostic_item(Symbol::intern("cmp_partialord_cmp"))?;
+                let resolves = |m: DefId, args: GenericArgsRef<'tcx>, default_ok: bool| {
+                    matches!(self.resolve_instance(m, args), Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. }))
+                        if self.derived(rd) || (default_ok && rd == m))
                 };
-                if !(derived(cmp, self.tcx.mk_args(&[t.into()])) && derived(lt, self.tcx.mk_args(&[t.into(), t.into()]))) {
+                let one = self.tcx.mk_args(&[t.into()]);
+                let two = self.tcx.mk_args(&[t.into(), t.into()]);
+                if !(resolves(cmp, one, false) && resolves(partial_cmp, two, false) && resolves(lt, two, true)) {
                     return None;
                 }
                 seen.push(d.did());
@@ -3300,6 +3033,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             TakeWhile if modelled(self, res) => Some(tuple(vec![a(0).s, "False".into(), a(1).s])),
             Same if modelled(self, res) => Some(a(0)),
             Count => step(self, recv).map(|s| self.named_call("iter_count", vec![fuel.clone(), s, a(0)])),
+            ForEach => step(self, recv).map(|s| self.named_call("iter_for_each", vec![fuel.clone(), s, a(1), a(0)])),
             // the least of unsigned integers
             Min => match res.kind() {
                 ty::Adt(_, oa) if matches!(oa.types().next().map(|t| *t.kind()), Some(ty::Uint(_))) => {
@@ -3659,21 +3393,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ht = self.ty_of(head);
         // over `&mut` of a slice, array or Vec (or `xs.iter_mut()`) the items are references to
         // the elements: AutoCorrode's `iter_mut`
-        // over `&mut v[a..b]`, the subslice is copied in before the loop and written back after it
-        // (see `call_args`), unless the body can leave the loop otherwise or can keep an item (a
-        // reference into the copy)
-        let mut write_back = (vec![], vec![]);
         let mut_items = match ht.kind() {
-            ty::Ref(_, inner, m)
-                if m.is_mut()
-                    && self.list_like(*inner)
-                    && !exits_early(some_arm.body, arm.body.hir_id)
-                    && only_deref_uses(self.tcx, some_arm.body, pat) =>
-            {
-                let (mut vs, prelude, post) = self.call_args(&[head])?;
-                write_back = (prelude, post);
-                Some(vs.remove(0))
-            }
             ty::Ref(_, inner, m) if m.is_mut() && self.list_like(*inner) => Some(self.val(head)?),
             _ if let Some(recv) = self.std_method_recv(head, StdFn::SliceIterMut) => Some(self.val(recv)?),
             _ => None,
@@ -3728,10 +3448,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
         };
         let body = with_prologue(&pro, &self.branch(some_arm.body)?);
-        let lp = Tr::new(format!("{}for {} in {} {{\n{}\n}}", lbl, ps, iter_s.at(20), body), 11);
-        let (prelude, post) = write_back;
-        if post.is_empty() { return Ok(lp) }
-        Ok(Tr::block(format!("{{\n{}\n{};\n{}\n}}", prelude.join("\n"), lp.s, post.join("\n"))))
+        Ok(Tr::new(format!("{}for {} in {} {{\n{}\n}}", lbl, ps, iter_s.at(20), body), 11))
     }
 
     // ------------------------------------------------------------------
@@ -4234,9 +3951,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let ExprKind::MethodCall(_, c, [buf], _) = recv.kind else { return Ok(None) };
         let Some(inner) = self.typeck.type_dependent_def_id(recv.hir_id) else { return Ok(None) };
         if self.std_fn(inner) != Some(StdFn::CharEncodeUtf8) { return Ok(None) }
-        let (argv, prelude, post) = self.call_args(&[c, buf])?;
-        let call = self.named_call("char_encode_utf8_bytes", argv);
-        Ok(Some(self.with_writeback(call, prelude, post, recv, &[c, buf])?))
+        let argv = self.vals([c, buf])?;
+        Ok(Some(self.named_call("char_encode_utf8_bytes", argv)))
     }
 
     /// A tuple-like constructor used as a function value: the closure calling it (as for function
@@ -4501,6 +4217,10 @@ enum StdFn {
     DefaultFn,
     /// `char::encode_utf8`
     CharEncodeUtf8,
+    /// `Range(Inclusive)::contains`
+    RangeContains,
+    /// `<[T]>::get_mut` with an index
+    SliceGetMut,
     /// `str::starts_with` with a `char` or a `&str` pattern
     StrStartsWith,
     /// `str::parse` into an integer type
@@ -4531,6 +4251,7 @@ enum IterFn {
     Filter,
     Any,
     Min,
+    ForEach,
 }
 
 /// A lang item, or a diagnostic item by its name in the table of the standard library.
@@ -4567,6 +4288,8 @@ const STD_ITEMS: &[(Item, StdFn)] = &[
     (Item::Diag("mem_size_of"), StdFn::SizeOf),
     (Item::Diag("try_from_fn"), StdFn::TryIntoArray),
     (Item::Diag("cmp_partialord_cmp"), StdFn::PartialCmp),
+    (Item::Diag("mem_swap"), StdFn::Model("mem_swap")),
+    (Item::Diag("mem_replace"), StdFn::Model("mem_replace")),
     (Item::Diag("default_fn"), StdFn::DefaultFn),
 ];
 
@@ -4596,84 +4319,6 @@ fn with_prologue(pro: &[String], body: &str) -> String {
 
 fn paren_if(c: &str) -> String {
     if c.contains(' ') { format!("({})", c) } else { c.to_string() }
-}
-
-/// Whether `e` mentions the local `x`, also as a variable captured by a closure.
-fn uses_local<'tcx>(tcx: TyCtxt<'tcx>, e: &'tcx hir::Expr<'tcx>, x: HirId) -> bool {
-    struct U<'t>(TyCtxt<'t>, HirId, bool);
-    impl<'v> Visitor<'v> for U<'_> {
-        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
-            match e.kind {
-                ExprKind::Path(hir::QPath::Resolved(None, p)) if p.res == Res::Local(self.1) => self.2 = true,
-                ExprKind::Closure(c) if self.0.upvars_mentioned(c.def_id).is_some_and(|u| u.contains_key(&self.1)) => self.2 = true,
-                _ => {}
-            }
-            intravisit::walk_expr(self, e);
-        }
-    }
-    let mut u = U(tcx, x, false);
-    u.visit_expr(e);
-    u.2
-}
-
-/// Whether the pattern `pat` is a single binding that `body` uses only dereferenced (`*x`): a
-/// `for` loop's item, a reference into a copied-in subslice (see `for_loop`), is then not kept.
-fn only_deref_uses<'tcx>(tcx: TyCtxt<'tcx>, body: &'tcx hir::Expr<'tcx>, pat: &hir::Pat<'tcx>) -> bool {
-    let PatKind::Binding(_, hid, _, None) = pat.kind else { return false };
-    struct Uses<'t> {
-        tcx: TyCtxt<'t>,
-        hid: HirId,
-        ok: bool,
-    }
-    impl<'v> Visitor<'v> for Uses<'_> {
-        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
-            if let ExprKind::Path(hir::QPath::Resolved(None, p)) = e.kind
-                && p.res == Res::Local(self.hid)
-                && !matches!(self.tcx.parent_hir_node(e.hir_id), hir::Node::Expr(d) if matches!(d.kind, ExprKind::Unary(UnOp::Deref, _)))
-            {
-                self.ok = false;
-            }
-            intravisit::walk_expr(self, e);
-        }
-    }
-    let mut u = Uses { tcx, hid, ok: true };
-    u.visit_expr(body);
-    u.ok
-}
-
-/// Whether control can leave `body` other than by finishing it or by a `break`/`continue` of the
-/// loop `lp` (or of a loop or block inside `body`): a `return` (also of `?`), or a jump to an
-/// enclosing loop or block.
-fn exits_early<'tcx>(body: &'tcx hir::Expr<'tcx>, lp: HirId) -> bool {
-    use rustc_hir::intravisit::{self, Visitor};
-    struct Inner(Vec<HirId>);
-    impl<'v> Visitor<'v> for Inner {
-        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
-            if matches!(e.kind, ExprKind::Loop(..) | ExprKind::Block(..)) {
-                self.0.push(e.hir_id);
-            }
-            intravisit::walk_expr(self, e);
-        }
-    }
-    struct Exits<'a>(&'a [HirId], HirId, bool);
-    impl<'v> Visitor<'v> for Exits<'_> {
-        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
-            match e.kind {
-                ExprKind::Ret(_) | ExprKind::Become(_) => self.2 = true,
-                ExprKind::Break(d, _) | ExprKind::Continue(d) => match d.target_id {
-                    Ok(t) if t == self.1 || self.0.contains(&t) => {}
-                    _ => self.2 = true,
-                },
-                _ => {}
-            }
-            intravisit::walk_expr(self, e);
-        }
-    }
-    let mut inner = Inner(vec![]);
-    inner.visit_expr(body);
-    let mut ex = Exits(&inner.0, lp, false);
-    ex.visit_expr(body);
-    ex.2
 }
 
 fn contains_let(e: &hir::Expr<'_>) -> bool {
