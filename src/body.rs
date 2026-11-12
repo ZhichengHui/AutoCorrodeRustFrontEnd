@@ -1959,9 +1959,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// takes for its method's own bounds (see `impl_dict`); one of the body's dictionary parameters
     /// (or a supertrait's in one), or an implementation's.
     fn dict_term(&mut self, r: ty::TraitRef<'tcx>) -> R<String> {
-        let own = self.own_dicts.clone();
-        if let Some(d) = own.into_iter().find_map(|(p, n)| self.bound_dict(p, n, r)) {
-            return Ok(d);
+        for k in 0..self.own_dicts.len() {
+            let (p, n) = self.own_dicts[k].clone();
+            if let Some(d) = self.bound_dict(p, n, r) {
+                return Ok(d);
+            }
         }
         match self.select(r)? {
             traits::ImplSource::UserDefined(d) => self.impl_dict(d.impl_def_id, d.args),
@@ -1986,7 +1988,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let Some(f) = self.model_field(r, m) else {
                 return unsup(format!("dictionary of the {} implementation of `{}`", what, r));
             };
-            let ns = self.own_dict_names(m);
+            let ns = self.own_dict_names(self.fe.own_dict_bounds(m).len());
             fields.push(paren_term(&lambda(&ns, f)));
         }
         for p in self.fe.dict_parents(r.def_id) {
@@ -2113,9 +2115,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             let margs = ty::GenericArgs::for_item(tcx, m, |p, _| {
                 if (p.index as usize) < r.args.len() { r.args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
             });
-            let ns = self.own_dict_names(m);
+            let own = self.fe.own_dict_bounds(m);
+            let ns = self.own_dict_names(own.len());
             let depth = self.own_dicts.len();
-            for (b, n) in self.fe.own_dict_bounds(m).into_iter().zip(&ns) {
+            for (b, n) in own.into_iter().zip(&ns) {
                 let b = tcx.erase_and_anonymize_regions(ty::EarlyBinder::bind(tcx, b).instantiate(tcx, margs).skip_normalization());
                 self.own_dicts.push((b, n.clone()));
             }
@@ -2130,10 +2133,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(if fields.is_empty() { name } else { format!("{} {}", name, fields.join(" ")) })
     }
 
-    /// Fresh names for the dictionaries of the own bounds of the trait method `m` that its field
-    /// takes (see `impl_dict`).
-    fn own_dict_names(&mut self, m: DefId) -> Vec<String> {
-        let n = self.fe.own_dict_bounds(m).len();
+    /// `n` fresh names for the dictionaries of the own bounds of a trait method that its field takes
+    /// (see `impl_dict`).
+    fn own_dict_names(&mut self, n: usize) -> Vec<String> {
         (0..n)
             .map(|_| {
                 self.fresh += 1;
@@ -2153,29 +2155,27 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         implementors: &rustc_hir::def_id::DefIdMap<DefId>,
     ) -> R<String> {
         let tcx = self.tcx;
-        Ok({
-            match implementors.get(&m) {
-                Some(&im) if imp.is_local() => {
-                    let iargs = ty::GenericArgs::for_item(tcx, im, |p, _| {
-                        if (p.index as usize) < args.len() { args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
-                    });
-                    self.fn_value((im, Inst::Generic), iargs)?
-                }
-                // a standard-library implementation's method is its model, if it has one, as in
-                // direct calls (see `std_call`); other external ones are templates
-                Some(&im) => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
-                    Some(f) => f,
-                    None => self.fe.ext_fun(im, false),
-                },
-                None if imp.is_local() && m.is_local() => {
-                    let key = self.fe.impl_copy(m, imp);
-                    self.fn_value(key, args)?
-                }
-                None => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
-                    Some(f) => f,
-                    None => self.fe.ext_fun(m, false),
-                },
+        Ok(match implementors.get(&m) {
+            Some(&im) if imp.is_local() => {
+                let iargs = ty::GenericArgs::for_item(tcx, im, |p, _| {
+                    if (p.index as usize) < args.len() { args[p.index as usize] } else { tcx.lifetimes.re_erased.into() }
+                });
+                self.fn_value((im, Inst::Generic), iargs)?
             }
+            // a standard-library implementation's method is its model, if it has one, as in
+            // direct calls (see `std_call`); other external ones are templates
+            Some(&im) => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
+                Some(f) => f,
+                None => self.fe.ext_fun(im, false),
+            },
+            None if imp.is_local() && m.is_local() => {
+                let key = self.fe.impl_copy(m, imp);
+                self.fn_value(key, args)?
+            }
+            None => match self.fe.is_std(imp).then(|| self.model_field(r, m)).flatten() {
+                Some(f) => f,
+                None => self.fe.ext_fun(m, false),
+            },
         })
     }
 

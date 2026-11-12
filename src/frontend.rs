@@ -178,6 +178,8 @@ pub struct Frontend<'tcx> {
     pub proj_env: Option<ty::TypingEnv<'tcx>>,
     /// The methods of each trait that are fields of its dictionaries (see `dict_methods`).
     pub dict_methods_memo: std::cell::RefCell<HashMap<DefId, Vec<DefId>>>,
+    /// The own bounds of each trait method that are dictionary parameters (see `own_dict_bounds`).
+    pub own_dict_bounds_memo: std::cell::RefCell<HashMap<DefId, Vec<ty::TraitRef<'tcx>>>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
     /// `Fn` traits (see `fn_param_types`).
     pub fn_params: HashMap<u32, String>,
@@ -298,6 +300,7 @@ impl<'tcx> Frontend<'tcx> {
             proj_tvars: None,
             proj_env: None,
             dict_methods_memo: Default::default(),
+            own_dict_bounds_memo: Default::default(),
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
             gen_calls: Vec::new(),
@@ -411,7 +414,10 @@ impl<'tcx> Frontend<'tcx> {
             Inst::Mono(_) => ty::TypingEnv::fully_monomorphized(),
             Inst::ImplCopy(imp) => {
                 let at = self.inst_args(key).expect("a copy has the arguments of its implementation");
-                let own = tcx.clauses_of(key.0).instantiate_own(tcx, at).map(|(c, _)| c.skip_normalization());
+                // (normalised there, as rustc normalises a typing environment: `<Foo<T> as Tr>::A:
+                // Clone` is `T: Clone` under `type A = T`)
+                let ienv = ty::TypingEnv::post_analysis(tcx, imp);
+                let own = tcx.clauses_of(key.0).instantiate_own(tcx, at).map(|(c, _)| normalize(tcx, ienv, c));
                 let clauses: Vec<ty::Clause<'tcx>> = tcx.param_env(imp).caller_bounds().chain(own).collect();
                 let pe = ty::ParamEnv::new(tcx, ty::elaborate::elaborate(tcx, clauses));
                 ty::TypingEnv::new(pe, ty::TypingMode::non_body_analysis()).with_post_analysis_normalized(tcx)

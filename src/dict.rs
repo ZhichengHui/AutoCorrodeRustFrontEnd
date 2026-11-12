@@ -369,6 +369,15 @@ impl<'tcx> Frontend<'tcx> {
     /// a trait method takes them before the method's arguments (see `dict_decl`), as Aeneas's
     /// method clauses.
     pub fn own_dict_bounds(&self, m: DefId) -> Vec<ty::TraitRef<'tcx>> {
+        if let Some(bs) = self.own_dict_bounds_memo.borrow().get(&m) {
+            return bs.clone();
+        }
+        let bs = self.find_own_dict_bounds(m);
+        self.own_dict_bounds_memo.borrow_mut().insert(m, bs.clone());
+        bs
+    }
+
+    fn find_own_dict_bounds(&self, m: DefId) -> Vec<ty::TraitRef<'tcx>> {
         let tcx = self.tcx;
         let mut out: Vec<ty::TraitRef<'tcx>> = vec![];
         for (c, _) in tcx.clauses_of(m).instantiate_own_identity() {
@@ -395,9 +404,10 @@ impl<'tcx> Frontend<'tcx> {
             Inst::ImplCopy(imp) => {
                 let mut bs = self.dict_bounds(imp);
                 let at = self.inst_args(key).expect("a copy has the arguments of its implementation");
+                // (those still on types with generic parameters, as in `dict_bounds`)
                 for b in self.own_dict_bounds(key.0) {
                     let b = tcx.erase_and_anonymize_regions(ty::EarlyBinder::bind(tcx, b).instantiate(tcx, at).skip_normalization());
-                    if !bs.contains(&b) {
+                    if b.args.has_param() && !bs.contains(&b) {
                         bs.push(b);
                     }
                 }

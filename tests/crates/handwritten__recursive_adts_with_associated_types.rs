@@ -1,6 +1,7 @@
 // Mutually recursive ADTs with associated types of their type parameters in fields: the members
 // of the group share the union of their associated types as extra type parameters (`Tree` uses
-// `S::Unit`, `Forest` uses `S::Label`), at generic and at concrete uses.
+// `S::Unit`, `Forest` uses `U::Label`; the members' parameters are shared by position), at generic
+// and at concrete uses.
 pub trait Shape {
     type Unit;
     type Label;
@@ -11,9 +12,9 @@ pub enum Tree<S: Shape> {
     Node(Forest<S>),
 }
 
-pub struct Forest<S: Shape> {
-    pub trees: Vec<Tree<S>>,
-    pub label: S::Label,
+pub struct Forest<U: Shape> {
+    pub trees: Vec<Tree<U>>,
+    pub label: U::Label,
 }
 
 pub struct Square;

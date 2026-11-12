@@ -786,13 +786,17 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             });
             let (own, env) = (ty::GenericArgs::identity_for_item(tcx, d), ty::TypingEnv::post_analysis(tcx, d));
             let shared_field_ty = |f: &ty::FieldDef| ty::EarlyBinder::bind(tcx, field_ty(tcx, f, own, env)).instantiate(tcx, to_shared).skip_normalization();
-            // the members of a group share their projections' type parameters (see `collect_adts`)
+            // the members of a group share their projections' type parameters (see `collect_adts`);
+            // the field types are at the group's parameters, and so are the projections and the
+            // typing environment (`d`'s bounds there) in which the ADTs in them are normalised
+            let at_shared = |p: Ty<'tcx>| ty::EarlyBinder::bind(tcx, p).instantiate(tcx, to_shared).skip_normalization();
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
             fe.proj_tvars = Some(
-                projs.into_iter().map(|p| fe.proj_key(p).expect("projections are aliases")).zip(proj_names.iter().cloned()).collect(),
+                projs.into_iter().map(|p| fe.proj_key(at_shared(p)).expect("projections are aliases")).zip(proj_names.iter().cloned()).collect(),
             );
-            fe.proj_env = Some(env);
+            let bounds = tcx.param_env(d).caller_bounds().map(|c| ty::EarlyBinder::bind(tcx, c).instantiate(tcx, to_shared).skip_normalization());
+            fe.proj_env = Some(ty::TypingEnv::new(ty::ParamEnv::new(tcx, bounds), ty::TypingMode::non_body_analysis()).with_post_analysis_normalized(tcx));
             let has_const = tcx.generics_of(d).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
             let mut tparams = tparams.clone();
             tparams.extend(proj_names);
@@ -986,14 +990,7 @@ fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> HashSet<u
     for comp in sccs(&ids, &succ) {
         let group: HashSet<FnKey<'tcx>> = comp.iter().copied().collect();
         // union-find over (member, type parameter index); each class lists its members
-        let mut class: HashMap<(FnKey<'tcx>, u32), usize> = HashMap::new();
-        let mut members: Vec<Vec<FnKey<'tcx>>> = vec![];
-        let node = |k: (FnKey<'tcx>, u32), class: &mut HashMap<(FnKey<'tcx>, u32), usize>, members: &mut Vec<Vec<FnKey<'tcx>>>| {
-            *class.entry(k).or_insert_with(|| {
-                members.push(vec![k.0]);
-                members.len() - 1
-            })
-        };
+        let mut uf = Renaming::default();
         for &caller in &comp {
             let mut ms = vec![];
             markers_in(fe, &defs[by_id[&caller]].body, &poly, &mut ms);
@@ -1011,24 +1008,14 @@ fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> HashSet<u
                         _ => None,
                     })
                     .collect();
+                // the call's renaming is added only if all of it is consistent
                 let consistent = renaming.is_some_and(|r| {
-                    r.into_iter().all(|(i, j)| {
-                        let (a, b) = (node((callee, i), &mut class, &mut members), node((caller, j), &mut class, &mut members));
-                        if a == b {
-                            return true;
-                        }
-                        if members[a].iter().any(|m| members[b].contains(m)) {
-                            return false;
-                        }
-                        let moved = std::mem::take(&mut members[b]);
-                        members[a].extend(moved);
-                        for c in class.values_mut() {
-                            if *c == b {
-                                *c = a;
-                            }
-                        }
-                        true
-                    })
+                    let mut tried = uf.clone();
+                    let ok = r.into_iter().all(|(i, j)| tried.unite((callee, i), (caller, j)));
+                    if ok {
+                        uf = tried;
+                    }
+                    ok
                 });
                 if !consistent {
                     poly.insert(n);
@@ -1037,6 +1024,44 @@ fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> HashSet<u
         }
     }
     poly
+}
+
+/// Classes of type parameters (member, index) of a recursive group that its calls rename into
+/// each other (see `poly_rec_calls`), with the members each class has parameters of.
+#[derive(Clone, Default)]
+struct Renaming<'tcx> {
+    class: HashMap<(FnKey<'tcx>, u32), usize>,
+    members: Vec<Vec<FnKey<'tcx>>>,
+}
+
+impl<'tcx> Renaming<'tcx> {
+    fn class_of(&mut self, k: (FnKey<'tcx>, u32)) -> usize {
+        let members = &mut self.members;
+        *self.class.entry(k).or_insert_with(|| {
+            members.push(vec![k.0]);
+            members.len() - 1
+        })
+    }
+
+    /// Put `x` and `y` in one class, unless that would rename two parameters of a member into
+    /// each other.
+    fn unite(&mut self, x: (FnKey<'tcx>, u32), y: (FnKey<'tcx>, u32)) -> bool {
+        let (a, b) = (self.class_of(x), self.class_of(y));
+        if a == b {
+            return true;
+        }
+        if self.members[a].iter().any(|m| self.members[b].contains(m)) {
+            return false;
+        }
+        let moved = std::mem::take(&mut self.members[b]);
+        self.members[a].extend(moved);
+        for c in self.class.values_mut() {
+            if *c == b {
+                *c = a;
+            }
+        }
+        true
+    }
 }
 
 /// The allocation records (see `BodyTr::alloc`): for each translation, the types with generic
@@ -1210,9 +1235,7 @@ fn subst_markers<'tcx>(
                 let j = allocs.set(me).iter().position(|(u, _)| *u == t).expect("a cell's type is in its body's record");
                 format!("({}_{} {})", allocs.names[&me], j, ALLOC_PARAM)
             }
-            "F" if poly.contains_key(&idx) => {
-                format!("\\<epsilon>\\<open>(unimplemented (STR ''{}'') :: (_, _, _, _, _, _) expression)\\<close>", poly[&idx])
-            }
+            "F" if poly.contains_key(&idx) => poly[&idx].clone(),
             "F" | "V" => {
                 let callee = fe.gen_calls[idx].callee;
                 // every marked callee is a local item with a body, hence translated
@@ -1292,28 +1315,48 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
     let mut defs = std::mem::take(&mut fe.fun_defs);
     let poly_calls = poly_rec_calls(fe, &defs);
     let allocs = alloc_sets(fe, &defs, &poly_calls);
-    // the polymorphic-recursive calls are placeholders; one as a function value makes its whole
-    // definition one (its function type is not known here)
+    // the polymorphic-recursive calls are placeholders (of the calls' result types); one as a
+    // function value makes its whole definition one (the value's function type is not known here)
     let mut poly: HashMap<usize, String> = HashMap::new();
     for d in defs.iter_mut() {
         let mut ms = vec![];
         markers_in(fe, &d.body, &HashSet::new(), &mut ms);
-        for (kind, n) in ms {
-            if !poly_calls.contains(&n) || poly.contains_key(&n) {
-                continue;
-            }
-            let what = format!(
+        ms.retain(|&(kind, n)| matches!(kind, 'F' | 'V') && poly_calls.contains(&n));
+        let what = |fe: &Frontend<'tcx>, n: usize| {
+            format!(
                 "call of `{}` at other type arguments within its recursive group (polymorphic recursion)",
                 fe.tcx.def_path_str(fe.gen_calls[n].callee.0)
-            );
-            let m = fe.placeholder(&what, Some(fe.tcx.def_span(d.key.0)));
+            )
+        };
+        if let Some(&(_, n)) = ms.iter().find(|(kind, _)| *kind == 'V') {
+            let m = fe.placeholder(&what(fe, n), Some(fe.tcx.def_span(d.key.0)));
             d.comments.push(m.clone());
-            if kind == 'V' {
-                d.params = (0..d.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
-                d.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
-                break;
+            d.params = (0..d.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
+            d.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
+            d.calls.clear();
+            continue;
+        }
+        for (_, n) in ms {
+            if poly.contains_key(&n) {
+                continue;
             }
-            poly.insert(n, names::string_token(&m));
+            let m = fe.placeholder(&what(fe, n), Some(fe.tcx.def_span(d.key.0)));
+            d.comments.push(m.clone());
+            let (callee, kargs) = (fe.gen_calls[n].callee, fe.gen_calls[n].kargs);
+            let ret = fe.tcx.instantiate_bound_regions_with_erased(fe.tcx.fn_sig(callee.0).instantiate_identity().skip_normalization()).output();
+            let ret = match fe.inst_args(callee) {
+                Some(a) => ty::EarlyBinder::bind(fe.tcx, ret).instantiate(fe.tcx, a).skip_normalization(),
+                None => ret,
+            };
+            let ret = at_call(fe, d.key, kargs, ret);
+            let msg = names::string_token(&m);
+            let term = if ret.is_never() {
+                format!("unimplemented!(\"{}\")", msg)
+            } else {
+                let h = hol_in(fe, d, ret);
+                format!("\\<epsilon>\\<open>(unimplemented (STR ''{}'') :: (_, {}, _, _, _, _) expression)\\<close>", msg, h)
+            };
+            poly.insert(n, term);
         }
     }
     let mut decls = String::new();
