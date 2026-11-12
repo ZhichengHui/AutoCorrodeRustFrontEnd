@@ -62,7 +62,8 @@ pub fn term_call(f: &str, a: &[String]) -> String {
 
 /// A HOL term as an argument of an application: parenthesised unless it is a name.
 fn paren_term(t: &str) -> String {
-    if t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '\u{1}' || c == '\u{2}') { t.to_string() } else { format!("({})", t) }
+    let name = t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '\u{1}' || c == '\u{2}');
+    if name || (t.starts_with('(') && crate::frontend::balanced_outer(t)) { t.to_string() } else { format!("({})", t) }
 }
 
 /// The label of a loop as it precedes the uRust loop (`'l: `), or nothing.
@@ -1977,18 +1978,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// the dictionaries of the supertraits are fields. Other methods have no model.
     fn model_dict(&mut self, r: ty::TraitRef<'tcx>, what: &str) -> R<String> {
         let tcx = self.tcx;
-        let unsupported = || unsup(format!("dictionary of the {} implementation of `{}`", what, r));
-        let clone = tcx.is_lang_item(r.def_id, LangItem::Clone);
-        let eq = tcx.is_lang_item(r.def_id, LangItem::PartialEq) && r.args.type_at(0) == r.args.type_at(1);
         let mut fields = vec![];
         for m in self.fe.dict_methods(r.def_id) {
-            fields.push(match (clone, eq, tcx.item_name(m).as_str()) {
-                (true, _, "clone") => "(\\<lambda>x. FunctionBody (literal x))".to_string(),
-                (true, _, "clone_from") => "(\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>)".to_string(),
-                (_, true, "eq") => "(\\<lambda>a b. FunctionBody \\<lbrakk> a == b \\<rbrakk>)".to_string(),
-                (_, true, "ne") => "(\\<lambda>a b. FunctionBody \\<lbrakk> a != b \\<rbrakk>)".to_string(),
-                _ => return unsupported(),
-            });
+            let Some(f) = self.model_field(r, m) else {
+                return unsup(format!("dictionary of the {} implementation of `{}`", what, r));
+            };
+            fields.push(f);
         }
         for p in self.fe.dict_parents(r.def_id) {
             let p = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization();
@@ -1996,6 +1991,72 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
         let name = self.fe.dict_name(r.def_id);
         Ok(if fields.is_empty() { name } else { format!("{} {}", name, fields.join(" ")) })
+    }
+
+    /// The model of the method `m` of a derived, built-in or standard-library implementation of
+    /// `r`, as a function value, if its direct calls have one: `clone` is the value itself (a value
+    /// is its clone), `clone_from` assigns, `eq` and `ne` of a type with itself are HOL
+    /// (in)equality (see `binary`, `std_call`); on modelled integers of one type the comparisons and
+    /// arithmetic operators are uRust's (not the shifts, see `shift_amount`), and `cmp` is
+    /// AutoCorrode's; on `bool`, `&`, `|`, `^` are `&&`, `||`, `!=`.
+    fn model_field(&mut self, r: ty::TraitRef<'tcx>, m: DefId) -> Option<String> {
+        let tcx = self.tcx;
+        let tr = r.def_id;
+        let name = tcx.item_name(m);
+        let lam2 = |b: &str| format!("(\\<lambda>a b. FunctionBody \\<lbrakk> {} \\<rbrakk>)", b);
+        if tcx.is_lang_item(tr, LangItem::Clone) {
+            return match name.as_str() {
+                "clone" => Some("(\\<lambda>x. FunctionBody (literal x))".to_string()),
+                "clone_from" => Some("(\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>)".to_string()),
+                _ => None,
+            };
+        }
+        let this = r.self_ty();
+        let rhs = r.args.types().nth(1);
+        let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same {
+            return match name.as_str() {
+                "eq" => Some(lam2("a == b")),
+                "ne" => Some(lam2("a != b")),
+                _ => None,
+            };
+        }
+        let int = Self::int_suffix(this).is_some() && rhs.is_none_or(|t| t == this);
+        let ops: [(LangItem, &str, &str); 8] = [
+            (LangItem::Add, "add", "+"),
+            (LangItem::Sub, "sub", "-"),
+            (LangItem::Mul, "mul", "*"),
+            (LangItem::Div, "div", "/"),
+            (LangItem::Rem, "rem", "%"),
+            (LangItem::BitAnd, "bitand", "&"),
+            (LangItem::BitOr, "bitor", "|"),
+            (LangItem::BitXor, "bitxor", "^"),
+        ];
+        for (l, n, tok) in ops {
+            if tcx.is_lang_item(tr, l) && name.as_str() == n {
+                if int {
+                    return Some(lam2(&format!("a {} b", tok)));
+                }
+                if this.is_bool() && rhs == Some(this) && matches!(l, LangItem::BitAnd | LangItem::BitOr | LangItem::BitXor) {
+                    let t = match l { LangItem::BitAnd => "&&", LangItem::BitOr => "||", _ => "!=" };
+                    return Some(lam2(&format!("a {} b", t)));
+                }
+                return None;
+            }
+        }
+        if int && tcx.is_lang_item(tr, LangItem::PartialOrd) {
+            return match name.as_str() {
+                "lt" => Some(lam2("a < b")),
+                "le" => Some(lam2("a <= b")),
+                "gt" => Some(lam2("a > b")),
+                "ge" => Some(lam2("a >= b")),
+                _ => None,
+            };
+        }
+        if int && tcx.is_diagnostic_item(sym::Ord, tr) && name.as_str() == "cmp" {
+            return Some(lam2("cmp(a, b)"));
+        }
+        None
     }
 
     /// The dictionary for `r` in the dictionary `d` for the bound `p`: `d` itself, or a
@@ -2041,12 +2102,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     });
                     self.fn_value((im, Inst::Generic), iargs)?
                 }
-                Some(&im) => self.fe.ext_fun(im, false),
+                Some(&im) => match self.model_field(r, m) {
+                    Some(f) => f,
+                    None => self.fe.ext_fun(im, false),
+                },
                 None if imp.is_local() && m.is_local() => {
                     let key = self.fe.impl_copy(m, imp);
                     self.fn_value(key, args)?
                 }
-                None => self.fe.ext_fun(m, false),
+                None => match self.model_field(r, m) {
+                    Some(f) => f,
+                    None => self.fe.ext_fun(m, false),
+                },
             };
             fields.push(paren_term(&f));
         }

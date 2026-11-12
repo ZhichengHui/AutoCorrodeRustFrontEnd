@@ -320,8 +320,10 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     adt_sccs
 }
 
-/// The calls of a body whose callee depends on the body's generic parameters: trait methods and
-/// generic `Fn` values (`dependent`), and local functions at such arguments (`callees`).
+/// The calls of a body that only an instance can translate (`dependent`): of trait methods with
+/// generic parameters of their own at arguments with the body's generic parameters (no dictionary
+/// field is polymorphic, see `crate::dict`); and the calls of local functions at such arguments
+/// (`callees`).
 struct GenericCalls<'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx ty::TypeckResults<'tcx>,
@@ -335,7 +337,10 @@ impl<'tcx> GenericCalls<'tcx> {
             return;
         }
         if self.tcx.trait_of_assoc(did).is_some() {
-            self.dependent = true;
+            let c = self.tcx.generics_of(did).own_counts();
+            if c.types > 0 || c.consts > 0 {
+                self.dependent = true;
+            }
         } else if did.is_local() {
             self.callees.push(did);
         }
@@ -349,38 +354,33 @@ impl<'tcx> Visitor<'tcx> for GenericCalls<'tcx> {
         self.tcx
     }
 
-    // a mutable local (or parameter) of a type with generic parameters needs a locale prism for
-    // that type, which only an instance has
-    fn visit_pat(&mut self, p: &'tcx hir::Pat<'tcx>) {
-        if let hir::PatKind::Binding(hir::BindingMode(_, hir::Mutability::Mut), ..) = p.kind
-            && self.typeck.pat_ty(p).has_param()
-        {
-            self.dependent = true;
-        }
-        intravisit::walk_pat(self, p);
-    }
-
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
         if let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) {
             self.call(did, self.typeck.node_args(e.hir_id));
         }
         if let hir::ExprKind::Call(callee, _) = e.kind {
-            match *self.typeck.expr_ty_adjusted(callee).peel_refs().kind() {
-                ty::FnDef(did, args) => self.call(did, args.skip_binder()),
-                ty::Param(_) => self.dependent = true,
-                _ => {}
+            if let ty::FnDef(did, args) = *self.typeck.expr_ty_adjusted(callee).peel_refs().kind() {
+                self.call(did, args.skip_binder());
             }
         }
         intravisit::walk_expr(self, e);
     }
 }
 
-/// The generic functions translated per instance: trait default methods, and generic functions
-/// with a call depending on their generic parameters or a mutable local of a generic type,
-/// directly or through other such functions.
+/// The generic functions translated per instance (besides once generically): the trait default
+/// methods with generic parameters of their own (they have no copies for implementations, see
+/// `run`), and the generic functions with a call only an instance translates (see
+/// `GenericCalls`), directly or through other such functions.
 fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefId]) -> HashSet<DefId> {
     let tcx = fe.tcx;
-    let mut mono: HashSet<DefId> = default_methods.iter().copied().collect();
+    let mut mono: HashSet<DefId> = default_methods
+        .iter()
+        .copied()
+        .filter(|&m| {
+            let c = tcx.generics_of(m).own_counts();
+            c.types > 0 || c.consts > 0
+        })
+        .collect();
     let mut callees: Vec<(DefId, Vec<DefId>)> = vec![];
     for &did in bodies {
         if !fe.local_fn_with_body(did) {

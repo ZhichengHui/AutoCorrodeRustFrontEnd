@@ -94,7 +94,10 @@ impl<'tcx> Frontend<'tcx> {
             .filter(|i| i.is_fn())
             .filter(|i| {
                 let c = self.tcx.generics_of(i.def_id).own_counts();
-                c.types == 0 && c.consts == 0 && !self.has_rpitit(i.def_id)
+                // the unstable methods of the standard library's traits are its internals (e.g.
+                // `PartialOrd::__chaining_lt`), which only it calls
+                let internal = !i.def_id.is_local() && self.tcx.lookup_stability(i.def_id).is_some_and(|s| s.is_unstable());
+                c.types == 0 && c.consts == 0 && !self.has_rpitit(i.def_id) && !internal
             })
             .map(|i| i.def_id)
             .collect()

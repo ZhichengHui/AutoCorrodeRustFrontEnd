@@ -1,4 +1,4 @@
-// Generic functions called with a function item or a closure for an `Fn` type parameter, and with a mutable local of a generic type: translated per instance.
+// Generic functions called with a function item or a closure for an `Fn` type parameter (a function value), and with a mutable local of a generic type (an allocation record).
 pub fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 { f(x) + 1 }
 pub fn twice(x: u32) -> u32 { x * 2 }
 pub fn use_item(x: u32) -> u32 { apply(twice, x) }
