@@ -548,7 +548,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return;
         }
         if matches!(e.kind, ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)) {
-            // a `break` or `continue` after drops (see `jump_drops`): its statements
+            // a `break` (with a value, or after drops, see `jump_drops`) or `continue` after drops: its statements
             if let Some(inner) = tr.s.strip_prefix("{\n").and_then(|x| x.strip_suffix("\n}"))
                 && inner.ends_with(';')
             {
@@ -1385,7 +1385,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     // the `break` (with its `;`, of any type) ends the block, which has its type
                     let brk = loop_jump("break", dest).s;
                     let drops = self.exit_drops(dest.target_id.ok())?;
-                    Ok(Tr::block(format!("{{ * {} = {}; {} {} }}", res, v.at(40), drops.join("\n"), brk)))
+                    // (as statements where it ends a block, see `diverging`)
+                    let drops = if drops.is_empty() { String::new() } else { format!("{}\n", drops.join("\n")) };
+                    Ok(Tr::block(format!("{{\n* {} = {};\n{}{}\n}}", res, v.at(40), drops, brk)))
                 }
                 None => unsup("`break` with a value"),
             },
