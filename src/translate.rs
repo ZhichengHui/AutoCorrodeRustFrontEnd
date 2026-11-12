@@ -423,13 +423,22 @@ fn alias_of(t: Ty<'_>) -> ty::AliasTy<'_> {
 /// parameters in its signature (`T::Output` in `fn first<T: Index<usize>>(x: &T) -> &T::Output`):
 /// they are type variables, which each instance fixes (`Output = u32` at `T = Buf`). Independent
 /// variables cannot express that two associated types of the same type are equal through an
-/// implementation (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`), so with two of
-/// them the signature's types are not modelled. One occurring only in the body is not a variable
-/// (it would be an extra type variable of the definition).
+/// implementation of another trait (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`),
+/// so with projections of two traits on the same type the signature's types are not modelled; the
+/// associated types of one trait (e.g. `<E as Engine>::Config` and `<E as Engine>::DecodeEstimate`)
+/// are independent. One occurring only in the body is not a variable (it would be an extra type
+/// variable of the definition).
 fn proj_tvars<'tcx>(fe: &Frontend<'tcx>, did: DefId, sig_tys: &[Ty<'tcx>]) -> Option<HashMap<ty::AliasTy<'tcx>, String>> {
     let ps: Vec<ty::AliasTy<'tcx>> = fe.projections(did, sig_tys).into_iter().map(alias_of).collect();
-    let selves: Vec<Ty<'tcx>> = ps.iter().filter(|a| a.try_to_projection().is_some()).map(|a| a.args.type_at(0)).collect();
-    if (1..selves.len()).all(|i| !selves[..i].contains(&selves[i])) {
+    // (self type, trait) of the projections
+    let owners: Vec<(Ty<'tcx>, DefId)> = ps
+        .iter()
+        .filter_map(|a| match a.kind {
+            ty::AliasTyKind::Projection { def_id } => Some((a.args.type_at(0), fe.tcx.parent(def_id))),
+            _ => None,
+        })
+        .collect();
+    if (1..owners.len()).all(|i| owners[..i].iter().all(|(s, t)| *s != owners[i].0 || *t == owners[i].1)) {
         Some(ps.into_iter().enumerate().map(|(k, a)| (a, proj_tvar(k))).collect())
     } else {
         None
