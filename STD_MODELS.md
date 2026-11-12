@@ -110,14 +110,14 @@
 ### 相等（PartialEq）
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| 标准库实现与派生实现的 `==`、`!=` | HOL `=`、`≠` | Isabelle/HOL | `binary`（`structural_eq`）、`std_call` |
+| 标准库实现与派生实现的 `==`、`!=` | HOL `=`、`≠` | Isabelle/HOL | `binary`（`structural_eq`）、`std_call`；派生实现的字典字段（`model_dict`） |
 
 丢掉的语义：字段类型有自定义（非结构）的 `PartialEq` 时，派生实现不是结构相等；外部类型（如 `HashMap`）的相等不由表示决定。
 
 ### Clone
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| 标准库实现与派生实现的 `clone` | 恒等 | 前端写法 | `std_call` |
+| 标准库实现与派生实现的 `clone` | 恒等 | 前端写法 | `std_call`；派生和内建实现的字典字段（`model_dict`，`clone_from` 为赋值） |
 
 丢掉的语义：字段类型有自定义的 `clone` 时，派生实现不是恒等。
 
