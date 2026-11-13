@@ -18,7 +18,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BinOpKind, ExprKind, HirId, LoopSource, MatchSource, PatKind, StmtKind, UnOp};
 use rustc_middle::traits;
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion};
-use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeckResults};
+use rustc_middle::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, TypeckResults};
 use rustc_span::{Span, Symbol, sym};
 
 use crate::frontend::{FnKey, Frontend, GenCall, Inst};
@@ -172,9 +172,58 @@ pub struct BodyTr<'a, 'tcx> {
     pub comments: Vec<String>,
     /// the dictionary parameters of the body (see `Frontend::dict_params`)
     dicts: Vec<(ty::TraitRef<'tcx>, String)>,
+    /// the indexing expressions in places borrowed mutably or assigned (see `mark_mut_place`)
+    mut_places: HashSet<HirId>,
+    /// the scopes being translated, innermost last (see `DropScope`)
+    drop_scopes: Vec<DropScope<'tcx>>,
+    /// the uses moving the value of a local with a destructor out, with the local's flag (see `own`)
+    moved_uses: HashMap<HirId, String>,
+    /// the flags of the locals with a destructor that have one (see `own`)
+    local_flags: HashMap<HirId, String>,
+    /// the jumps (`break`, `continue`) translated as statements ending a block (see `diverging`):
+    /// those after drops, or setting a loop's value
+    stmt_jumps: HashMap<HirId, String>,
+    /// whether dropping a value of a type runs a destructor (see `needs_glue`)
+    glue_cache: std::cell::RefCell<HashMap<Ty<'tcx>, bool>>,
+    /// the paths to each local in the body, and the locals a closure captures by value (see `own`)
+    local_uses: Option<(HashMap<HirId, Vec<&'tcx hir::Expr<'tcx>>>, HashSet<HirId>)>,
+    /// the types whose drop glue is being generated (see `drop_glue`)
+    glue_stack: Vec<Ty<'tcx>>,
+    /// the mutable locals holding the values of the `loop`s being translated that produce one
+    loop_results: HashMap<HirId, String>,
     /// while a dictionary field of an implementation is built (see `impl_dict`): the dictionaries
     /// for the method's own bounds that the field takes, as `λ`-bound names
     own_dicts: Vec<(ty::TraitRef<'tcx>, String)>,
+}
+
+/// A local owning a value with a destructor (see `BodyTr::needs_glue`), dropped where its scope
+/// ends.
+#[derive(Clone)]
+struct DropLocal<'tcx> {
+    /// the uRust local (a cell if `cell`)
+    name: String,
+    cell: bool,
+    ty: Ty<'tcx>,
+    /// the mutable local telling whether the local holds a value (it may be moved out, or not
+    /// initialised yet)
+    flag: Option<String>,
+}
+
+/// A scope being translated: a block, or a function's or closure's body (its parameters), with
+/// the locals dropped when it ends; or a loop, the target of `break` and `continue`.
+enum DropScope<'tcx> {
+    Block(Vec<DropLocal<'tcx>>),
+    Body(Vec<DropLocal<'tcx>>),
+    Loop(HirId),
+}
+
+/// How a use of a local with a destructor treats its value (see `BodyTr::use_kind`).
+#[derive(PartialEq)]
+enum UseKind {
+    /// a place: borrowed, projected, read in part
+    Place,
+    /// moved out whole
+    Move,
 }
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
@@ -196,6 +245,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             calls: crate::frontend::DefSet::default(),
             comments: vec![],
             dicts: fe_dicts,
+            mut_places: HashSet::new(),
+            drop_scopes: vec![],
+            moved_uses: HashMap::new(),
+            local_flags: HashMap::new(),
+            stmt_jumps: HashMap::new(),
+            glue_cache: Default::default(),
+            local_uses: None,
+            glue_stack: vec![],
+            loop_results: HashMap::new(),
             own_dicts: vec![],
         }
     }
@@ -274,6 +332,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// local (a cell), which needs storage for its type: returns its allocator, if not the
     /// locale's (see `alloc`).
     fn declare(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<Option<String>> {
+        // a binding with a destructor is supported where it owns its value (see `declare_owned`)
+        if self.needs_glue(self.node_ty(hid)) {
+            return unsup("binding of a value with a destructor in a pattern");
+        }
+        self.declare_owned(hid, name, m)
+    }
+
+    /// As `declare`, for a binding that owns its value, whose destructor `own` arranges.
+    fn declare_owned(&mut self, hid: HirId, name: &str, m: hir::Mutability) -> R<Option<String>> {
+        // a local with a destructor is dropped by its name, which must not be shadowed while it lives
+        if self.drop_scopes.iter().any(|sc| match sc {
+            DropScope::Block(ls) | DropScope::Body(ls) => ls.iter().any(|l| l.name == name),
+            DropScope::Loop(_) => false,
+        }) {
+            return unsup("shadowing a local with a destructor");
+        }
         let a = if m.is_mut() { self.alloc(self.node_ty(hid))? } else { None };
         self.locals.insert(hid, Local { name: name.to_string(), cell: m.is_mut() });
         Ok(a)
@@ -294,6 +368,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// Translate the body of a function; returns (param names, body text).
     pub fn fn_body(&mut self, body: &'tcx hir::Body<'tcx>) -> R<(Vec<String>, String)> {
+        self.drop_scopes.push(DropScope::Body(vec![]));
+        let r = self.fn_body_scoped(body);
+        self.drop_scopes.pop();
+        r
+    }
+
+    fn fn_body_scoped(&mut self, body: &'tcx hir::Body<'tcx>) -> R<(Vec<String>, String)> {
         let mut params = vec![];
         let mut prologue = vec![];
         for (i, p) in body.params.iter().enumerate() {
@@ -302,11 +383,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let n = names::local_name(ident.as_str());
                     let n = if params.contains(&n) { format!("{}_{}", n, i) } else { n };
                     params.push(n.clone());
-                    let a = self.declare(hid, &n, m)?;
+                    let a = self.declare_owned(hid, &n, m)?;
                     if m.is_mut() {
                         prologue.push(self.let_binding(&n, m, &a, &n));
                     }
+                    prologue.extend(self.own(hid, true)?);
                 }
+                _ if self.needs_glue(self.pat_ty(p.pat)) => return unsup("parameter with a destructor bound by a pattern"),
                 PatKind::Wild => params.push(format!("unused_{}", i)),
                 _ => {
                     let n = format!("arg_{}", i);
@@ -317,7 +400,25 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
         }
         let b = self.block_expr_inner(body.value)?;
+        let b = self.with_body_drops(b)?;
         Ok((params, with_prologue(&prologue, &b)))
+    }
+
+    /// The body `b` (statements) of a function or closure followed by the drops of its parameters
+    /// (the innermost `Body` scope).
+    fn with_body_drops(&mut self, b: String) -> R<String> {
+        let Some(DropScope::Body(ls)) = self.drop_scopes.last() else { return Ok(b) };
+        let ls = ls.clone();
+        let drops = self.drop_locals(&ls)?;
+        if drops.is_empty() { return Ok(b) }
+        Ok(self.then_drops(&format!("{{\n{}\n}}", b), &drops))
+    }
+
+    /// `let r = v; drops; r` (statements, the last the value): Rust computes a block's or a
+    /// return's value before the drops.
+    fn then_drops(&mut self, v: &str, drops: &[String]) -> String {
+        let r = self.fresh("res");
+        format!("let {} = {};\n{}\n{}", r, v, drops.join("\n"), r)
     }
 
     /// Translate an expression used as a whole body (no braces).
@@ -355,7 +456,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     // Blocks and statements
     // ------------------------------------------------------------------
 
+    /// A block: its locals with destructors are dropped where it ends (see `DropScope`).
     fn block_seq(&mut self, stmts: &'tcx [hir::Stmt<'tcx>], tail: Option<&'tcx hir::Expr<'tcx>>) -> R<String> {
+        self.drop_scopes.push(DropScope::Block(vec![]));
+        let r = self.block_seq_inner(stmts, tail);
+        self.drop_scopes.pop();
+        r
+    }
+
+    fn block_seq_inner(&mut self, stmts: &'tcx [hir::Stmt<'tcx>], tail: Option<&'tcx hir::Expr<'tcx>>) -> R<String> {
         let mut parts: Vec<String> = vec![];
         let mut ended_by_divergence = false;
         for (i, st) in stmts.iter().enumerate() {
@@ -363,7 +472,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 StmtKind::Item(_) => {}
                 StmtKind::Let(l) => {
                     let (pre, post) = self.let_stmt(l)?;
-                    let rest = self.block_seq(&stmts[i + 1..], tail)?;
+                    let rest = self.block_seq_inner(&stmts[i + 1..], tail)?;
                     parts.push(format!("{}\n{}{}", pre, rest, post));
                     return Ok(join_seq(parts));
                 }
@@ -379,13 +488,29 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
         }
         if !ended_by_divergence {
-            if let Some(t) = tail {
-                if self.ty_of(t).is_never() {
-                    self.diverging(&mut parts, t);
-                } else {
-                    let tt = self.expr(t);
-                    parts.push(format!("\u{3}{}", tt.s)); // \u{3} marks a tail expression
+            // the drops of the block's locals, after its value
+            let drops = match self.drop_scopes.last() {
+                Some(DropScope::Block(ls)) => {
+                    let ls = ls.clone();
+                    self.drop_locals(&ls)?
                 }
+                _ => vec![],
+            };
+            match tail {
+                Some(t) if self.ty_of(t).is_never() => self.diverging(&mut parts, t),
+                Some(t) => {
+                    let tt = self.expr(t);
+                    if drops.is_empty() {
+                        parts.push(format!("\u{3}{}", tt.s)); // \u{3} marks a tail expression
+                    } else {
+                        parts.push(format!("\u{3}{}", self.then_drops(&tt.at(20), &drops)));
+                    }
+                }
+                None if !drops.is_empty() => {
+                    parts.extend(drops);
+                    parts.push("\u{3}()".to_string());
+                }
+                None => {}
             }
         }
         // a trailing `let _ = e;` (from an expression statement) needs a continuation
@@ -418,6 +543,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return;
         }
         if matches!(e.kind, ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)) {
+            // a `break` with a value, or a jump after drops: its statements (see `stmt_jumps`)
+            if let Some(st) = self.stmt_jumps.remove(&e.hir_id) {
+                parts.push(format!("\u{4}{}", st));
+                return;
+            }
             // \u{4}: ends with its own semicolon
             parts.push(if tr.s.ends_with(';') { format!("\u{4}{}", tr.s) } else { format!("{};", tr.s) });
             return;
@@ -462,6 +592,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn stmt_expr(&mut self, e: &'tcx hir::Expr<'tcx>) -> String {
         let t = self.ty_of(e);
         let tr = self.expr(e);
+        // a value with a destructor (a temporary) is dropped at the end of the statement
+        if self.needs_glue(t) {
+            let tmp = self.fresh("temp");
+            return match self.drop_glue(t, PV::Val(Tr::atom(tmp.clone()))) {
+                Ok(g) => format!("let {} = {};\n{}", tmp, tr.at(20), g.join("\n")),
+                Err(Unsup(m)) => {
+                    let marker = self.fe.placeholder(&m, Some(e.span));
+                    format!("let _ = {};", self.placeholder_term(&marker, t).s)
+                }
+            };
+        }
         if t.is_unit() {
             format!("{};", tr.at(11))
         } else {
@@ -491,10 +632,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // `let x;` -- deferred initialisation: model as a mutable local.
                 if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), hid, ident, None) = l.pat.kind {
                     let n = names::local_name(ident.as_str());
-                    let a = self.declare(hid, &n, hir::Mutability::Mut)?;
+                    let a = self.declare_owned(hid, &n, hir::Mutability::Mut)?;
                     let ht = self.hty(self.node_ty(hid));
                     let v = format!("\\<llangle>undefined :: {}\\<rrangle>", ht);
-                    Ok((self.let_binding(&n, hir::Mutability::Mut, &a, &v), String::new()))
+                    let flag = self.own(hid, false)?;
+                    Ok((with_prologue(&[self.let_binding(&n, hir::Mutability::Mut, &a, &v)], &flag.join("\n")), String::new()))
                 } else {
                     unsup("let without initializer and with a non-identifier pattern")
                 }
@@ -504,6 +646,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // a variable of type `!` (no coercion of the initializer fixes its type)
                 if self.ty_adj(init).is_never() {
                     iv = self.never_as(iv, "unit");
+                }
+                // `let _ = e;` drops a temporary at once (a place is not moved)
+                let it = self.ty_adj(init);
+                if matches!(l.pat.kind, PatKind::Wild) && self.needs_glue(it) && !is_place_expr(self.typeck, init) {
+                    let tmp = self.fresh("temp");
+                    let g = self.drop_glue(it, PV::Val(Tr::atom(tmp.clone())))?;
+                    return Ok((format!("let {} = {};\n{}", tmp, iv.at(20), g.join("\n")), String::new()));
                 }
                 Ok((self.bind_pattern(l.pat, iv)?, String::new()))
             }
@@ -515,7 +664,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match pat.kind {
             PatKind::Binding(bm, hid, ident, None) if let Some(m) = by_value(bm) => {
                 let n = names::local_name(ident.as_str());
-                let a = self.declare(hid, &n, m)?;
+                let a = self.declare_owned(hid, &n, m)?;
+                let flag = self.own(hid, true)?;
                 // the allocator of a mutable local is chosen by its type; for a list or an option the
                 // initial value (`[]`, `None`, `Vec::with_capacity(n)`, ...) may not fix the element
                 // type when the uses that would are placeholders or external, so it is annotated
@@ -523,11 +673,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if m.is_mut() && matches!(lt.kind(), ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Vec" | "Option"))) {
                     let ht = self.hty(lt);
                     let tv = self.typed("init", v, &ht);
-                    return Ok(self.let_binding(&n, m, &a, &tv.s));
+                    return Ok(with_prologue(&[self.let_binding(&n, m, &a, &tv.s)], &flag.join("\n")));
                 }
-                Ok(self.let_binding(&n, m, &a, &v.at(20)))
+                Ok(with_prologue(&[self.let_binding(&n, m, &a, &v.at(20))], &flag.join("\n")))
             }
             PatKind::Wild => Ok(format!("let _ = {};", v.at(20))),
+            // the parts not bound would be dropped (not modelled)
+            _ if self.needs_glue(self.pat_ty(pat)) => unsup("destructuring a value with a destructor"),
             _ => {
                 let tmp = self.fresh("destr");
                 let lets = self.irrefutable(pat, &Tr::atom(tmp.clone()))?;
@@ -654,6 +806,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The value matched by a pattern: a scrutinee of type `&mut T` (match ergonomics) is
     /// dereferenced; bindings by mutable reference are rejected by the pattern translation.
     fn scrut(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        // a temporary with a destructor lives until the end of the `match` (not modelled)
+        if !is_place_expr(self.typeck, e) && self.needs_glue(self.ty_of(e)) {
+            return unsup("matching a temporary with a destructor");
+        }
         let mut v = self.val(e)?;
         let mut t = self.ty_adj(e);
         while let ty::Ref(_, inner, m) = t.kind() {
@@ -683,6 +839,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn pv_adjusted(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<PV> {
+        // a temporary with a destructor that is borrowed: dropped at the end of the statement
+        if self.typeck.expr_adjustments(e).iter().any(|a| matches!(a.kind, Adjust::Borrow(_)))
+            && !is_place_expr(self.typeck, e)
+            && self.needs_glue(self.ty_of(e))
+        {
+            return unsup("borrowed temporary with a destructor");
+        }
+        // a place auto-borrowed mutably (a method's receiver, `v[a..b].fill(x)`)
+        if self
+            .typeck
+            .expr_adjustments(e)
+            .iter()
+            .any(|a| matches!(a.kind, Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Mut { .. }))))
+        {
+            self.mark_mut_place(e);
+        }
         let mut pv = self.pv_unadj(e)?;
         let mut cur = self.ty_of(e);
         for adj in self.typeck.expr_adjustments(e) {
@@ -759,8 +931,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         .map(|(_, k)| k)
     }
 
-    /// Whether the place `e` is, or lies inside, a subslice `v[a..b]` of a sequence. The subslice
-    /// is a value (a list), so a mutable borrow of such a place would refer to a temporary copy.
+    /// Whether the place `e` is, or lies inside, a subslice `v[a..b]` of a sequence.
     fn in_subslice(&self, mut e: &'tcx hir::Expr<'tcx>) -> bool {
         loop {
             match e.kind {
@@ -779,12 +950,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// `&mut` of a place is the reference to it; `&mut` of a temporary value allocates a
     /// fresh mutable local holding the value (Rust's temporary) and yields its reference.
     fn borrow_mut(&mut self, e: &'tcx hir::Expr<'tcx>, pv: PV, t: Ty<'tcx>) -> R<PV> {
-        // a place in a subslice: the writes through the borrow would be lost
-        if self.in_subslice(e) {
-            return unsup("mutable borrow of a subslice");
-        }
         match pv {
             PV::Ref(r) => Ok(PV::Val(r)),
+            // a place in a subslice of a value (not of a place, see `index_place`): the writes
+            // through the borrow would be lost
+            PV::Val(_) if self.in_subslice(e) => unsup("mutable borrow of a subslice of a value"),
             PV::Val(v) => {
                 let a = self.alloc(t)?;
                 let tmp = self.fresh("tmp");
@@ -794,12 +964,78 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
+    /// Marks the indexing expressions of the place `e` (through fields, indexing and
+    /// dereferences): a subslice in it is then a reference into the sequence (see `index_place`).
+    fn mark_mut_place(&mut self, mut e: &'tcx hir::Expr<'tcx>) {
+        loop {
+            match e.kind {
+                ExprKind::Index(b, _, _) => {
+                    self.mut_places.insert(e.hir_id);
+                    e = b;
+                }
+                ExprKind::Field(b, _) | ExprKind::Unary(UnOp::Deref, b) => e = b,
+                _ => return,
+            }
+        }
+    }
+
+    /// The fields of the range expression `idx` (`a..b`, `a..`, `..b`, `..=b`, or the unit struct
+    /// `..`), with its kind; `None` for other indices (e.g. a variable holding a range).
+    fn range_literal(&self, idx: &'tcx hir::Expr<'tcx>) -> Option<(RangeKind, &'tcx [hir::ExprField<'tcx>])> {
+        let kind = self.range_kind(self.ty_of(idx))?;
+        match idx.kind {
+            ExprKind::Struct(_, fields, _) if !matches!(kind, RangeKind::Inclusive) => Some((kind, fields)),
+            ExprKind::Path(_) if matches!(kind, RangeKind::Full) => Some((kind, &[])),
+            _ => None,
+        }
+    }
+
+    /// The bounds `(lo, hi, inclusive)` of the range expression `idx` indexing a sequence whose
+    /// length is `len` (the end of `a..` and `..`); `None` for other indices (see `range_literal`).
+    fn range_bounds(&mut self, idx: &'tcx hir::Expr<'tcx>, len: Tr) -> R<Option<(Tr, Tr, bool)>> {
+        let Some((kind, fields)) = self.range_literal(idx) else { return Ok(None) };
+        let field = |s: &mut Self, name: rustc_span::Symbol| -> R<Tr> {
+            let f = fields.iter().find(|f| f.ident.name == name).expect("range field");
+            s.val(f.expr)
+        };
+        let zero = Tr::atom("0_usize");
+        Ok(Some(match kind {
+            RangeKind::Range => {
+                let lo = field(self, sym::start)?;
+                (lo, field(self, sym::end)?, false)
+            }
+            RangeKind::From => (field(self, sym::start)?, len, false),
+            RangeKind::To => (zero, field(self, sym::end)?, false),
+            RangeKind::ToInclusive => (zero, field(self, sym::end)?, true),
+            RangeKind::Full => (zero, len, false),
+            RangeKind::Inclusive => return Ok(None),
+        }))
+    }
+
+    /// The base of the sequence index `base[..]` as a place: overloaded `Index(Mut)` auto-borrows
+    /// the base, so go back to the place through the borrow.
+    fn index_base(&mut self, base: &'tcx hir::Expr<'tcx>) -> R<PV> {
+        let mut bpv = self.pv_adjusted(base)?;
+        let mut bt_adj = self.ty_adj(base);
+        while let ty::Ref(_, inner, _) = bt_adj.kind() {
+            bpv = self.deref_pv(bpv, bt_adj)?;
+            bt_adj = *inner;
+        }
+        Ok(bpv)
+    }
+
     fn pv_unadj(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<PV> {
         match e.kind {
             ExprKind::Path(ref qp) if let Res::Local(hid) = self.typeck.qpath_res(qp, e.hir_id) => {
                 let Some(l) = self.locals.get(&hid).cloned() else {
                     return unsup("use of a captured or unknown local");
                 };
+                // the value of a local with a destructor moved out: its flag is cleared
+                if let Some(f) = self.moved_uses.get(&e.hir_id).cloned() {
+                    let read = if l.cell { format!("* {}", l.name) } else { l.name.clone() };
+                    let mv = self.fresh("moved");
+                    return Ok(PV::Val(Tr::block(format!("{{ let {} = {}; * {} = false; {} }}", mv, read, f, mv))));
+                }
                 Ok(if l.cell { PV::Ref(Tr::atom(l.name)) } else { PV::Val(Tr::atom(l.name)) })
             }
             ExprKind::Unary(UnOp::Deref, inner) => {
@@ -814,9 +1050,26 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 self.deref_pv(p, t)
             }
             ExprKind::Field(base, ident) => {
+                if !is_place_expr(self.typeck, base) && self.needs_glue(self.ty_of(base)) {
+                    return unsup("field of a temporary with a destructor");
+                }
                 let bpv = self.pv_adjusted(base)?;
                 let bt = self.ty_adj(base);
                 match bt.kind() {
+                    // the public fields of the range types, read (see `Frontend::ty`): those of a
+                    // `Range` (AutoCorrode's `range` record), the only field of `a..` and `..b`
+                    ty::Adt(def, _)
+                        if let (Some(k @ ("Range" | "RangeFrom" | "RangeTo" | "RangeToInclusive")), PV::Val(v)) = (self.fe.std_adt(def.did()), &bpv) =>
+                    {
+                        match (k, ident.name) {
+                            ("Range", n) if n == sym::start || n == sym::end => {
+                                Ok(PV::Val(Tr::new(format!("\\<llangle>range.{}\\<rrangle>\\<^sub>1({})", n, v.s), 999)))
+                            }
+                            ("RangeFrom", n) if n == sym::start => Ok(PV::Val(v.clone())),
+                            ("RangeTo" | "RangeToInclusive", n) if n == sym::end => Ok(PV::Val(v.clone())),
+                            _ => unsup(format!("field access on `{}`", bt)),
+                        }
+                    }
                     ty::Adt(def, _) if def.is_struct() && def.did().is_local() => {
                         let fidx = self.typeck.field_index(e.hir_id).as_usize();
                         let adt = def.did();
@@ -875,12 +1128,22 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     return Ok(if is_mut { PV::Ref(r) } else { PV::Val(r) });
                 }
                 let is_range = self.range_kind(self.ty_adj(idx).peel_refs()).is_some();
-                let mut bpv = self.pv_adjusted(base)?;
-                // overloaded `Index(Mut)` auto-borrows the base: go back to the place
-                let mut bt_adj = self.ty_adj(base);
-                while let ty::Ref(_, inner, _) = bt_adj.kind() {
-                    bpv = self.deref_pv(bpv, bt_adj)?;
-                    bt_adj = *inner;
+                let bpv = self.index_base(base)?;
+                if let PV::Ref(r) = &bpv
+                    && let Some(p) = self.index_place(e, base, idx, r)?
+                {
+                    return Ok(PV::Ref(p));
+                }
+                // an open range on a value with side effects (`&f()[..6]`): the value is bound first
+                if let PV::Val(v) = &bpv
+                    && matches!(self.range_literal(idx), Some((RangeKind::From | RangeKind::To | RangeKind::ToInclusive | RangeKind::Full, _)))
+                    && !self.is_simple(base)
+                {
+                    let tmp = self.fresh("base");
+                    let bind = format!("let {} = {};", tmp, v.at(20));
+                    let Some((lo, hi, incl)) = self.range_bounds(idx, Tr::atom(format!("len({})", tmp)))? else { return unsup("range index") };
+                    let sub = format!("{}[{} {} {}]", tmp, lo.at(42), if incl { "..=" } else { ".." }, hi.at(42));
+                    return Ok(PV::Val(Tr::block(format!("{{ {} {} }}", bind, sub))));
                 }
                 let i = match self.open_range(base, idx, &bpv)? {
                     Some(i) => i,
@@ -904,51 +1167,51 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
+    /// `base[idx]` with a range `idx` and the reference `r` to `base` (a sequence): the reference
+    /// to the subslice (a focus on the elements between the ones before and the ones after it, see
+    /// AutoCorrode's `slice_range_mut`), in a place borrowed mutably or assigned (see
+    /// `mark_mut_place`), for an open range on a base with side effects (see `open_range`), and for
+    /// a range held in a variable; `None` otherwise (the subslice is a value). A slice keeps its
+    /// length, so the focus stays on the elements of the range while the borrow lives.
+    fn index_place(&mut self, e: &'tcx hir::Expr<'tcx>, base: &'tcx hir::Expr<'tcx>, idx: &'tcx hir::Expr<'tcx>, r: &Tr) -> R<Option<Tr>> {
+        let Some(kind) = self.range_kind(self.ty_adj(idx).peel_refs()) else { return Ok(None) };
+        let literal = self.range_literal(idx).is_some() || matches!(kind, RangeKind::Inclusive);
+        let open = matches!(kind, RangeKind::From | RangeKind::To | RangeKind::ToInclusive | RangeKind::Full);
+        if !(self.mut_places.contains(&e.hir_id) || (open && !self.is_simple(base)) || !literal) {
+            return Ok(None);
+        }
+        let model = match kind {
+            RangeKind::Range | RangeKind::Inclusive => "slice_range_mut",
+            RangeKind::From => "slice_range_from_mut",
+            RangeKind::To => "slice_range_to_mut",
+            RangeKind::ToInclusive => "slice_range_to_inclusive_mut",
+            // the whole sequence (`..` has no effect)
+            RangeKind::Full => return Ok(Some(r.clone())),
+        };
+        let i = self.val(idx)?;
+        Ok(Some(self.named_call(model, vec![r.clone(), i])))
+    }
+
     /// A sequence index `a..`, `..b`, `..=b` or `..` written as the closed uRust range
     /// `a .. len(base)`, `0 .. b`, `0 ..= b`, `0 .. len(base)`. The missing end repeats the base,
     /// so only a base without side effects qualifies; `None` for every other index.
     fn open_range(&mut self, base: &'tcx hir::Expr<'tcx>, idx: &'tcx hir::Expr<'tcx>, bpv: &PV) -> R<Option<Tr>> {
-        // `..` is the unit struct `RangeFull`, the others are struct expressions
-        let fields: &[hir::ExprField<'tcx>] = match idx.kind {
-            ExprKind::Struct(_, fields, _) => fields,
-            ExprKind::Path(_) => &[],
-            _ => return Ok(None),
-        };
-        let kind = self.range_kind(self.ty_of(idx));
-        let (from, to_incl) = match kind {
-            Some(RangeKind::From) => (true, None),
-            Some(RangeKind::To) => (false, Some(false)),
-            Some(RangeKind::ToInclusive) => (false, Some(true)),
-            Some(RangeKind::Full) => (false, None),
-            _ => return Ok(None),
-        };
-        // a path is the unit struct `..` itself, or a variable holding a range (not handled here)
-        if matches!(idx.kind, ExprKind::Path(_)) && !matches!(kind, Some(RangeKind::Full)) {
+        // `a..b` is a uRust range value; a variable holding a range is not handled here
+        if !matches!(self.range_literal(idx), Some((RangeKind::From | RangeKind::To | RangeKind::ToInclusive | RangeKind::Full, _))) {
             return Ok(None);
         }
         if !self.is_simple(base) { return unsup("open range index on a base with side effects") }
-        let len = || match bpv {
+        let len = Tr::atom(match bpv {
             PV::Val(v) => format!("len({})", v.at(11)),
             PV::Ref(r) => format!("len(* {})", r.at(200)),
-        };
-        let field = |s: &mut Self, name: rustc_span::Symbol| -> R<Tr> {
-            let f = fields.iter().find(|f| f.ident.name == name).expect("range field");
-            s.val(f.expr)
-        };
-        let zero = Tr::atom("0_usize");
-        Ok(Some(if from {
-            let a = field(self, sym::start)?;
-            Tr::new(format!("{} .. {}", a.at(42), len()), 41)
-        } else if let Some(incl) = to_incl {
-            let b = field(self, sym::end)?;
-            Tr::new(format!("{} {} {}", zero.s, if incl { "..=" } else { ".." }, b.at(42)), 41)
-        } else {
-            Tr::new(format!("{} .. {}", zero.s, len()), 41)
-        }))
+        });
+        let Some((lo, hi, incl)) = self.range_bounds(idx, len)? else { return Ok(None) };
+        Ok(Some(Tr::new(format!("{} {} {}", lo.at(42), if incl { "..=" } else { ".." }, hi.at(42)), 41)))
     }
 
     /// The place denoted by an expression; must be a reference.
     fn place(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        self.mark_mut_place(e);
         let mut pv = self.pv_adjusted(e)?;
         // overloaded compound assignment auto-borrows its left-hand side: go back to the place
         let mut t = self.ty_adj(e);
@@ -977,6 +1240,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let gargs = self.node_args(e.hir_id);
                 let arg_exprs: Vec<&'tcx hir::Expr<'tcx>> = std::iter::once(recv).chain(args).collect();
                 if let Some(t) = self.fmt_call(did, &arg_exprs, e)? {
+                    return Ok(t);
+                }
+                if let Some(t) = self.encode_utf8_bytes(did, recv)? {
                     return Ok(t);
                 }
                 let argv = self.vals(arg_exprs.iter().copied())?;
@@ -1019,10 +1285,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 MatchSource::ForLoopDesugar => self.for_loop(scrut, arms),
                 MatchSource::TryDesugar(_) => {
                     let ExprKind::Call(_, [inner]) = scrut.kind else { return unsup("`?` desugaring") };
+                    if self.exit_after_owned_operand(e) {
+                        return unsup("early exit after evaluating a value with a destructor");
+                    }
                     let v = self.val(inner)?;
-                    if let Some(t) = self.try_error_conversion(inner, arms, &v)? {
+                    // the drops of an early return (see `exit_drops`)
+                    let drops = self.exit_drops(None)?;
+                    if let Some(t) = self.try_error_conversion(inner, arms, &v, &drops)? {
                         return Ok(t);
                     }
+                    if !drops.is_empty() { return unsup("`?` leaving a scope with destructors") }
                     Ok(Tr::new(format!("{}?", v.at(400)), 400))
                 }
                 MatchSource::Normal | MatchSource::Postfix => self.match_expr(scrut, arms),
@@ -1035,6 +1307,37 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok(Tr::block(format!("{{\n{}\n}}", s)))
             }
             ExprKind::Assign(lhs, rhs, _) => {
+                let lt = self.ty_of(lhs);
+                if self.needs_glue(lt) {
+                    // the value, then the place, whose old value is dropped (if a local's flag says
+                    // it holds one), then the write
+                    let v = self.val(rhs)?;
+                    let p = self.place(lhs)?;
+                    let (nv, pl) = (self.fresh("new"), self.fresh("place"));
+                    let old = self.drop_glue(lt, PV::Ref(Tr::atom(pl.clone())))?;
+                    let flag = match lhs.kind {
+                        ExprKind::Path(ref qp) => match self.typeck.qpath_res(qp, lhs.hir_id) {
+                            Res::Local(h) => self.local_flags.get(&h).cloned(),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let (old, set) = match &flag {
+                        Some(f) => (format!("if * {} {{\n{}\n}} else {{\n()\n}};", f, old.join("\n")), format!("\n* {} = true;", f)),
+                        None => (old.join("\n"), String::new()),
+                    };
+                    return Ok(Tr::block(format!(
+                        "{{\nlet {} = {};\nlet {} = {};\n{}\n* {} = {};{}\n}}",
+                        nv,
+                        v.at(20),
+                        pl,
+                        p.at(20),
+                        old,
+                        pl,
+                        nv,
+                        set
+                    )));
+                }
                 let p = self.place(lhs)?;
                 let v = self.val(rhs)?;
                 Ok(Tr::new(format!("* {} = {}", p.at(200), v.at(40)), 40))
@@ -1046,6 +1349,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::AddrOf(hir::BorrowKind::Ref, m, x) => {
                 if m.is_mut() {
+                    self.mark_mut_place(x);
                     let t = self.ty_adj(x);
                     let pv = self.pv_adjusted(x)?;
                     match self.borrow_mut(x, pv, t)? {
@@ -1057,16 +1361,41 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
             }
             ExprKind::AddrOf(..) => unsup("raw borrow"),
-            ExprKind::Break(dest, None) => Ok(loop_jump("break", dest)),
-            ExprKind::Break(_, Some(_)) => unsup("`break` with a value"),
-            ExprKind::Continue(dest) => Ok(loop_jump("continue", dest)),
-            ExprKind::Ret(v) => match v {
-                Some(v) => {
-                    let t = self.val(v)?;
-                    Ok(Tr::atom(format!("return {};", t.s)))
+            ExprKind::Break(..) | ExprKind::Continue(_) | ExprKind::Ret(_) if self.exit_after_owned_operand(e) => {
+                unsup("early exit after evaluating a value with a destructor")
+            }
+            ExprKind::Break(dest, None) => self.jump_drops(e, dest, loop_jump("break", dest)),
+            // `break v` out of a `loop` producing a value: the loop's result is set (see `loop_expr`)
+            ExprKind::Break(dest, Some(v)) => match dest.target_id.ok().and_then(|t| self.loop_results.get(&t).cloned()) {
+                Some(res) => {
+                    let v = self.val(v)?;
+                    // the `break` (with its `;`, of any type) ends the block, which has its type
+                    let brk = loop_jump("break", dest).s;
+                    let drops = self.exit_drops(dest.target_id.ok())?;
+                    let mut st = vec![format!("* {} = {};", res, v.at(40))];
+                    st.extend(drops);
+                    st.push(brk);
+                    Ok(self.jump_stmts(e, st))
                 }
-                None => Ok(Tr::atom("return;")),
+                None => unsup("`break` with a value"),
             },
+            ExprKind::Continue(dest) => self.jump_drops(e, dest, loop_jump("continue", dest)),
+            // the value, then the drops of the locals of the function (or closure)
+            ExprKind::Ret(v) => {
+                let t = match v {
+                    Some(v) => Some(self.val(v)?),
+                    None => None,
+                };
+                let drops = self.exit_drops(None)?;
+                if drops.is_empty() {
+                    return Ok(Tr::atom(match t {
+                        Some(t) => format!("return {};", t.s),
+                        None => "return;".to_string(),
+                    }));
+                }
+                let t = t.map(|t| t.at(20)).unwrap_or_else(|| "()".to_string());
+                Ok(Tr::atom(format!("return {{\n{}\n}};", self.then_drops(&t, &drops))))
+            }
             ExprKind::Struct(qp, fields, tail) => self.struct_expr(e, qp, fields, tail),
             ExprKind::Array(es) => {
                 if es.is_empty() { return Ok(Tr::atom("[]")) }
@@ -1203,7 +1532,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 self.const_use(did, e)
             }
             Res::Def(DefKind::Fn | DefKind::AssocFn, _) => self.fn_item_value(e),
-            Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) => unsup("constructor used as a function value"),
+            Res::Def(DefKind::Ctor(of, CtorKind::Fn), ctor) => self.ctor_value(of, ctor, e),
+            // a const generic parameter in an instance: its value there (an integer or `bool`)
+            Res::Def(DefKind::ConstParam, p) if let Inst::Mono(args) = self.key.1 => {
+                let i = self.tcx.generics_of(self.key.0).param_def_id_to_index(self.tcx, p).expect("const parameter of the item");
+                let t = self.ty_of(e);
+                match args.const_at(i as usize).try_to_leaf() {
+                    Some(s) if t.is_bool() => Ok(Tr::atom(if s.to_bits(s.size()) != 0 { "true" } else { "false" })),
+                    Some(s) if t.is_integral() => Self::scalar_int_lit(s, t),
+                    _ => unsup(format!("const generic parameter of type `{}`", t)),
+                }
+            }
             _ => unsup(format!("path `{}`", self.fe.snippet(e.span))),
         }
     }
@@ -1226,6 +1565,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match self.fe.std_adt(adt) {
             Some("Option") => return Ok(Tr::atom("None")),
             Some("FmtError") => return Ok(Tr::atom("fmt_Error")),
+            // `..` (see `Frontend::ty`)
+            Some("RangeFull") => return Ok(Tr::atom("()")),
             Some("Ordering") => {
                 let v = self.tcx.adt_def(adt).variant(vidx.into()).name.to_string();
                 return Ok(Tr::atom(format!("Ordering::{}", v)));
@@ -1286,6 +1627,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if src.is_bool() {
             let b = self.val(x)?;
             return Ok(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", b.at(20), tsfx, tsfx), 21));
+        }
+        // `c as T` for `c: char` is its code point, truncated to `T` (a HOL `char` has 256 values)
+        if src.is_char() {
+            let c = self.val(x)?;
+            let h = self.hty(target);
+            let v = Tr::new(format!("\\<llangle>of_nat \\<circ> of_char\\<rrangle>\\<^sub>1({})", c.s), 999);
+            return Ok(self.typed("cast", v, &h));
         }
         if Self::int_suffix(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
         let v = self.val(x)?;
@@ -1369,9 +1717,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let args = self.node_args(e.hir_id);
         match self.resolve_instance(did, args) {
             Ok(Some(inst)) => {
-                // derived impls, and the std impls (Option, tuples, references, str, slices)
+                // derived impls, and the std impls (Option, tuples, references, str, slices); not
+                // on a type holding a `HashMap`, whose model (a list) has an order
                 let rd = inst.def_id();
-                self.tcx.impl_of_assoc(rd).is_some() && (self.derived(rd) || self.fe.is_std(rd))
+                self.tcx.impl_of_assoc(rd).is_some()
+                    && (self.derived(rd) || self.fe.is_std(rd))
+                    && !args.types().any(|t| self.holds_hashmap(t, &mut vec![]))
             }
             _ => false,
         }
@@ -1450,8 +1801,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // per-node table has no entry for paths built by desugarings, e.g. of `for`)
                 let ty::FnDef(_, gargs) = *self.ty_of(callee).kind() else { return unsup("call target") };
                 let gargs = self.tcx.instantiate_bound_regions_with_erased(gargs);
-                let argv = self.vals(args)?;
                 let arg_exprs: Vec<&'tcx hir::Expr<'tcx>> = args.iter().collect();
+                let argv = self.vals(arg_exprs.iter().copied())?;
                 self.call_def(did, gargs, argv, &arg_exprs, e)
             }
             Res::Def(DefKind::Ctor(of, CtorKind::Fn), ctor) => {
@@ -1662,11 +2013,26 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         for part in &fa.parts {
             match part {
                 FmtPart::Lit(s) => {
-                    for piece in hol_str_pieces(s)? {
-                        steps.push(Step::Call(match piece {
-                            StrPiece::Str(r) => format!("fmt_write_str({}, \\<llangle>STR ''{}''\\<rrangle>)", f, r),
-                            StrPiece::Char(c) => format!("fmt_write_char({}, \\<llangle>{}\\<rrangle>)", f, c),
-                        }));
+                    // runs of ASCII characters as strings, of other characters as code points
+                    let mut runs: Vec<(bool, String)> = vec![];
+                    for c in s.chars() {
+                        match runs.last_mut() {
+                            Some((a, r)) if *a == c.is_ascii() => r.push(c),
+                            _ => runs.push((c.is_ascii(), c.to_string())),
+                        }
+                    }
+                    for (ascii, run) in runs {
+                        if !ascii {
+                            let cs: Vec<String> = run.chars().map(|c| (c as u32).to_string()).collect();
+                            steps.push(Step::Call(format!("fmt_write_codes({}, \\<llangle>[{}] :: nat list\\<rrangle>)", f, cs.join(", "))));
+                            continue;
+                        }
+                        for piece in hol_str_pieces(&run)? {
+                            steps.push(Step::Call(match piece {
+                                StrPiece::Str(r) => format!("fmt_write_str({}, \\<llangle>STR ''{}''\\<rrangle>)", f, r),
+                                StrPiece::Char(c) => format!("fmt_write_char({}, \\<llangle>{}\\<rrangle>)", f, c),
+                            }));
+                        }
                     }
                 }
                 FmtPart::Ph { flags, width, precision, width_arg, precision_arg, arg } => {
@@ -1689,7 +2055,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let call = self.fmt_arg_call(ctor, fa.vals[t], &names[t], &sub)?;
                     steps.push(Step::Stmt(format!("let mut {} = fmt_formatter_new({}_u32, {}, {});", sub, flags, w, p)));
                     steps.push(Step::Call(call));
-                    steps.push(Step::Call(format!("fmt_write_str({}, fmt_formatter_buf(* {}))", f, sub)));
+                    steps.push(Step::Call(format!("fmt_write_codes({}, fmt_formatter_codes(* {}))", f, sub)));
                 }
             }
         }
@@ -1803,7 +2169,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => unsup("constructor of a standard library type"),
             };
         }
-        if argv.len() > 8 { return unsup("constructor with more than 8 fields") }
+        if argv.len() > 8 {
+            if !adt.is_local() { return unsup("constructor with more than 8 fields") }
+            return Ok(self.ctor_many(adt, vidx, argv, vec![]));
+        }
         if !adt.is_local() {
             // an external ADT declared with its constructors (see `ExtType::ctors`)
             return match self.fe.ext_ctor(adt, vidx) {
@@ -1818,12 +2187,41 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::new(format!("{}({})", n, a.join(", ")), 999))
     }
 
+    /// A local constructor applied to more than 8 values (more than a uRust call or record
+    /// expression takes): the values bound in order (after `pre`), then the HOL constructor applied
+    /// to them.
+    fn ctor_many(&mut self, adt: DefId, vidx: usize, vals: Vec<Tr>, pre: Vec<String>) -> Tr {
+        let mut lets = pre;
+        let mut names = vec![];
+        for v in vals {
+            let n = self.fresh("fld");
+            lets.push(format!("let {} = {};", n, v.at(20)));
+            names.push(n);
+        }
+        let c = self.fe.variant_ctor_name(adt, vidx);
+        Tr::block(format!("{{\n{}\n\\<llangle>{} {}\\<rrangle>\n}}", lets.join("\n"), c, names.join(" ")))
+    }
+
     /// A call of the local function `did` at the generic arguments `args`.
     fn local_call(&mut self, did: DefId, args: GenericArgsRef<'tcx>, argv: Vec<Tr>) -> R<Tr> {
         // (polymorphic recursion is found once the recursive groups are known, see
         // `translate::poly_rec_calls`)
         let (key, kargs) = self.local_callee(did, args)?;
-        let dicts = self.callee_dicts(key, kargs)?;
+        // a dictionary that cannot be built at this call (e.g. of a derived implementation whose
+        // methods have no model): the instance at the call's concrete arguments, which needs none
+        let mut key = key;
+        let mut dicts = self.callee_dicts(key, kargs);
+        if dicts.is_err()
+            && key.1 == Inst::Generic
+            && !self.fe.is_trait_item(did)
+            && !args.has_param()
+            && args.types().all(|t| self.fe.ty_dry(t).1)
+            && let Some(inst) = self.fe.instance(did, args)
+        {
+            key = inst;
+            dicts = Ok(vec![]);
+        }
+        let dicts = dicts?;
         self.calls.insert(key);
         let a: Vec<String> = argv.iter().map(|t| t.at(11)).collect();
         // an instance takes neither dictionaries nor an allocation record
@@ -1845,6 +2243,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some(key) = self.fe.callee(did, args) else {
             return unsup(format!("more than {} instances of a generic function", crate::frontend::MAX_INSTANCES));
         };
+        // a function with const generic parameters is translated only per instance
+        if key.1 == Inst::Generic && self.fe.has_const_params(did) {
+            return unsup("call of a function with const generic parameters at non-constant arguments");
+        }
         if !(self.fe.is_trait_item(did) && key.1 == Inst::Generic) {
             return Ok((key, args));
         }
@@ -2018,10 +2420,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => None,
             };
         }
+        // `Eq`'s hidden `assert_receiver_is_total_eq` (a compile-time check): does nothing
+        if tcx.is_diagnostic_item(sym::Eq, tr) && name.as_str() == "assert_receiver_is_total_eq" {
+            return Some("\\<lambda>x. FunctionBody (literal ())".to_string());
+        }
         let this = r.self_ty();
         let rhs = r.args.types().nth(1);
         let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
-        if tcx.is_lang_item(tr, LangItem::PartialEq) && same {
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same && !self.holds_hashmap(this, &mut vec![]) {
             return match name.as_str() {
                 "eq" => Some(lam2("a == b".into())),
                 "ne" => Some(lam2("a != b".into())),
@@ -2259,7 +2665,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     ty::InstanceKind::Virtual(..) => return unsup("dynamic dispatch (trait object)"),
                     _ => {
                         // compiler-generated shims, e.g. `Clone` for primitive/tuple types
-                        if let Some(t) = self.std_call(did, did, &argv, arg_exprs, e)? { return Ok(t) }
+                        if let Some(t) = self.std_call(did, did, gargs, &argv, arg_exprs, e)? { return Ok(t) }
                         return unsup(format!("call of `{}`", self.tcx.def_path_str(did)));
                     }
                 },
@@ -2284,7 +2690,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 return unsup(format!("interior mutability (`{}`)", t));
             }
         }
-        if let Some(t) = self.std_call(did, target, &argv, arg_exprs, e)? {
+        // a standard library function could drop a value with a destructor it is given (only
+        // `mem::drop`, `swap`, `replace` are known)
+        let owned_or_mut = |s: &Self, a: &hir::Expr<'tcx>| {
+            let mut t = s.ty_adj(a);
+            while let ty::Ref(_, inner, m) = *t.kind() {
+                // through a shared reference nothing can be dropped
+                if !m.is_mut() { return false }
+                t = inner;
+            }
+            s.needs_glue(t)
+        };
+        if arg_exprs.iter().any(|a| owned_or_mut(self, a))
+            && !matches!(self.std_fn(target), Some(StdFn::Drop | StdFn::Model("mem_swap" | "mem_replace")))
+        {
+            return unsup("standard library function given a value with a destructor");
+        }
+        if let Some(t) = self.std_call(did, target, gargs, &argv, arg_exprs, e)? {
             return Ok(self.result_stated(target, t, e));
         }
         if target.is_local() && !self.fe.bodiless_intrinsic(target) {
@@ -2380,7 +2802,33 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         _ => None,
                     };
                 }
-                return [sym::Into, sym::AsRef, sym::Borrow]
+                // the methods of `Iterator` with models (on the iterators of `Frontend::iter_step`)
+                if tcx.is_diagnostic_item(sym::Iterator, parent) {
+                    use IterFn::*;
+                    return Some(StdFn::Iter(match tcx.item_name(did).as_str() {
+                        "next" => Next,
+                        "enumerate" => Enumerate,
+                        "zip" => Zip,
+                        "skip" => Skip,
+                        "take" => Take,
+                        "filter" => Filter,
+                        "any" => Any,
+                        "for_each" => ForEach,
+                        "min" => Min,
+                        "take_while" => TakeWhile,
+                        "map" => Map,
+                        "rev" | "copied" | "cloned" => Same,
+                        "count" => Count,
+                        "collect" => Collect,
+                        _ => return None,
+                    }));
+                }
+                if tcx.is_diagnostic_item(sym::TryInto, parent) {
+                    return Some(StdFn::TryIntoArray);
+                }
+                // `IntoIterator::into_iter` of an iterator, or of a reference to a sequence, whose
+                // state is the sequence: the identity when the HOL types agree
+                return [sym::Into, sym::AsRef, sym::Borrow, sym::IntoIterator]
                     .into_iter()
                     .any(|t| tcx.is_diagnostic_item(t, parent))
                     .then_some(StdFn::Conversion);
@@ -2388,6 +2836,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             DefKind::Impl { of_trait: false } => match tcx.type_of(parent).instantiate_identity().skip_normalization().kind() {
                 ty::Adt(def, _) => self.fe.std_adt(def.did())?,
                 ty::Slice(_) => "slice",
+                ty::Str => "str",
+                ty::Char => "char",
                 ty::Uint(_) => "uint",
                 ty::Int(_) => "int",
                 _ => return None,
@@ -2416,6 +2866,73 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("uint" | "int", "saturating_sub") => IntOp("saturating_sub"),
             ("uint" | "int", "div_ceil") => IntOp("div_ceil"),
             ("int", "wrapping_add_unsigned") => IntOp("wrapping_add_unsigned"),
+            // the models of AutoCorrode's `StdLib_Frontend_Models`
+            ("Option", "unwrap_or") => Model("option_unwrap_or"),
+            ("Option", "unwrap_or_else") => Model("option_unwrap_or_else"),
+            ("Option", "map") => Model("option_map"),
+            ("Option", "and_then") => Model("option_and_then"),
+            ("Option", "is_some_and") => Model("option_is_some_and"),
+            ("Option", "ok_or_else") => Model("option_ok_or_else"),
+            ("Option", "copied" | "cloned" | "as_ref") => Conversion,
+            ("Result", "map") => Model("result_map"),
+            ("Result", "map_err") => Model("result_map_err"),
+            ("Vec" | "slice", "is_empty") => Model("slice_is_empty"),
+            ("slice", "first") => Model("slice_first"),
+            ("slice", "last") => Model("slice_last"),
+            ("slice", "get") => SliceGet,
+            ("slice", "copy_within") => SliceCopyWithin,
+            ("Range" | "RangeInclusive", "contains") => RangeContains,
+            ("slice", "get_mut") => SliceGetMut,
+            ("slice", "chunks_exact") => Model("slice_chunks_exact"),
+            ("slice", "chunks") => Model("slice_chunks"),
+            ("slice", "copy_from_slice") => Model("slice_copy_from_slice"),
+            ("slice", "fill") => Model("slice_fill"),
+            ("slice", "reverse") => Model("slice_reverse"),
+            ("Vec", "truncate") => Model("vec_truncate"),
+            ("Vec", "clear") => Model("vec_clear"),
+            ("Vec", "resize") => Model("vec_resize"),
+            ("Vec", "extend_from_slice") => Model("vec_extend_from_slice"),
+            ("Vec", "into_boxed_slice") => Conversion,
+            // the capacity is not modelled
+            ("Vec", "shrink_to_fit") => Model("vec_shrink_to_fit"),
+            ("Vec", "swap_remove") => Model("vec_swap_remove"),
+            ("Vec", "dedup") => VecDedup,
+            ("slice", "sort") => SliceSort,
+            // a hash map whose iteration order is not observed (see `STD_MODELS.md`)
+            ("HashMap", "new") => ModelTyped("hashmap_new"),
+            ("HashMap", "len") => Model("hashmap_len"),
+            ("HashMap", "is_empty") => Model("hashmap_is_empty"),
+            ("HashMap", "contains_key") => HashMapKey("hashmap_contains_key"),
+            ("HashMap", "get") => HashMapKey("hashmap_get"),
+            ("HashMap", "get_mut") => HashMapKey("hashmap_get_mut"),
+            ("HashMap", "insert") => HashMapKey("hashmap_insert"),
+            ("HashMap", "remove") => HashMapKey("hashmap_remove"),
+            ("HashMap", "entry") => HashMapKey("hashmap_entry"),
+            ("HashMapEntry", "or_insert") => Model("hashmap_entry_or_insert"),
+            ("str", "lines") => Model("str_lines"),
+            ("str", "split_whitespace") => Model("str_split_whitespace"),
+            ("str", "chars") => Model("str_chars"),
+            ("str", "as_bytes") => Model("str_as_bytes"),
+            // only followed by `as_bytes` (see `encode_utf8_bytes`)
+            ("char", "encode_utf8") => CharEncodeUtf8,
+            ("str", "starts_with") => StrStartsWith,
+            ("str", "parse") => StrParse,
+            // bitwise operations: also on signed integers, whose HOL type is a word type
+            ("uint" | "int", "wrapping_add") => Model("wrapping_add"),
+            ("uint" | "int", "wrapping_sub") => Model("wrapping_sub"),
+            ("uint" | "int", "wrapping_mul") => Model("wrapping_mul"),
+            ("uint" | "int", "trailing_zeros") => Model("trailing_zeros"),
+            ("uint" | "int", "leading_zeros") => Model("leading_zeros"),
+            ("uint" | "int", "from_be_bytes") => ModelTyped("from_be_bytes"),
+            // the frontend assumes a little-endian platform
+            ("uint" | "int", "from_le_bytes" | "from_ne_bytes") => ModelTyped("from_le_bytes"),
+            ("uint" | "int", "to_be_bytes") => Model("to_be_bytes"),
+            ("uint" | "int", "to_le_bytes" | "to_ne_bytes") => Model("to_le_bytes"),
+            ("uint" | "int", "to_le") => Conversion,
+            // comparisons: on unsigned integers only (HOL's order of words is unsigned)
+            ("uint", "checked_sub") => Model("checked_sub"),
+            ("uint", "overflowing_sub") => Model("overflowing_sub"),
+            ("uint", "checked_shl") => Model("checked_shl"),
             // the models of AutoCorrode's `StdLib_Fmt`
             ("Formatter", "write_str") => FmtMethod("fmt_write_str"),
             ("Formatter", "write_char") => FmtMethod("fmt_write_char"),
@@ -2436,6 +2953,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         &mut self,
         orig: DefId,
         target: DefId,
+        gargs: GenericArgsRef<'tcx>,
         argv: &[Tr],
         arg_exprs: &[&'tcx hir::Expr<'tcx>],
         e: &'tcx hir::Expr<'tcx>,
@@ -2467,8 +2985,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         use StdFn::*;
         let r = match f {
             Clone => Some(a(0)),
-            Eq if same_operands(self) => Some(Self::mk_bin("==", 44, &a(0), &a(1))),
-            Ne if same_operands(self) => Some(Self::mk_bin("!=", 44, &a(0), &a(1))),
+            Eq if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut vec![]) => {
+                Some(Self::mk_bin("==", 44, &a(0), &a(1)))
+            }
+            Ne if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut vec![]) => {
+                Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
+            }
             // AutoCorrode's `cmp` needs an `order` on the operands' HOL type
             Cmp if !target.is_local() && self.hol_ordered(self.ty_adj(arg_exprs[0]).peel_refs()) => {
                 Some(self.named_call("cmp", vec![a(0), a(1)]))
@@ -2488,10 +3010,152 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Len => Some(self.named_call("len", vec![a(0)])),
             VecNew => Some(Tr::atom("[]")),
             ToVec | BoxNew => Some(a(0)),
-            Drop => Some(Tr::block(format!("{{ let _ = {}; () }}", a(0).s))),
+            // the destructor, if any
+            Drop => {
+                let t = self.ty_adj(arg_exprs[0]);
+                let tmp = self.fresh("dropped");
+                let g = self.drop_glue(t, PV::Val(Tr::atom(tmp.clone())))?;
+                Some(Tr::block(format!("{{ let {} = {}; {} () }}", tmp, a(0).s, g.join("\n"))))
+            }
             RangeInclusiveNew => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
             Conversion | SliceIter if same_hol(self) => Some(a(0)),
+            // a lossless conversion between integers (`From`, `Into`): the value, as `as` converts it
+            Conversion if !arg_exprs.is_empty() => {
+                let src = self.ty_adj(arg_exprs[0]).peel_refs();
+                let dst = self.ty_of(e);
+                match Self::int_suffix(dst) {
+                    Some(sfx) if src.is_bool() => Some(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", a(0).at(20), sfx, sfx), 21)),
+                    Some(sfx) if Self::int_suffix(src).is_some() => Some(Tr::new(format!("({}) as {}", a(0).s, sfx), 299)),
+                    _ => None,
+                }
+            }
             IntOp(op) => Some(self.named_call(op, vec![a(0), a(1)])),
+            Model(n) => Some(self.named_call(n, argv.to_vec())),
+            // the HOL type of the result is not determined by the arguments'
+            ModelTyped(n) => {
+                let call = self.named_call(n, argv.to_vec());
+                let h = self.hty(self.ty_of(e));
+                Some(self.typed("res", call, &h))
+            }
+            // `get` by an index, or by a range (whose HOL value is a `range` or its only field)
+            SliceGet => {
+                let it = self.ty_adj(arg_exprs[1]).peel_refs();
+                let m = match it.kind() {
+                    ty::Uint(ty::UintTy::Usize) => Some("slice_get"),
+                    ty::Adt(d, _) => match self.fe.std_adt(d.did()) {
+                        Some("Range" | "RangeInclusive") => Some("slice_get_range"),
+                        Some("RangeTo") => Some("slice_get_to"),
+                        Some("RangeToInclusive") => Some("slice_get_to_inclusive"),
+                        Some("RangeFrom") => Some("slice_get_from"),
+                        Some("RangeFull") => Some("slice_get_full"),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                m.map(|m| self.named_call(m, vec![a(0), a(1)]))
+            }
+            SliceGetMut if self.ty_adj(arg_exprs[1]).peel_refs().is_usize() => Some(self.named_call("slice_get_mut", vec![a(0), a(1)])),
+            SliceGetMut if matches!(self.range_kind(self.ty_adj(arg_exprs[1]).peel_refs()), Some(RangeKind::Range | RangeKind::Inclusive)) => {
+                Some(self.named_call("slice_get_range_mut", vec![a(0), a(1)]))
+            }
+            // `iter_mut()` as a value (in a `for` loop, see `for_loop`)
+            SliceIterMut => Some(self.named_call("slice_iter_mut_list", vec![a(0)])),
+            // of an integer range (AutoCorrode's `contains`)
+            RangeContains => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
+                ty::Adt(_, ra) if ra.type_at(0).is_integral() && ra.type_at(0) == self.ty_adj(arg_exprs[1]).peel_refs() => {
+                    Some(self.named_call("contains", vec![a(0), a(1)]))
+                }
+                _ => None,
+            },
+            SliceCopyWithin => match self.ty_adj(arg_exprs[1]).peel_refs().kind() {
+                ty::Adt(d, _) if matches!(self.fe.std_adt(d.did()), Some("Range" | "RangeInclusive")) => {
+                    Some(self.named_call("slice_copy_within", vec![a(0), a(1), a(2)]))
+                }
+                _ => None,
+            },
+            // `TryInto::try_into` / `TryFrom::try_from` from a slice to an array of length `N` (or
+            // to a reference to one): `Ok` iff the slice has `N` elements
+            TryIntoArray => {
+                let ty::Adt(_, rargs) = self.ty_of(e).kind() else { return Ok(None) };
+                // the array, or a reference to it, or (from a `Vec`) a `Box` of it
+                // (normalised: an array length given by a constant item is evaluated)
+                let env = self.typing_env();
+                // not to `&mut [T; N]`, which aliases the slice (a copy would lose the writes)
+                let target = rargs.types().next().filter(|t| !matches!(t.kind(), ty::Ref(_, _, m) if m.is_mut()));
+                let target = target.map(|t| t.peel_refs()).map(|t| match t.kind() {
+                    ty::Adt(d, a) if d.is_box() => a.type_at(0),
+                    _ => t,
+                });
+                let target = target.map(|t| crate::frontend::try_normalize(self.tcx, env, ty::Unnormalized::new_wip(t)).unwrap_or(t));
+                let src = self.ty_adj(arg_exprs[0]);
+                let model = match src.kind() {
+                    // from `&[T]` (the value of a `&mut [T]` is a reference, not the list)
+                    ty::Ref(_, s, m) if !m.is_mut() && s.is_slice() => Some("slice_try_into_array"),
+                    // `TryFrom<Vec<T>>`, `TryFrom<Box<[T]>>` (by value): the error is the argument
+                    ty::Adt(d, a) if self.fe.std_adt(d.did()) == Some("Vec") || (d.is_box() && a.type_at(0).is_slice()) => {
+                        Some("vec_try_into_array")
+                    }
+                    _ => None,
+                };
+                match (model, target.map(|t| *t.kind())) {
+                    (Some(m), Some(ty::Array(_, n))) => {
+                        n.try_to_target_usize(self.tcx).map(|n| self.named_call(m, vec![a(0), Tr::atom(format!("{}_usize", n))]))
+                    }
+                    _ => None,
+                }
+            }
+            StrStartsWith => match self.ty_adj(arg_exprs[1]).peel_refs().kind() {
+                ty::Char => Some(self.named_call("str_starts_with_char", vec![a(0), a(1)])),
+                ty::Str => Some(self.named_call("str_starts_with_str", vec![a(0), a(1)])),
+                _ => None,
+            },
+            // `str::parse::<F>` for an integer type `F` (the result's type is stated by `result_stated`)
+            StrParse => match gargs.types().next().map(|t| t.kind()) {
+                Some(ty::Uint(_)) => Some(self.named_call("str_parse_word", vec![a(0)])),
+                Some(ty::Int(_)) => Some(self.named_call("str_parse_sword", vec![a(0)])),
+                _ => None,
+            },
+            OrdMin | OrdMax if matches!(self.ty_adj(arg_exprs[0]).peel_refs().kind(), ty::Uint(_)) => {
+                Some(self.named_call(if f == OrdMin { "ord_min" } else { "ord_max" }, vec![a(0), a(1)]))
+            }
+            // `size_of::<T>()` at a type without parameters: its size in bytes, from its layout
+            SizeOf => match gargs.types().next().filter(|t| !t.has_param()) {
+                Some(t) => {
+                    let env = ty::TypingEnv::fully_monomorphized();
+                    self.tcx.layout_of(env.as_query_input(t)).ok().map(|l| Tr::atom(format!("{}_usize", l.size.bytes())))
+                }
+                None => None,
+            },
+            Iter(k) => self.iter_call(k, argv, arg_exprs, e),
+            // the key `K`: the first type argument of `HashMap<K, V, S>`; a borrowed key `&Q` must
+            // have its HOL type
+            HashMapKey(n) => {
+                let k = gargs.types().next().filter(|k| !k.has_param() && self.structural_eq_ty(*k, &mut vec![]));
+                let key_arg_ok = |this: &mut Self, k: Ty<'tcx>| {
+                    arg_exprs.get(1).is_none_or(|x| this.fe.ty(this.ty_adj(x).peel_refs()) == this.fe.ty(k))
+                };
+                match k {
+                    Some(k) if key_arg_ok(self, k) => Some(self.named_call(n, argv.to_vec())),
+                    _ => None,
+                }
+            }
+            SliceSort => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
+                ty::Slice(t) => {
+                    let c = self.ord_cmp_term(*t, &mut vec![]);
+                    c.map(|c| self.named_call("slice_sort_by", vec![Tr::atom(format!("\\<llangle>{}\\<rrangle>", c)), a(0)]))
+                }
+                _ => None,
+            },
+            VecDedup => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
+                ty::Adt(_, va) if self.structural_eq_ty(va.type_at(0), &mut vec![]) => Some(self.named_call("vec_dedup", vec![a(0)])),
+                _ => None,
+            },
+            PartialCmp => {
+                let l = self.ty_adj(arg_exprs[0]).peel_refs();
+                let r = self.ty_adj(arg_exprs[1]).peel_refs();
+                (matches!(l.kind(), ty::Uint(_)) && l == r).then(|| self.named_call("partial_cmp_word", vec![a(0), a(1)]))
+            }
+            DefaultFn if argv.is_empty() => self.default_value(self.ty_of(e), &mut vec![])?,
             // the models of AutoCorrode's `StdLib_Frontend_Models`
             VecPush => Some(self.named_call("vec_push", vec![a(0), a(1)])),
             VecPop => Some(self.named_call("vec_pop", vec![a(0)])),
@@ -2507,6 +3171,195 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             _ => None,
         };
         Ok(r)
+    }
+
+    /// Whether `PartialEq` on `t` is structural (HOL's equality): on the primitive types, `str`,
+    /// `String`, and the tuples, arrays, slices, `Vec`s and `Option`s of such types, and on local
+    /// ADTs whose `PartialEq` is derived, with such fields. `seen`: the ADTs being checked.
+    fn structural_eq_ty(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+        match t.kind() {
+            ty::Uint(_) | ty::Int(_) | ty::Bool | ty::Char | ty::Str => true,
+            // not `&mut T`: its HOL value is a reference, whose equality is the address's
+            ty::Ref(_, x, m) if !m.is_mut() => self.structural_eq_ty(*x, seen),
+            ty::Slice(x) | ty::Array(x, _) => self.structural_eq_ty(*x, seen),
+            ty::Tuple(ts) => ts.iter().all(|x| self.structural_eq_ty(x, seen)),
+            ty::Adt(d, args) => match self.fe.std_adt(d.did()) {
+                Some("String") => true,
+                Some("Vec" | "Option") => self.structural_eq_ty(args.type_at(0), seen),
+                Some(_) => false,
+                None if d.did().is_local() => {
+                    if seen.contains(&t) { return true }
+                    let Some(eq) = self.tcx.lang_items().eq_trait() else { return false };
+                    let first_fn = self.tcx.associated_items(eq).in_definition_order().find(|i| i.is_fn()).map(|i| i.def_id);
+                    let Some(m) = first_fn else { return false };
+                    let derived = matches!(
+                        self.resolve_instance(m, self.tcx.mk_args(&[t.into(), t.into()])),
+                        Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
+                    );
+                    seen.push(t);
+                    let fields = derived && d.all_fields().all(|f| self.structural_eq_ty(f.ty(self.tcx, args).skip_normalization(), seen));
+                    seen.pop();
+                    fields
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The HOL comparison (`'a => 'a => ordering`) of `Ord::cmp` on `t`: on unsigned and signed
+    /// integers, `bool` and `char` by their values, and on local structs whose `Ord` is derived,
+    /// lexicographically by their fields (with such comparisons).
+    fn ord_cmp_term(&mut self, t: Ty<'tcx>, seen: &mut Vec<DefId>) -> Option<String> {
+        match t.kind() {
+            ty::Uint(_) | ty::Bool => Some("ord_cmp".into()),
+            ty::Int(_) => Some("(\\<lambda>a b. ord_cmp (sint a) (sint b))".into()),
+            ty::Char => Some("(\\<lambda>a b. ord_cmp (of_char a :: nat) (of_char b))".into()),
+            ty::Adt(d, args) if d.is_struct() && d.did().is_local() && self.fe.record_adts.contains(&d.did()) && !seen.contains(&d.did()) => {
+                // `sort` compares with `PartialOrd::lt`: `Ord` and `PartialOrd` are derived, and
+                // `lt` is derived or `PartialOrd`'s default (through the derived `partial_cmp`)
+                let ord = self.tcx.get_diagnostic_item(sym::Ord)?;
+                let cmp = self.tcx.associated_items(ord).filter_by_name_unhygienic(sym::cmp).next()?.def_id;
+                let lt = self.tcx.get_diagnostic_item(Symbol::intern("cmp_partialord_lt"))?;
+                let partial_cmp = self.tcx.get_diagnostic_item(Symbol::intern("cmp_partialord_cmp"))?;
+                let resolves = |m: DefId, args: GenericArgsRef<'tcx>, default_ok: bool| {
+                    matches!(self.resolve_instance(m, args), Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. }))
+                        if self.derived(rd) || (default_ok && rd == m))
+                };
+                let one = self.tcx.mk_args(&[t.into()]);
+                let two = self.tcx.mk_args(&[t.into(), t.into()]);
+                if !(resolves(cmp, one, false) && resolves(partial_cmp, two, false) && resolves(lt, two, true)) {
+                    return None;
+                }
+                seen.push(d.did());
+                let mut parts = vec![];
+                for (i, f) in d.all_fields().enumerate() {
+                    let c = self.ord_cmp_term(f.ty(self.tcx, args).skip_normalization(), seen)?;
+                    let sel = self.fe.field_name(d.did(), 0, i);
+                    parts.push(format!("({} ({} a) ({} b))", c, sel, sel));
+                }
+                seen.pop();
+                let body = parts.iter().rev().fold(None, |acc: Option<String>, p| {
+                    Some(match acc {
+                        None => p.clone(),
+                        Some(r) => format!("(ordering_then {} {})", p, r),
+                    })
+                });
+                Some(format!("(\\<lambda>a b. {})", body.unwrap_or_else(|| "Equal".into())))
+            }
+            _ => None,
+        }
+    }
+
+    /// `Default::default()` of `t`: of the integer types, `bool`, `char`, `Option`, `Vec`, `String`,
+    /// tuples and arrays of such types, and of local structs whose `Default` is derived (the
+    /// defaults of their fields).
+    fn default_value(&mut self, t: Ty<'tcx>, seen: &mut Vec<DefId>) -> R<Option<Tr>> {
+        Ok(Some(match t.kind() {
+            ty::Uint(_) | ty::Int(_) => Self::int_lit(0, false, t)?,
+            ty::Bool => Tr::atom("false"),
+            ty::Char => Tr::atom("\\<llangle>CHR 0x00\\<rrangle>"),
+            ty::Tuple(ts) if ts.is_empty() => Tr::atom("()"),
+            ty::Tuple(ts) if ts.len() >= 2 => {
+                let mut vs = vec![];
+                for x in ts.iter() {
+                    let Some(v) = self.default_value(x, seen)? else { return Ok(None) };
+                    vs.push(v.at(11));
+                }
+                Tr::atom(format!("({})", vs.join(", ")))
+            }
+            ty::Array(x, n) => {
+                let Some(n) = n.try_to_target_usize(self.tcx) else { return Ok(None) };
+                let Some(v) = self.default_value(*x, seen)? else { return Ok(None) };
+                let n = Self::int_lit(n as u128, false, self.tcx.types.usize)?;
+                self.named_call("vec_from_elem", vec![v, n])
+            }
+            ty::Adt(d, args) => match self.fe.std_adt(d.did()) {
+                Some("Option") => {
+                    let h = self.hty(t);
+                    self.typed("dflt", Tr::atom("None"), &h)
+                }
+                Some("Vec") => {
+                    let h = self.hty(t);
+                    self.typed("dflt", Tr::atom("[]"), &h)
+                }
+                Some("String") => Tr::atom(format!("\\<llangle>STR {}{}\\<rrangle>", "''", "''")),
+                None if d.is_struct() && d.did().is_local() && !seen.contains(&d.did()) => {
+                    let Some(dflt) = self.tcx.get_diagnostic_item(Symbol::intern("default_fn")) else { return Ok(None) };
+                    let derived = matches!(
+                        self.resolve_instance(dflt, self.tcx.mk_args(&[t.into()])),
+                        Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
+                    );
+                    if !derived { return Ok(None) }
+                    seen.push(d.did());
+                    let mut vs = vec![];
+                    for f in d.all_fields() {
+                        let Some(v) = self.default_value(f.ty(self.tcx, args).skip_normalization(), seen)? else { return Ok(None) };
+                        vs.push(v);
+                    }
+                    seen.pop();
+                    self.ctor_call(d.did(), 0, vs)?
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        }))
+    }
+
+    /// A method of `Iterator` (see `std_fn`) called on an iterator with a model (see
+    /// `Frontend::iter_step`). An adapter's state is its fields, the inner iterator's state first
+    /// (see `Frontend::ty`); the methods that run the iterator to its end take the crate's fuel.
+    fn iter_call(&mut self, k: IterFn, argv: &[Tr], arg_exprs: &[&'tcx hir::Expr<'tcx>], e: &'tcx hir::Expr<'tcx>) -> Option<Tr> {
+        let a = |i: usize| -> Tr { argv[i].clone() };
+        let recv = self.ty_adj(arg_exprs[0]);
+        let res = self.ty_of(e);
+        let modelled = |this: &Self, t: Ty<'tcx>| matches!(t.kind(), ty::Adt(d, _) if this.fe.std_adt(d.did()).is_some());
+        let tuple = |xs: Vec<String>| Tr::atom(format!("({})", xs.join(", ")));
+        let step = |this: &Self, t: Ty<'tcx>| this.fe.iter_step(t, false).map(|s| Tr::atom(format!("\\<llangle>{}\\<rrangle>", s)));
+        let fuel = Tr::atom("\\<llangle>urust_fuel\\<rrangle>".to_string());
+        use IterFn::*;
+        match k {
+            // `next(&mut self)`, `any(&mut self, f)`: on the iterator itself (not through a further
+            // reference)
+            Next => match recv.kind() {
+                ty::Ref(_, it, m) if m.is_mut() => step(self, *it).map(|s| self.named_call("iter_ref_next", vec![s, a(0)])),
+                _ => None,
+            },
+            Any => match recv.kind() {
+                ty::Ref(_, it, m) if m.is_mut() => step(self, *it).map(|s| self.named_call("iter_ref_any", vec![fuel, s, a(1), a(0)])),
+                _ => None,
+            },
+            // the adapters take the iterator by value
+            _ if !modelled(self, recv) => None,
+            Enumerate if modelled(self, res) => Some(tuple(vec![a(0).s, "0_usize".into()])),
+            // `zip(other)`: `other` is `IntoIterator::into_iter`'d, the identity when its HOL type is
+            // that of the resulting iterator (an iterator, or a reference to a sequence)
+            Zip => {
+                let ty::Adt(_, zargs) = res.kind() else { return None };
+                let b = zargs.types().nth(1)?;
+                let other = self.ty_adj(arg_exprs[1]).peel_refs();
+                (modelled(self, res) && self.fe.ty(other) == self.fe.ty(b)).then(|| tuple(vec![a(0).s, a(1).s]))
+            }
+            Skip | Take | Map | Filter if modelled(self, res) => Some(tuple(vec![a(0).s, a(1).s])),
+            TakeWhile if modelled(self, res) => Some(tuple(vec![a(0).s, "False".into(), a(1).s])),
+            Same if modelled(self, res) => Some(a(0)),
+            Count => step(self, recv).map(|s| self.named_call("iter_count", vec![fuel.clone(), s, a(0)])),
+            ForEach => step(self, recv).map(|s| self.named_call("iter_for_each", vec![fuel.clone(), s, a(1), a(0)])),
+            // the least of unsigned integers
+            Min => match res.kind() {
+                ty::Adt(_, oa) if matches!(oa.types().next().map(|t| *t.kind()), Some(ty::Uint(_))) => {
+                    step(self, recv).map(|s| self.named_call("iter_min", vec![fuel.clone(), s, a(0)]))
+                }
+                _ => None,
+            },
+            Collect => match res.kind() {
+                ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("Vec") => {
+                    step(self, recv).map(|s| self.named_call("iter_collect_list", vec![fuel, s, a(0)]))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Is `did` a function `fn<T>(T) -> T` whose type parameter has no bound with methods? Its
@@ -2530,6 +3383,26 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Uint(_) | ty::Int(_) => true,
             _ => false,
         }
+    }
+
+    /// Whether a value of type `t` holds a `HashMap` (also in the fields of local ADTs): its
+    /// model is a list in insertion order, so HOL's equality is not the map's.
+    fn holds_hashmap(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+        if seen.contains(&t) { return false }
+        seen.push(t);
+        let r = t.walk().any(|g| match g.kind() {
+            ty::GenericArgKind::Type(x) => match x.kind() {
+                ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("HashMap") => true,
+                ty::Adt(d, _) if d.did().is_local() && x != t => self.holds_hashmap(x, seen),
+                ty::Adt(d, args) if d.did().is_local() => {
+                    d.all_fields().any(|f| self.holds_hashmap(f.ty(self.tcx, args).skip_normalization(), seen))
+                }
+                _ => false,
+            },
+            _ => false,
+        });
+        seen.pop();
+        r
     }
 
     fn derived(&self, did: DefId) -> bool {
@@ -2576,6 +3449,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 let (Some(a), Some(b)) = (st, en) else { return unsup("range") };
                 return Ok(Tr::new(format!("{} .. {}", a.at(42), b.at(42)), 41));
+            }
+            // `a..`, `..b`, `..=b`: their only field (see `Frontend::ty`)
+            if matches!(k, "RangeFrom" | "RangeTo" | "RangeToInclusive") && let [f] = fields {
+                return self.val(f.expr);
+            }
+            if k == "RangeFull" && fields.is_empty() {
+                return Ok(Tr::atom("()"));
             }
             return unsup(format!("struct expression of `{}`", t));
         }
@@ -2625,7 +3505,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         } else if def.is_enum() {
             self.ctor_call(adt, vidx, vals)?
         } else {
-            if nf > 8 { return unsup("struct with more than 8 fields") }
+            if nf > 8 { return Ok(self.ctor_many(adt, vidx, vals, pre)) }
             let n = self.fe.variant_call_name(adt, vidx);
             let fs: Vec<String> = (0..nf).map(|k| {
                 let fname = self.fe.field_name(adt, vidx, k);
@@ -2685,7 +3565,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// `e?` on a `Result` whose error type differs from the one returned: Rust converts the error
     /// with `From::from`, which uRust's `?` does not; the conversion is made explicit.
-    fn try_error_conversion(&mut self, inner: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>], v: &Tr) -> R<Option<Tr>> {
+    fn try_error_conversion(&mut self, inner: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>], v: &Tr, drops: &[String]) -> R<Option<Tr>> {
         // the `Break` arm of the desugaring returns the function's result type
         let Some(ret) = arms.iter().find_map(|a| match a.body.kind {
             ExprKind::Ret(Some(r)) => Some(r),
@@ -2696,17 +3576,30 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let from = self.ty_adj(inner).peel_refs();
         let to = self.ty_of(ret);
         let (ty::Adt(fd, fa), ty::Adt(td, ta)) = (from.kind(), to.kind()) else { return Ok(None) };
+        // an early return with drops: `return { let r = <residual>; drops; r }`
+        let ret_with = |s: &mut Self, r: String| -> String {
+            if drops.is_empty() { return format!("return {};", r) }
+            format!("return {{\n{}\n}};", s.then_drops(&r, drops))
+        };
+        if !drops.is_empty() && self.fe.std_adt(fd.did()) == Some("Option") && self.fe.std_adt(td.did()) == Some("Option") {
+            let x = self.fresh("some");
+            let none = ret_with(self, "None".to_string());
+            return Ok(Some(Tr::new(
+                format!("match {} {{\n  Some({}) \\<Rightarrow> {},\n  None \\<Rightarrow> {{ {} }}\n}}", v.at(20), x, x, none),
+                20,
+            )));
+        }
         if self.fe.std_adt(fd.did()) != Some("Result") || self.fe.std_adt(td.did()) != Some("Result") {
             return Ok(None);
         }
         let (e1, e2) = (fa.type_at(1), ta.type_at(1));
-        if e1 == e2 {
+        if e1 == e2 && drops.is_empty() {
             return Ok(None);
         }
         let Some(from_fn) = self.tcx.lang_items().get(LangItem::FromFn) else { return unsup("`?` with an error conversion") };
         let args = self.tcx.mk_args(&[e2.into(), e1.into()]);
         let err = self.fresh("err");
-        let conv = match self.resolve_instance(from_fn, args) {
+        let conv = if e1 == e2 { Tr::atom(err.clone()) } else { match self.resolve_instance(from_fn, args) {
             Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) if self.fe.local_fn_with_body(rd) => {
                 self.local_call(rd, rargs, vec![Tr::atom(err.clone())])?
             }
@@ -2717,26 +3610,37 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 self.typed("res", call, &h)
             }
             _ => return unsup("`?` with an unresolved error conversion"),
-        };
+        } };
         let ok = self.fresh("ok");
+        let back = ret_with(self, format!("Err({})", conv.at(11)));
         Ok(Some(Tr::new(
-            format!(
-                "match {} {{\n  Ok({}) \\<Rightarrow> {},\n  Err({}) \\<Rightarrow> {{ return Err({}); }}\n}}",
-                v.at(20),
-                ok,
-                ok,
-                err,
-                conv.at(11)
-            ),
+            format!("match {} {{\n  Ok({}) \\<Rightarrow> {},\n  Err({}) \\<Rightarrow> {{ {} }}\n}}", v.at(20), ok, ok, err, back),
             20,
         )))
     }
 
     fn loop_expr(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, label: Option<Label>, src: LoopSource) -> R<Tr> {
+        self.drop_scopes.push(DropScope::Loop(e.hir_id));
+        let r = self.loop_expr_scoped(e, b, label, src);
+        self.drop_scopes.pop();
+        r
+    }
+
+    fn loop_expr_scoped(&mut self, e: &'tcx hir::Expr<'tcx>, b: &'tcx hir::Block<'tcx>, label: Option<Label>, src: LoopSource) -> R<Tr> {
         let lbl = loop_label(label);
         let t = self.ty_of(e);
+        // a `loop` producing a value: a mutable local holds it, set by the `break`s (it stays
+        // `undefined` if the loop runs out of fuel, as `let x;` without a value)
         if !(t.is_unit() || t.is_never()) {
-            return unsup("loop producing a value (`break` with a value)");
+            if !matches!(src, LoopSource::Loop) { return unsup("loop producing a value (`break` with a value)") }
+            let a = self.alloc(t)?;
+            let res = self.fresh("lres");
+            let h = self.hty(t);
+            let init = self.let_binding(&res, hir::Mutability::Mut, &a, &format!("\\<llangle>undefined :: {}\\<rrangle>", h));
+            self.loop_results.insert(e.hir_id, res.clone());
+            let body = self.block_seq(b.stmts, b.expr);
+            self.loop_results.remove(&e.hir_id);
+            return Ok(Tr::block(format!("{{\n{}\n{} {}loop {{\n{}\n}};\n* {}\n}}", init, FUEL, lbl, body?, res)));
         }
         match src {
             LoopSource::While => {
@@ -2789,6 +3693,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     fn for_loop(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
+        // the loop of the desugaring is the target of the body's `break`s and `continue`s
+        let target = arms.first().map(|a| a.body.hir_id);
+        if let Some(t) = target {
+            self.drop_scopes.push(DropScope::Loop(t));
+        }
+        let r = self.for_loop_scoped(head_call, arms);
+        if target.is_some() {
+            self.drop_scopes.pop();
+        }
+        r
+    }
+
+    fn for_loop_scoped(&mut self, head_call: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
         // match IntoIterator::into_iter(<head>) { mut iter => loop { match next(&mut iter) { None => break, Some(<pat>) => <body> } } }
         let ExprKind::Call(_, [head]) = head_call.kind else { return unsup("for-loop head") };
         let [arm] = arms else { return unsup("for-loop desugaring") };
@@ -2812,6 +3729,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let Some((some_arm, pat)) = some else { return unsup("for-loop desugaring") };
         // the iterable: a range, slice, array or Vec is iterated by a uRust `for` loop
         let ht = self.ty_of(head);
+        // the elements not moved out by the body would be dropped (not modelled)
+        if self.needs_glue(ht) {
+            return unsup("`for` over values with destructors");
+        }
         // over `&mut` of a slice, array or Vec (or `xs.iter_mut()`) the items are references to
         // the elements: AutoCorrode's `iter_mut`
         let mut_items = match ht.kind() {
@@ -3368,6 +4289,35 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::block(format!("{{ {} \\<llangle>{} :: {}\\<rrangle> }}", copies.join(" "), tmp, h)))
     }
 
+    /// `c.encode_utf8(buf).as_bytes()`: `char_encode_utf8_bytes(c, buf)`, the bytes of the encoding,
+    /// also written to the buffer; the `&mut str` in between (which `String.literal` cannot hold
+    /// for a non-ASCII character) is not kept. `None` for other calls.
+    fn encode_utf8_bytes(&mut self, did: DefId, recv: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
+        if self.std_fn(did) != Some(StdFn::Model("str_as_bytes")) { return Ok(None) }
+        let ExprKind::MethodCall(_, c, [buf], _) = recv.kind else { return Ok(None) };
+        let Some(inner) = self.typeck.type_dependent_def_id(recv.hir_id) else { return Ok(None) };
+        if self.std_fn(inner) != Some(StdFn::CharEncodeUtf8) { return Ok(None) }
+        let argv = self.vals([c, buf])?;
+        Ok(Some(self.named_call("char_encode_utf8_bytes", argv)))
+    }
+
+    /// A tuple-like constructor used as a function value: the closure calling it (as for function
+    /// items, see `fn_item_value`).
+    fn ctor_value(&mut self, of: CtorOf, ctor: DefId, e: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        let tcx = self.tcx;
+        let (adt, vidx) = self.ctor_variant(of, ctor);
+        let ty::FnDef(..) = self.ty_of(e).kind() else { return unsup("constructor used as a function value") };
+        let sig = tcx.instantiate_bound_regions_with_erased(self.ty_of(e).fn_sig(tcx));
+        let ps: Vec<String> = sig.inputs().iter().map(|_| self.fresh("carg")).collect();
+        let tys: Vec<String> = sig.inputs().iter().map(|t| self.hty(*t)).collect();
+        let ret = self.hty(sig.output());
+        let call = self.ctor_call(adt, vidx, ps.iter().map(|p| Tr::atom(p.clone())).collect())?;
+        let head = if ps.is_empty() { "||".to_string() } else { format!("|{}|", ps.join(", ")) };
+        let h = self.fe.fun_type(&tys, &ret);
+        let tmp = self.fresh("closure");
+        Ok(Tr::block(format!("{{ let {} = ( {} {{\n{}\n}}); \\<llangle>{} :: {}\\<rrangle> }}", tmp, head, call.s, tmp, h)))
+    }
+
     /// A function item `f` used as a value: the closure `|a1, .., an| f(a1, .., an)` (for a
     /// local function, or a trait method resolved to a local implementation), with its type
     /// stated as for closures.
@@ -3399,6 +4349,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// The formals and the body of a closure.
     fn closure_body(&mut self, c: &'tcx hir::Closure<'tcx>) -> R<(Vec<String>, String)> {
+        self.drop_scopes.push(DropScope::Body(vec![]));
+        let r = self.closure_body_scoped(c);
+        self.drop_scopes.pop();
+        r
+    }
+
+    fn closure_body_scoped(&mut self, c: &'tcx hir::Closure<'tcx>) -> R<(Vec<String>, String)> {
         let body = self.tcx.hir_body(c.body);
         let mut ps = vec![];
         let mut pro = vec![];
@@ -3411,12 +4368,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     if modelled {
                         pro.push(format!("let {} = \\<llangle>{} :: {}\\<rrangle>;", n, n, pt));
                     }
-                    let a = self.declare(hid, &n, m)?;
+                    let a = self.declare_owned(hid, &n, m)?;
                     if m.is_mut() {
                         pro.push(self.let_binding(&n, m, &a, &n));
                     }
+                    pro.extend(self.own(hid, true)?);
                     ps.push(n);
                 }
+                _ if self.needs_glue(self.pat_ty(p.pat)) => return unsup("parameter with a destructor bound by a pattern"),
                 _ => {
                     let n = format!("carg_{}", i);
                     pro.extend(self.irrefutable(p.pat, &Tr::atom(n.clone()))?);
@@ -3425,7 +4384,424 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
         }
         let b = self.block_expr_inner(body.value)?;
+        let b = self.with_body_drops(b)?;
         Ok((ps, with_prologue(&pro, &b)))
+    }
+
+    // ------------------------------------------------------------------
+    // Destructors
+    // ------------------------------------------------------------------
+
+    /// Whether dropping a value of type `t` runs a destructor of the crate (`Drop` implemented
+    /// for a local type), for the value itself or for its fields, contents or elements. A type
+    /// parameter runs none: a generic version is translated for the types without destructors
+    /// (as the standard library's, whose destructors only free memory); within the crate, the
+    /// functions binding values of such types are also translated per instance (see
+    /// `translate::GenericCalls`).
+    fn needs_glue(&self, t: Ty<'tcx>) -> bool {
+        if !self.fe.has_drop_impls { return false }
+        if let Some(&r) = self.glue_cache.borrow().get(&t) { return r }
+        let r = self.glue_in(t, &mut vec![]);
+        self.glue_cache.borrow_mut().insert(t, r);
+        r
+    }
+
+    /// `t` normalised, with an `impl Trait` type replaced by its hidden type (see
+    /// `frontend::try_normalize`).
+    fn reveal(&self, t: Ty<'tcx>) -> Ty<'tcx> {
+        crate::frontend::try_normalize(self.tcx, self.typing_env(), ty::Unnormalized::new_wip(t)).unwrap_or(t)
+    }
+
+    fn glue_in(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+        let t = self.reveal(t);
+        if seen.contains(&t) { return false }
+        seen.push(t);
+        let r = match t.kind() {
+            ty::Adt(d, args) if d.did().is_local() => {
+                self.tcx.adt_destructor(d.did()).is_some()
+                    || d.all_fields().any(|f| self.glue_in(f.ty(self.tcx, args).skip_normalization(), seen))
+            }
+            // a standard type: one with a destructor drops what its type arguments own (a
+            // `Vec`, a `Box`, ...); one without drops its fields (an iterator over borrowed
+            // elements holds pointers, which own nothing)
+            ty::Adt(d, args) if self.tcx.adt_destructor(d.did()).is_some() => args.types().any(|x| self.glue_in(x, seen)),
+            ty::Adt(d, args) => d.all_fields().any(|f| self.glue_in(f.ty(self.tcx, args).skip_normalization(), seen)),
+            ty::Tuple(ts) => ts.iter().any(|x| self.glue_in(x, seen)),
+            ty::Array(x, _) | ty::Slice(x) => self.glue_in(*x, seen),
+            ty::Closure(_, a) => a.as_closure().upvar_tys().iter().any(|x| self.glue_in(x, seen)),
+            _ => false,
+        };
+        seen.pop();
+        r
+    }
+
+    /// The statements dropping the value `pv` of type `t` (Rust's drop glue): for a local struct
+    /// with a `Drop` implementation, its `drop` on a reference to the value, then the fields in
+    /// declaration order; the contents of a `Box` or an `Option`, the components of a tuple, the
+    /// elements of a sequence in order.
+    fn drop_glue(&mut self, t: Ty<'tcx>, pv: PV) -> R<Vec<String>> {
+        if !self.needs_glue(t) { return Ok(vec![]) }
+        let rt = self.reveal(t);
+        if self.glue_stack.contains(&rt) { return unsup("destructor of a recursive type") }
+        self.glue_stack.push(rt);
+        let r = self.drop_glue_unrolled(t, pv);
+        self.glue_stack.pop();
+        r
+    }
+
+    fn drop_glue_unrolled(&mut self, t: Ty<'tcx>, pv: PV) -> R<Vec<String>> {
+        let tcx = self.tcx;
+        let t = self.reveal(t);
+        let mut out = vec![];
+        match t.kind() {
+            ty::Adt(d, args) if d.is_box() => return self.drop_glue(args.type_at(0), pv),
+            ty::Adt(d, args) if d.did().is_local() && d.is_struct() => {
+                let adt = d.did();
+                let mut pv = pv;
+                if tcx.adt_destructor(adt).is_some() {
+                    let r = match pv {
+                        PV::Ref(r) => r,
+                        PV::Val(v) => {
+                            let a = self.alloc(t)?;
+                            let tmp = self.fresh("dropped");
+                            out.push(self.let_binding(&tmp, hir::Mutability::Mut, &a, &v.at(20)));
+                            Tr::atom(tmp)
+                        }
+                    };
+                    let drop_trait = tcx.lang_items().drop_trait().ok_or(Unsup("`Drop` trait".into()))?;
+                    let Some(m) = tcx.associated_items(drop_trait).in_definition_order().next().map(|i| i.def_id) else {
+                        return unsup("`Drop::drop`");
+                    };
+                    let Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args: rargs })) =
+                        self.resolve_instance(m, tcx.mk_args(&[t.into()]))
+                    else {
+                        return unsup(format!("destructor of `{}`", t));
+                    };
+                    let call = self.local_call(rd, rargs, vec![r.clone()])?;
+                    out.push(format!("{};", call.at(11)));
+                    pv = PV::Ref(r);
+                }
+                for (i, f) in d.all_fields().enumerate() {
+                    let ft = f.ty(tcx, args).skip_normalization();
+                    if !self.needs_glue(ft) { continue }
+                    let fpv = match &pv {
+                        PV::Val(v) => PV::Val(self.field_read(adt, i, v)?),
+                        PV::Ref(r) => {
+                            self.opaque_adt(adt)?;
+                            if !self.fe.record_adts.contains(&adt) {
+                                return unsup("destructor of a field of a recursive struct");
+                            }
+                            PV::Ref(Tr::new(format!("{}.{}", r.at(99), self.fe.field_name(adt, 0, i)), 100))
+                        }
+                    };
+                    out.extend(self.drop_glue(ft, fpv)?);
+                }
+            }
+            ty::Adt(d, args) if self.fe.std_adt(d.did()) == Some("Option") => {
+                let x = self.fresh("dropped");
+                let inner = self.drop_glue(args.type_at(0), PV::Val(Tr::atom(x.clone())))?;
+                out.push(format!("if let Some({}) = {} {{\n{}\n}} else {{\n()\n}};", x, self.to_val(pv).at(20), inner.join("\n")));
+            }
+            ty::Tuple(ts) => {
+                let tmp = self.fresh("dropped");
+                out.push(format!("let {} = {};", tmp, self.to_val(pv).at(20)));
+                for (k, x) in ts.iter().enumerate() {
+                    out.extend(self.drop_glue(x, PV::Val(Tr::new(format!("{}.{}", tmp, k), 998)))?);
+                }
+            }
+            ty::Array(x, _) | ty::Slice(x) => {
+                let e = self.fresh("dropped");
+                let inner = self.drop_glue(*x, PV::Val(Tr::atom(e.clone())))?;
+                out.push(format!("for {} in {} {{\n{}\n}};", e, self.to_val(pv).at(20), inner.join("\n")));
+            }
+            ty::Adt(d, args) if self.fe.std_adt(d.did()) == Some("Vec") => {
+                let e = self.fresh("dropped");
+                let inner = self.drop_glue(args.type_at(0), PV::Val(Tr::atom(e.clone())))?;
+                out.push(format!("for {} in {} {{\n{}\n}};", e, self.to_val(pv).at(20), inner.join("\n")));
+            }
+            _ => return unsup(format!("destructor of a value of type `{}`", t)),
+        }
+        Ok(out)
+    }
+
+    /// The statements dropping the locals `ls` (in reverse order of declaration; one with a flag
+    /// only if it holds a value).
+    fn drop_locals(&mut self, ls: &[DropLocal<'tcx>]) -> R<Vec<String>> {
+        let mut out = vec![];
+        for l in ls.iter().rev() {
+            let pv = if l.cell { PV::Ref(Tr::atom(l.name.clone())) } else { PV::Val(Tr::atom(l.name.clone())) };
+            let g = self.drop_glue(l.ty, pv)?;
+            if g.is_empty() { continue }
+            match &l.flag {
+                Some(f) => out.push(format!("if * {} {{\n{}\n}} else {{\n()\n}};", f, g.join("\n"))),
+                None => out.extend(g),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether, when the early exit `e` (`return`, `?`, `break`, `continue`) is reached, an
+    /// operand with a destructor was already evaluated by an enclosing expression (e.g. `l` in
+    /// `Pair { first: l, n: x? }`): Rust drops it, which is not modelled. Conservative: every
+    /// other operand of the enclosing expressions counts, up to the body or closure.
+    fn exit_after_owned_operand(&self, e: &'tcx hir::Expr<'tcx>) -> bool {
+        if !self.fe.has_drop_impls { return false }
+        let mut child = e.hir_id;
+        for (h, node) in self.tcx.hir_parent_iter(e.hir_id) {
+            let hir::Node::Expr(a) = node else {
+                if matches!(node, hir::Node::Item(_) | hir::Node::ImplItem(_) | hir::Node::TraitItem(_)) { break }
+                child = h;
+                continue;
+            };
+            let operands: Vec<&'tcx hir::Expr<'tcx>> = match a.kind {
+                ExprKind::Closure(_) => break,
+                ExprKind::Call(f, args) => std::iter::once(f).chain(args).collect(),
+                ExprKind::MethodCall(_, r, args, _) => std::iter::once(r).chain(args).collect(),
+                ExprKind::Tup(xs) | ExprKind::Array(xs) => xs.iter().collect(),
+                ExprKind::Struct(_, fs, tail) => {
+                    let mut v: Vec<_> = fs.iter().map(|f| f.expr).collect();
+                    if let hir::StructTailExpr::Base(b) = tail { v.push(b) }
+                    v
+                }
+                ExprKind::Binary(_, l, r) | ExprKind::Assign(l, r, _) | ExprKind::AssignOp(_, l, r) | ExprKind::Index(l, r, _) => vec![l, r],
+                // a place matched is not moved (its scope drops it)
+                ExprKind::Match(sc, _, _) if !is_place_expr(self.typeck, sc) => vec![sc],
+                ExprKind::If(c, _, _) => vec![c],
+                _ => vec![],
+            };
+            if operands.iter().any(|o| o.hir_id != child && self.needs_glue(self.ty_adj(o))) {
+                return true;
+            }
+            child = h;
+        }
+        false
+    }
+
+    /// The drops when control leaves the scopes up to the loop `target` (`break`, `continue`), or
+    /// up to and including the function's or closure's body (`None`: `return`), innermost first.
+    fn exit_drops(&mut self, target: Option<HirId>) -> R<Vec<String>> {
+        let mut ls: Vec<Vec<DropLocal<'tcx>>> = vec![];
+        let mut found = false;
+        for sc in self.drop_scopes.iter().rev() {
+            match (sc, target) {
+                (DropScope::Loop(h), Some(t)) if *h == t => {
+                    found = true;
+                    break;
+                }
+                (DropScope::Body(l), None) => {
+                    ls.push(l.clone());
+                    found = true;
+                    break;
+                }
+                (DropScope::Body(_), Some(_)) => break,
+                (DropScope::Block(l), _) => ls.push(l.clone()),
+                (DropScope::Loop(_), _) => {}
+            }
+        }
+        let mut out = vec![];
+        for l in ls {
+            out.extend(self.drop_locals(&l)?);
+        }
+        if !found && !out.is_empty() {
+            return unsup("jump out of a scope with destructors to an unknown target");
+        }
+        Ok(out)
+    }
+
+    /// The jump `j` (`break`/`continue` to `dest`, the expression `e`) after the drops of the
+    /// scopes it leaves.
+    fn jump_drops(&mut self, e: &'tcx hir::Expr<'tcx>, dest: hir::Destination, j: Tr) -> R<Tr> {
+        let mut st = self.exit_drops(dest.target_id.ok())?;
+        if st.is_empty() { return Ok(j) }
+        st.push(j.s);
+        Ok(self.jump_stmts(e, st))
+    }
+
+    /// The statements `st` ending with a jump (of the expression `e`): a block (of any type, as
+    /// the jump), and, where it ends a block, the statements themselves (see `diverging`).
+    fn jump_stmts(&mut self, e: &'tcx hir::Expr<'tcx>, st: Vec<String>) -> Tr {
+        let st = st.join("\n");
+        self.stmt_jumps.insert(e.hir_id, st.clone());
+        Tr::block(format!("{{\n{}\n}}", st))
+    }
+
+    /// The local `hid` (just declared) owns its value: if dropping it runs a destructor (see
+    /// `needs_glue`), it is dropped where its scope ends. When a use moves its value out, or it is
+    /// not initialised (`init` false), a flag tells whether it holds one (returned: its
+    /// declaration). A use moving a part with a destructor out, or a closure capturing it by value,
+    /// is not supported.
+    fn own(&mut self, hid: HirId, init: bool) -> R<Vec<String>> {
+        let t = self.node_ty(hid);
+        if !self.needs_glue(t) { return Ok(vec![]) }
+        let l = self.locals.get(&hid).cloned().expect("an owned local is declared");
+        // the uses of the local in the body (also in closures), collected once
+        if self.local_uses.is_none() {
+            let body = self.tcx.hir_body_owned_by(self.key.0.expect_local());
+            let mut v = LocalUses { tcx: self.tcx, typeck: self.typeck, uses: HashMap::new(), by_value: HashSet::new() };
+            v.visit_body(body);
+            self.local_uses = Some((v.uses, v.by_value));
+        }
+        let (uses, by_value) = self.local_uses.as_ref().expect("collected");
+        if by_value.contains(&hid) {
+            return unsup("closure capturing a value with a destructor");
+        }
+        let uses = uses.get(&hid).cloned().unwrap_or_default();
+        let mut moves = vec![];
+        for u in uses {
+            if self.use_kind(u)? == UseKind::Move {
+                moves.push(u.hir_id);
+            }
+        }
+        let mut out = vec![];
+        let flag = if !init || !moves.is_empty() {
+            let f = self.fresh(&format!("{}_live", l.name));
+            let a = self.alloc(self.tcx.types.bool)?;
+            out.push(self.let_binding(&f, hir::Mutability::Mut, &a, if init { "true" } else { "false" }));
+            for m in moves {
+                self.moved_uses.insert(m, f.clone());
+            }
+            self.local_flags.insert(hid, f.clone());
+            Some(f)
+        } else {
+            None
+        };
+        let dl = DropLocal { name: l.name, cell: l.cell, ty: t, flag };
+        match self.drop_scopes.last_mut() {
+            Some(DropScope::Block(ls)) | Some(DropScope::Body(ls)) => ls.push(dl),
+            _ => return unsup("local with a destructor outside a block"),
+        }
+        Ok(out)
+    }
+
+    /// How the use `p` (a path to a local with a destructor) treats the value; an error for a
+    /// move of a part with a destructor out of it, or a value discarded by a statement.
+    fn use_kind(&self, p: &'tcx hir::Expr<'tcx>) -> R<UseKind> {
+        let parent = self.tcx.parent_hir_node(p.hir_id);
+        let adj = self.typeck.expr_adjustments(p);
+        if !adj.is_empty() {
+            // borrowed (autoref): a place
+            if adj.iter().any(|a| matches!(a.kind, Adjust::Borrow(_))) { return Ok(UseKind::Place) }
+            // dereferenced (a `Box`): a field read through it is a place, see below; anything else
+            // moves the contents out of the box
+            if adj.iter().any(|a| matches!(a.kind, Adjust::Deref(_)))
+                && !matches!(parent, hir::Node::Expr(par) if matches!(par.kind, ExprKind::Field(..)))
+            {
+                return unsup("move out of a box holding a value with a destructor");
+            }
+            // a coercion of the value (unsizing): moved
+            if !adj.iter().any(|a| matches!(a.kind, Adjust::Deref(_))) { return Ok(UseKind::Move) }
+        }
+        let bad_bindings = |pat: &'tcx hir::Pat<'tcx>| {
+            let mut bad = false;
+            pat.walk_always(|q| {
+                if let PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), h, _, _) = q.kind
+                    && self.needs_glue(self.node_ty(h))
+                {
+                    bad = true;
+                }
+            });
+            bad
+        };
+        Ok(match self.tcx.parent_hir_node(p.hir_id) {
+            hir::Node::Expr(par) => match par.kind {
+                ExprKind::AddrOf(..) => UseKind::Place,
+                // the operand of an overloaded `+=` or index taken by value is moved
+                ExprKind::AssignOp(_, lhs, _) | ExprKind::Index(lhs, _, _) => {
+                    if lhs.hir_id == p.hir_id { UseKind::Place } else { UseKind::Move }
+                }
+                // the contents of a `Box`: moved out if they have a destructor and the use moves them
+                ExprKind::Unary(UnOp::Deref, _) => {
+                    if self.needs_glue(self.ty_of(par)) && self.use_kind(par)? == UseKind::Move {
+                        return unsup("move out of a box holding a value with a destructor");
+                    }
+                    UseKind::Place
+                }
+                // a part: moved out if it has a destructor and its use moves it
+                ExprKind::Field(..) => {
+                    if self.needs_glue(self.ty_of(par)) && self.use_kind(par)? == UseKind::Move {
+                        return unsup("move of a part with a destructor out of a value");
+                    }
+                    UseKind::Place
+                }
+                // assigned (the old value is dropped there, see `expr`)
+                ExprKind::Assign(lhs, _, _) if lhs.hir_id == p.hir_id => UseKind::Place,
+                ExprKind::Match(s, arms, _) if s.hir_id == p.hir_id => {
+                    if arms.iter().any(|a| bad_bindings(a.pat)) {
+                        return unsup("move of a part with a destructor out of a value");
+                    }
+                    UseKind::Place
+                }
+                ExprKind::Let(le) if le.init.hir_id == p.hir_id => {
+                    if bad_bindings(le.pat) {
+                        return unsup("move of a part with a destructor out of a value");
+                    }
+                    UseKind::Place
+                }
+                ExprKind::Struct(_, _, hir::StructTailExpr::Base(b)) if b.hir_id == p.hir_id => {
+                    return unsup("functional update of a value with a destructor");
+                }
+                _ => UseKind::Move,
+            },
+            hir::Node::LetStmt(l) => match l.pat.kind {
+                PatKind::Wild | PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(..), _), ..) => UseKind::Place,
+                PatKind::Binding(..) => UseKind::Move,
+                _ if bad_bindings(l.pat) => return unsup("move of a part with a destructor out of a value"),
+                _ => UseKind::Place,
+            },
+            hir::Node::Stmt(_) => return unsup("value with a destructor discarded by a statement"),
+            _ => UseKind::Move,
+        })
+    }
+}
+
+/// Whether `e` is a place expression (a local or a static, or a field, element or dereference of
+/// one).
+fn is_place_expr<'tcx>(typeck: &TypeckResults<'tcx>, e: &hir::Expr<'tcx>) -> bool {
+    match e.kind {
+        ExprKind::Path(ref qp) => matches!(typeck.qpath_res(qp, e.hir_id), Res::Local(_) | Res::Def(DefKind::Static { .. }, _)),
+        // a part of a place (of a temporary it is a temporary)
+        ExprKind::Field(b, _) | ExprKind::Index(b, _, _) => is_place_expr(typeck, b),
+        // what a reference points to is a place; the contents of a `Box` are where the box is
+        ExprKind::Unary(UnOp::Deref, b) => {
+            matches!(typeck.expr_ty_adjusted(b).kind(), ty::Ref(..) | ty::RawPtr(..)) || is_place_expr(typeck, b)
+        }
+        _ => false,
+    }
+}
+
+/// The paths to each local in a body (also in its closures), and the locals a closure captures
+/// by value.
+struct LocalUses<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typeck: &'tcx TypeckResults<'tcx>,
+    uses: HashMap<HirId, Vec<&'tcx hir::Expr<'tcx>>>,
+    by_value: HashSet<HirId>,
+}
+
+impl<'tcx> Visitor<'tcx> for LocalUses<'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
+        match e.kind {
+            ExprKind::Path(ref qp) => {
+                if let Res::Local(h) = self.typeck.qpath_res(qp, e.hir_id) {
+                    self.uses.entry(h).or_default().push(e);
+                }
+            }
+            ExprKind::Closure(c) => {
+                for cap in self.typeck.closure_min_captures_flattened(c.def_id) {
+                    if !matches!(cap.info.capture_kind, ty::UpvarCapture::ByRef(_)) {
+                        self.by_value.insert(cap.get_root_variable());
+                    }
+                }
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, e);
     }
 }
 
@@ -3591,6 +4967,63 @@ enum StdFn {
     FmtMethod(&'static str),
     /// the `fmt` method of a formatting trait (`Display`, `Debug`, `LowerHex`, ...)
     FmtTrait(DefId),
+    /// a model of AutoCorrode's `StdLib_Frontend_Models` applied to the arguments
+    Model(&'static str),
+    /// as `Model`, with the HOL type of the result stated (the arguments do not determine it)
+    ModelTyped(&'static str),
+    /// `<[T]>::get` with an index or a range
+    SliceGet,
+    /// `<[T]>::copy_within` with a `Range` or `RangeInclusive`
+    SliceCopyWithin,
+    /// `TryInto::try_into`, `TryFrom::try_from` from a slice to an array
+    TryIntoArray,
+    /// a method of `HashMap` taking a key (by its model's name), for keys with structural equality
+    HashMapKey(&'static str),
+    /// `<[T]>::sort` by the `Ord` of the elements
+    SliceSort,
+    /// `Vec::dedup` with structural equality
+    VecDedup,
+    /// `PartialOrd::partial_cmp` on unsigned integers
+    PartialCmp,
+    /// `Default::default` of a standard type, or derived
+    DefaultFn,
+    /// `char::encode_utf8`
+    CharEncodeUtf8,
+    /// `Range(Inclusive)::contains`
+    RangeContains,
+    /// `<[T]>::get_mut` with an index
+    SliceGetMut,
+    /// `str::starts_with` with a `char` or a `&str` pattern
+    StrStartsWith,
+    /// `str::parse` into an integer type
+    StrParse,
+    /// `Ord::min`, `cmp::min` (and `max`) on unsigned integers
+    OrdMin,
+    OrdMax,
+    /// `mem::size_of`
+    SizeOf,
+    /// a method of `Iterator`
+    Iter(IterFn),
+}
+
+/// The methods of `Iterator` with models (see `iter_call`).
+#[derive(Clone, Copy, PartialEq)]
+enum IterFn {
+    Next,
+    Enumerate,
+    Zip,
+    Skip,
+    Take,
+    TakeWhile,
+    Map,
+    /// `rev`, `copied`, `cloned`: the state of the inner iterator
+    Same,
+    Count,
+    Collect,
+    Filter,
+    Any,
+    Min,
+    ForEach,
 }
 
 /// A lang item, or a diagnostic item by its name in the table of the standard library.
@@ -3620,6 +5053,16 @@ const STD_ITEMS: &[(Item, StdFn)] = &[
     (Item::Diag("string_as_str"), StdFn::Conversion),
     (Item::Diag("slice_iter"), StdFn::SliceIter),
     (Item::Diag("vec_from_elem"), StdFn::VecFromElem),
+    (Item::Diag("cmp_min"), StdFn::OrdMin),
+    (Item::Diag("cmp_ord_min"), StdFn::OrdMin),
+    (Item::Diag("cmp_max"), StdFn::OrdMax),
+    (Item::Diag("cmp_ord_max"), StdFn::OrdMax),
+    (Item::Diag("mem_size_of"), StdFn::SizeOf),
+    (Item::Diag("try_from_fn"), StdFn::TryIntoArray),
+    (Item::Diag("cmp_partialord_cmp"), StdFn::PartialCmp),
+    (Item::Diag("mem_swap"), StdFn::Model("mem_swap")),
+    (Item::Diag("mem_replace"), StdFn::Model("mem_replace")),
+    (Item::Diag("default_fn"), StdFn::DefaultFn),
 ];
 
 /// `if c1 { b1 } else { if c2 { b2 } else { .. } }` for (condition, body) branches;

@@ -123,11 +123,16 @@ pub struct Frontend<'tcx> {
     ext_type_ids: HashMap<DefId, String>,
     pub foreign_funs: BTreeMap<String, ExtFun>,
     pub alloc_types: Vec<String>,
+    /// their canonical forms (see `need_alloc`)
+    alloc_keys: Vec<String>,
     /// the function items whose types `ty` is translating (a function item's signature may
     /// contain its own type, through an `impl Trait` result)
     fn_items: Vec<DefId>,
     /// `core::fmt::Error` (see `fmt_error_of`)
     fmt_error: Option<DefId>,
+    /// the standard library iterators and other ADTs that have models but no lang or diagnostic
+    /// item of their own (see `std_adts_of`)
+    std_adts: Vec<(DefId, &'static str)>,
     /// the formatting traits: the bounds of the `fmt::rt::Argument` constructors (`Display`,
     /// `Debug`, `LowerHex`, ..., `Pointer`), with their names
     pub fmt_traits: Vec<(DefId, String)>,
@@ -145,6 +150,8 @@ pub struct Frontend<'tcx> {
     /// generic `Fn` argument) depending on their type parameters, directly or through other such
     /// functions; trait default methods (generic over `Self`).
     pub mono_fns: HashSet<DefId>,
+    /// whether the crate implements `Drop` for a type (see `BodyTr::needs_glue`)
+    pub has_drop_impls: bool,
     instance_names: HashMap<(DefId, GenericArgsRef<'tcx>), String>,
     /// names of the copies of default methods, by (method, implementation)
     copy_names: HashMap<(DefId, DefId), String>,
@@ -244,6 +251,100 @@ pub fn normalize<'tcx, T: TypeFoldable<TyCtxt<'tcx>> + Copy>(tcx: TyCtxt<'tcx>, 
     try_normalize(tcx, env, x).unwrap_or_else(|_| tcx.erase_and_anonymize_regions(x.skip_normalization()))
 }
 
+/// A HOL type written without redundant parentheses (every compound argument and operand
+/// parenthesised, nothing else), to compare types written differently; the string itself if it
+/// does not parse.
+pub fn canonical_hol_ty(s: &str) -> String {
+    // tokens: parentheses, commas, symbols (`\<times>`, `\<Rightarrow>`) and words
+    let mut toks: Vec<String> = vec![];
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' | ')' | ',' => {
+                if !cur.is_empty() { toks.push(std::mem::take(&mut cur)) }
+                toks.push(c.to_string());
+            }
+            c if c.is_whitespace() => {
+                if !cur.is_empty() { toks.push(std::mem::take(&mut cur)) }
+            }
+            '\\' => {
+                if !cur.is_empty() { toks.push(std::mem::take(&mut cur)) }
+                let mut sym = String::from("\\");
+                for d in chars.by_ref() {
+                    sym.push(d);
+                    if d == '>' { break }
+                }
+                toks.push(sym);
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() { toks.push(cur) }
+    enum T {
+        App(Vec<T>, String),
+        Name(String),
+        Bin(Box<T>, &'static str, Box<T>),
+    }
+    const TIMES: &str = "\\<times>";
+    const FUN: &str = "\\<Rightarrow>";
+    fn ty(t: &[String], i: &mut usize) -> Option<T> {
+        let l = prod(t, i)?;
+        if t.get(*i).map(|x| x.as_str()) == Some(FUN) {
+            *i += 1;
+            return Some(T::Bin(Box::new(l), "=>", Box::new(ty(t, i)?)));
+        }
+        Some(l)
+    }
+    fn prod(t: &[String], i: &mut usize) -> Option<T> {
+        let l = app(t, i)?;
+        if t.get(*i).map(|x| x.as_str()) == Some(TIMES) {
+            *i += 1;
+            return Some(T::Bin(Box::new(l), "*", Box::new(prod(t, i)?)));
+        }
+        Some(l)
+    }
+    fn app(t: &[String], i: &mut usize) -> Option<T> {
+        let w = t.get(*i)?.clone();
+        let mut args = if w == "(" {
+            *i += 1;
+            let mut v = vec![ty(t, i)?];
+            while t.get(*i)? == "," {
+                *i += 1;
+                v.push(ty(t, i)?);
+            }
+            if t.get(*i)? != ")" { return None }
+            *i += 1;
+            v
+        } else if w == ")" || w == "," || w == TIMES || w == FUN {
+            return None;
+        } else {
+            *i += 1;
+            vec![T::Name(w)]
+        };
+        // postfix type constructors
+        while let Some(c) = t.get(*i)
+            && !(c == "(" || c == ")" || c == "," || c == TIMES || c == FUN)
+        {
+            *i += 1;
+            args = vec![T::App(args, c.clone())];
+        }
+        if args.len() == 1 { args.pop() } else { None }
+    }
+    fn show(x: &T) -> String {
+        match x {
+            T::Name(n) => n.clone(),
+            T::App(a, c) => format!("({}) {}", a.iter().map(show).collect::<Vec<_>>().join(", "), c),
+            T::Bin(l, o, r) => format!("({} {} {})", show(l), o, show(r)),
+        }
+    }
+    let mut i = 0;
+    match ty(&toks, &mut i) {
+        Some(x) if i == toks.len() => show(&x),
+        _ => s.to_string(),
+    }
+}
+
 pub fn paren_ty(s: &str) -> String {
     if s.contains(' ') && !(s.starts_with('(') && balanced_outer(s)) { format!("({})", s) } else { s.to_string() }
 }
@@ -275,8 +376,10 @@ impl<'tcx> Frontend<'tcx> {
             ext_type_ids: HashMap::new(),
             foreign_funs: BTreeMap::new(),
             alloc_types: Vec::new(),
+            alloc_keys: vec![],
             fn_items: Vec::new(),
             fmt_error: fmt_error_of(tcx),
+            std_adts: std_adts_of(tcx),
             fmt_traits: fmt_traits_of(tcx),
             opaques: Vec::new(),
             placeholders: Vec::new(),
@@ -286,6 +389,7 @@ impl<'tcx> Frontend<'tcx> {
             marker_ids: Vec::new(),
             marker_index: HashMap::new(),
             mono_fns: HashSet::new(),
+            has_drop_impls: false,
             instance_names: HashMap::new(),
             copy_names: HashMap::new(),
             dict_traits: Vec::new(),
@@ -347,6 +451,12 @@ impl<'tcx> Frontend<'tcx> {
         if !self.mono_fns.contains(&did) || args.has_param() || !args.types().all(|t| self.ty_dry(t).1) {
             return Some((did, Inst::Generic));
         }
+        self.instance(did, args)
+    }
+
+    /// The instance of the local item `did` at the concrete generic arguments `args` (queued for
+    /// translation the first time). `None` if `did` already has `MAX_INSTANCES` instances.
+    pub fn instance(&mut self, did: DefId, args: GenericArgsRef<'tcx>) -> Option<FnKey<'tcx>> {
         let args = self.tcx.erase_and_anonymize_regions(args);
         if !self.instance_names.contains_key(&(did, args)) {
             let count = self.instances_per_fn.entry(did).or_insert(0);
@@ -612,12 +722,60 @@ impl<'tcx> Frontend<'tcx> {
             "Range"
         } else if lang(LangItem::RangeInclusiveStruct) {
             "RangeInclusive"
+        } else if lang(LangItem::RangeFrom) {
+            "RangeFrom"
+        } else if lang(LangItem::RangeTo) {
+            "RangeTo"
+        } else if lang(LangItem::RangeToInclusive) {
+            "RangeToInclusive"
+        } else if lang(LangItem::RangeFull) {
+            "RangeFull"
         } else if diag(Symbol::intern("Formatter")) {
             "Formatter"
         } else if Some(did) == self.fmt_error {
             "FmtError"
+        } else if diag(Symbol::intern("SliceIter")) {
+            "SliceIter"
+        } else if diag(Symbol::intern("Enumerate")) {
+            "Enumerate"
+        } else if diag(sym::HashMap) {
+            "HashMap"
+        } else if diag(Symbol::intern("HashMapEntry")) {
+            "HashMapEntry"
+        } else if let Some(&(_, n)) = self.std_adts.iter().find(|(d, _)| *d == did) {
+            n
         } else {
             return None;
+        })
+    }
+
+    /// The step function (AutoCorrode's `iter_step`, see `STD_MODELS.md`) of the iterator type `t`
+    /// for its `next` (or, if `back`, its `next_back`), when it has a model.
+    pub fn iter_step(&self, t: Ty<'tcx>, back: bool) -> Option<String> {
+        let ty::Adt(def, args) = t.kind() else { return None };
+        let inner = |i: usize| args.types().nth(i).expect("type argument of an iterator adapter");
+        Some(match (self.std_adt(def.did())?, back) {
+            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", false) => "list_iter_next".into(),
+            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", true) => "list_iter_next_back".into(),
+            ("ChunksExact", false) => "chunks_exact_next".into(),
+            ("Chunks", false) => "chunks_next".into(),
+            // `Filter::next` is the inner `find`, which takes the crate's fuel
+            ("Filter", false) => format!("(filter_next urust_fuel {})", self.iter_step(inner(0), false)?),
+            // `a..` over an unsigned integer (its state is the next value, see `ty`)
+            ("RangeFrom", false) if matches!(inner(0).kind(), ty::Uint(_)) => "range_from_next".into(),
+            // `a..b`, `a..=b` over an unsigned integer (a `range` record), from either end
+            ("Range" | "RangeInclusive", false) if matches!(inner(0).kind(), ty::Uint(_)) => "range_next".into(),
+            ("Range" | "RangeInclusive", true) if matches!(inner(0).kind(), ty::Uint(_)) => "range_next_back".into(),
+            ("Enumerate", false) => format!("(enumerate_next {})", self.iter_step(inner(0), false)?),
+            ("Zip", false) => format!("(zip_next {} {})", self.iter_step(inner(0), false)?, self.iter_step(inner(1), false)?),
+            ("Skip", false) => format!("(skip_next {})", self.iter_step(inner(0), false)?),
+            ("Take", false) => format!("(take_next {})", self.iter_step(inner(0), false)?),
+            ("TakeWhile", false) => format!("(take_while_next {})", self.iter_step(inner(0), false)?),
+            // `Map::next_back` is the inner `next_back`, mapped
+            ("Map", b) => format!("(map_next {})", self.iter_step(inner(0), b)?),
+            ("Rev", b) => self.iter_step(inner(0), !b)?,
+            ("Copied" | "Cloned", b) => self.iter_step(inner(0), b)?,
+            _ => return None,
         })
     }
 
@@ -848,6 +1006,47 @@ impl<'tcx> Frontend<'tcx> {
                     Some("Range") | Some("RangeInclusive") => {
                         format!("{} range", paren_ty(&self.ty(targs[0])))
                     }
+                    // `a..`, `..b`, `..=b` by their only field; `..` has none
+                    Some("RangeFrom") | Some("RangeTo") | Some("RangeToInclusive") => self.ty(targs[0]),
+                    Some("RangeFull") => "unit".into(),
+                    // iterators by their states (see `iter_step` and `STD_MODELS.md`): the remaining
+                    // elements of a sequence, or an adapter's fields with the inner iterator's state
+                    Some("SliceIter") | Some("VecIntoIter") => format!("{} list", paren_ty(&self.ty(targs[0]))),
+                    // the references to the remaining elements
+                    Some("SliceIterMut") => format!("(('addr, 'gv, {}) Global_Store.ref list)", self.ty(targs[0])),
+                    Some("Chunks") => format!("({} list \\<times> 64 word \\<times> tnil)", paren_ty(&self.ty(targs[0]))),
+                    Some("Filter") => {
+                        format!("({} \\<times> {} \\<times> tnil)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    // a hash map whose iteration order is not observed: its entries (see `STD_MODELS.md`)
+                    Some("HashMap") => {
+                        format!("(({} \\<times> {} \\<times> tnil) list)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    // an entry: the map (a reference to it) and the key
+                    Some("HashMapEntry") => format!(
+                        "(('addr, 'gv, ({} \\<times> {} \\<times> tnil) list) Global_Store.ref \\<times> {} \\<times> tnil)",
+                        paren_ty(&self.ty(targs[0])),
+                        paren_ty(&self.ty(targs[1])),
+                        paren_ty(&self.ty(targs[0]))
+                    ),
+                    Some("Lines") | Some("SplitWhitespace") => "String.literal list".into(),
+                    Some("Chars") => "char list".into(),
+                    Some("ChunksExact") => {
+                        let t = paren_ty(&self.ty(targs[0]));
+                        format!("({} list list \\<times> {} list \\<times> tnil)", t, t)
+                    }
+                    Some("Enumerate") | Some("Skip") | Some("Take") => {
+                        format!("({} \\<times> 64 word \\<times> tnil)", paren_ty(&self.ty(targs[0])))
+                    }
+                    Some("Zip") | Some("Map") => {
+                        format!("({} \\<times> {} \\<times> tnil)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    Some("TakeWhile") => {
+                        format!("({} \\<times> bool \\<times> {} \\<times> tnil)", paren_ty(&self.ty(targs[0])), paren_ty(&self.ty(targs[1])))
+                    }
+                    Some("Rev") | Some("Copied") | Some("Cloned") => self.ty(targs[0]),
+                    Some("ParseIntError") => "int_error_kind".into(),
+                    Some("TryFromSliceError") => "try_from_slice_error".into(),
                     _ => {
                         let name = if let Some(&why) = self.opaque_adts.get(&did) {
                             let n = self.tcx.def_path_str(did);
@@ -954,9 +1153,13 @@ impl<'tcx> Frontend<'tcx> {
 
     /// The locale's allocator for the HOL type `hol_ty` (its index in `alloc_types`), added if new.
     pub fn need_alloc(&mut self, hol_ty: &str) -> usize {
-        match self.alloc_types.iter().position(|t| t == hol_ty) {
+        // the same type may be written with different parentheses: one storage per type (else the
+        // overloading of `store_reference_const` is ambiguous)
+        let key = canonical_hol_ty(hol_ty);
+        match self.alloc_keys.iter().position(|t| *t == key) {
             Some(k) => k,
             None => {
+                self.alloc_keys.push(key);
                 self.alloc_types.push(hol_ty.to_string());
                 self.alloc_types.len() - 1
             }
@@ -1093,8 +1296,12 @@ impl<'tcx> Frontend<'tcx> {
     /// `ty`), how many it keeps (e.g. `Vec<T, A>` is `T list`).
     pub fn hol_kept_args(&self, did: DefId) -> Option<usize> {
         match self.std_adt(did)? {
-            "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" => Some(1),
-            "String" | "Ordering" | "Formatter" | "FmtError" => Some(0),
+            "Box" | "Vec" | "Option" | "Range" | "RangeInclusive" | "RangeFrom" | "RangeTo" | "RangeToInclusive" => Some(1),
+            "String" | "Ordering" | "Formatter" | "FmtError" | "RangeFull" => Some(0),
+            // the iterators keep all their type arguments (see `ty`)
+            "SliceIter" | "SliceIterMut" | "ChunksExact" | "Chunks" | "VecIntoIter" | "Enumerate" | "Skip" | "Take" | "Rev" | "Copied" | "Cloned" => Some(1),
+            "Zip" | "TakeWhile" | "Map" | "Filter" | "HashMap" | "HashMapEntry" => Some(2),
+            "Lines" | "SplitWhitespace" | "Chars" | "ParseIntError" | "TryFromSliceError" => Some(0),
             _ => None,
         }
     }
@@ -1111,6 +1318,12 @@ impl<'tcx> Frontend<'tcx> {
     // ------------------------------------------------------------------
     // External functions
     // ------------------------------------------------------------------
+
+    /// Whether the item `did` has const generic parameters of its own: it is translated only per
+    /// instance (see `translate::run`), where they are constants.
+    pub fn has_const_params(&self, did: DefId) -> bool {
+        self.tcx.generics_of(did).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }))
+    }
 
     /// Register (or look up) an external function, returning its HOL name.
     pub fn ext_fun(&mut self, did: DefId, foreign: bool) -> String {
@@ -1187,6 +1400,91 @@ fn fmt_error_of(tcx: TyCtxt<'_>) -> Option<DefId> {
         },
         _ => None,
     }
+}
+
+/// The standard library ADTs with models that have no lang or diagnostic item of their own,
+/// identified by the compiler as the result types of methods it identifies: the iterator adapters
+/// returned by methods of `Iterator`, the iterators returned by methods of the inherent impls of
+/// `str` and of slices (found through their methods with diagnostic items), and `ParseIntError`,
+/// the error type of `FromStr` for the integer types.
+fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
+    let mut out: Vec<(DefId, &'static str)> = vec![];
+    let result_adt = |f: DefId| match tcx.fn_sig(f).skip_binder().output().skip_binder().kind() {
+        ty::Adt(d, _) => Some(d.did()),
+        _ => None,
+    };
+    let mut methods_of = |owner: DefId, methods: &[(&str, &'static str)]| {
+        for &(m, n) in methods {
+            let item = tcx.associated_items(owner).filter_by_name_unhygienic(Symbol::intern(m)).find(|i| i.is_fn());
+            if let Some(d) = item.and_then(|i| result_adt(i.def_id)) {
+                out.push((d, n));
+            }
+        }
+    };
+    if let Some(it) = tcx.get_diagnostic_item(sym::Iterator) {
+        let adapters = [
+            ("zip", "Zip"),
+            ("skip", "Skip"),
+            ("take", "Take"),
+            ("take_while", "TakeWhile"),
+            ("map", "Map"),
+            ("filter", "Filter"),
+            ("rev", "Rev"),
+            ("copied", "Copied"),
+            ("cloned", "Cloned"),
+        ];
+        methods_of(it, &adapters);
+    }
+    if let Some(sw) = tcx.get_diagnostic_item(Symbol::intern("str_split_whitespace")) {
+        methods_of(tcx.parent(sw), &[("split_whitespace", "SplitWhitespace"), ("lines", "Lines"), ("chars", "Chars")]);
+    }
+    if let Some(si) = tcx.get_diagnostic_item(Symbol::intern("slice_iter")) {
+        methods_of(tcx.parent(si), &[("chunks_exact", "ChunksExact"), ("chunks", "Chunks"), ("iter_mut", "SliceIterMut")]);
+    }
+    // `<u8 as FromStr>::Err`: the associated type `Err` of the implementation of `FromStr` (the
+    // trait of the method `from_str_method`) for `u8`
+    if let Some(from_str) = tcx.get_diagnostic_item(Symbol::intern("from_str_method")).map(|m| tcx.parent(m)) {
+        for &imp in tcx.all_impls(from_str).collect::<Vec<_>>().iter() {
+            if *tcx.type_of(imp).instantiate_identity().skip_normalization().kind() != ty::Uint(ty::UintTy::U8) { continue }
+            let err = tcx.associated_items(imp).filter_by_name_unhygienic(sym::Err).next();
+            if let Some(err) = err
+                && let ty::Adt(d, _) = tcx.type_of(err.def_id).instantiate_identity().skip_normalization().kind()
+            {
+                out.push((d.did(), "ParseIntError"));
+            }
+        }
+    }
+    // `vec::IntoIter`: the associated type `IntoIter` of the implementation of `IntoIterator` for
+    // `Vec<T>` (by value)
+    if let (Some(into_iter), Some(vec)) = (tcx.get_diagnostic_item(sym::IntoIterator), tcx.get_diagnostic_item(sym::Vec)) {
+        for imp in tcx.all_impls(into_iter).collect::<Vec<_>>() {
+            let self_ty = tcx.type_of(imp).instantiate_identity().skip_normalization();
+            if !matches!(self_ty.kind(), ty::Adt(d, _) if d.did() == vec) { continue }
+            let it = tcx.associated_items(imp).filter_by_name_unhygienic(Symbol::intern("IntoIter")).next();
+            if let Some(it) = it
+                && let ty::Adt(d, _) = tcx.type_of(it.def_id).instantiate_identity().skip_normalization().kind()
+            {
+                out.push((d.did(), "VecIntoIter"));
+            }
+        }
+    }
+    // `TryFromSliceError`: the associated type `Error` of the implementation of `TryFrom<&[T]>`
+    // for arrays `[T; N]`
+    if let Some(try_from) = tcx.get_diagnostic_item(sym::TryFrom) {
+        for imp in tcx.all_impls(try_from).collect::<Vec<_>>() {
+            let tr = tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization();
+            let from_slice = matches!(tr.args.type_at(1).kind(), ty::Ref(_, s, _) if s.is_slice());
+            if !from_slice || !matches!(tr.args.type_at(0).kind(), ty::Array(..)) { continue }
+            let err = tcx.associated_items(imp).filter_by_name_unhygienic(Symbol::intern("Error")).next();
+            if let Some(err) = err
+                && let ty::Adt(d, _) = tcx.type_of(err.def_id).instantiate_identity().skip_normalization().kind()
+                && !out.iter().any(|(x, _)| *x == d.did())
+            {
+                out.push((d.did(), "TryFromSliceError"));
+            }
+        }
+    }
+    out
 }
 
 /// The traits bounding the type parameters of the constructors of `fmt::rt::Argument` (the lang

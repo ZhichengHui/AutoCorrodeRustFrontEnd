@@ -101,14 +101,12 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             hir::ItemKind::TraitAlias(..) => fe.item_placeholder("trait alias", tcx.def_span(did)),
             hir::ItemKind::GlobalAsm { .. } => fe.item_placeholder("global assembly", item.span),
             hir::ItemKind::Impl(_) => {
+                // destructors are called where Rust drops the values (see `BodyTr::drop_glue`)
                 if !tcx.is_automatically_derived(did)
                     && let Some(tr) = tcx.impl_opt_trait_ref(did)
                     && tcx.is_lang_item(tr.skip_binder().def_id, LangItem::Drop)
                 {
-                    fe.item_placeholder(
-                        "destructor semantics (drop is translated as an ordinary function; destructor calls are not inserted)",
-                        tcx.def_span(did),
-                    );
+                    fe.has_drop_impls = true;
                 }
             }
             hir::ItemKind::ForeignMod { items: fitems, .. } => {
@@ -146,8 +144,20 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     for &d in &bodies {
         fe.def_name(d);
     }
+    // A function with const generic parameters only at its instances (see `local_callee`). A
+    // function translated per instance (see `mono_fns`) that the crate does not export is
+    // translated generically only when a definition refers to its generic version, or when it
+    // has no instance (see below): its generic version cannot translate what needs the instances.
+    let exported = tcx.effective_visibilities(());
+    let deferred: HashSet<DefId> = bodies
+        .iter()
+        .copied()
+        .filter(|&d| fe.mono_fns.contains(&d) && !fe.has_const_params(d) && d.as_local().is_some_and(|l| !exported.is_exported(l)))
+        .collect();
     for &d in &bodies {
-        translate_item(&mut fe, (d, Inst::Generic));
+        if !fe.has_const_params(d) && !deferred.contains(&d) {
+            translate_item(&mut fe, (d, Inst::Generic));
+        }
     }
     // each local implementation's copies of the default methods it does not override (its
     // dictionaries' fields)
@@ -165,9 +175,36 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             }
         }
     }
-    // instances called from the translated bodies, and from those instances
-    while let Some(key) = fe.pending.pop() {
-        translate_item(&mut fe, key);
+    // instances called from the translated bodies, and from those instances; then the deferred
+    // generic versions that are referred to or whose functions have no instance (and what they call);
+    // a default method that no local implementation uses (nor these): generically, with the
+    // dictionary of `Self` (for the implementations outside the crate)
+    loop {
+        while let Some(key) = fe.pending.pop() {
+            translate_item(&mut fe, key);
+        }
+        let needed: Vec<DefId> = deferred
+            .iter()
+            .copied()
+            .filter(|&d| {
+                let g = (d, Inst::Generic);
+                !fe.fun_defs.iter().any(|f| f.key == g)
+                    && (fe.fun_defs.iter().any(|f| f.calls.0.contains(&g)) || !fe.fun_defs.iter().any(|f| f.key.0 == d))
+            })
+            .collect();
+        let unused_defaults: Vec<DefId> =
+            default_methods.iter().copied().filter(|&d| !fe.fun_defs.iter().any(|f| f.key.0 == d)).collect();
+        if needed.is_empty() && unused_defaults.is_empty() {
+            break;
+        }
+        for d in needed.into_iter().chain(unused_defaults) {
+            translate_item(&mut fe, (d, Inst::Generic));
+        }
+    }
+    for &d in &bodies {
+        if fe.has_const_params(d) && !fe.fun_defs.iter().any(|f| f.key.0 == d) {
+            fe.item_placeholder("function with const generic parameters (not called at constant arguments)", tcx.def_span(d));
+        }
     }
     // a default method without copies or instances (not a dictionary field, and not called at a
     // concrete type) is translated once, generically: in `Self` and the trait's parameters, with
@@ -343,7 +380,8 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             }
         }
     }
-    // ADTs containing `&mut` references, directly or through other local ADTs
+    // ADTs containing `&mut` references, directly or through other local ADTs, or through the
+    // standard types whose models hold references (see `Frontend::ty`)
     loop {
         let mut changed = false;
         for &d in &adts {
@@ -352,7 +390,7 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             }
             let needs = field_subtypes(d).any(|t| match t.kind() {
                 ty::Ref(_, _, m) => m.is_mut(),
-                ty::Adt(a, _) => fe.ref_adts.contains(&a.did()),
+                ty::Adt(a, _) => fe.ref_adts.contains(&a.did()) || matches!(fe.std_adt(a.did()), Some("SliceIterMut" | "HashMapEntry")),
                 _ => false,
             });
             if needs {
@@ -373,7 +411,9 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
 /// The calls of a body that only an instance can translate (`dependent`): of trait methods that are
 /// not dictionary fields (see `Frontend::dict_methods`: e.g. with generic parameters of their own)
 /// at arguments with the body's generic parameters; and the calls of local functions at such
-/// arguments (`callees`).
+/// arguments (`callees`). In a crate with destructors, also a binding or an expression whose type
+/// has generic parameters: only an instance knows whether dropping it runs a destructor (see
+/// `BodyTr::needs_glue`).
 struct GenericCalls<'a, 'tcx> {
     fe: &'a Frontend<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -386,6 +426,26 @@ impl<'a, 'tcx> GenericCalls<'a, 'tcx> {
     fn call(&mut self, did: DefId, args: ty::GenericArgsRef<'tcx>) {
         if !args.has_param() {
             return;
+        }
+        // a method of `HashMap` or of its `Entry`, `<[T]>::sort`, `Vec::dedup`: their models need
+        // the equality or order of the key or element type to be structural or known, which only
+        // an instance shows (see `BodyTr::std_call`)
+        let parent = self.tcx.parent(did);
+        if matches!(self.tcx.def_kind(parent), DefKind::Impl { of_trait: false }) && self.fe.is_std(did) {
+            let name = self.tcx.item_name(did);
+            let needs_instance = match self.tcx.type_of(parent).instantiate_identity().skip_normalization().kind() {
+                ty::Adt(d, _) => match self.fe.std_adt(d.did()) {
+                    Some("HashMap" | "HashMapEntry") => true,
+                    Some("Vec") => name.as_str() == "dedup",
+                    _ => false,
+                },
+                ty::Slice(_) => name.as_str() == "sort",
+                _ => false,
+            };
+            if needs_instance {
+                self.dependent = true;
+                return;
+            }
         }
         if let Some(tr) = self.tcx.trait_of_assoc(did) {
             // a call of a value of a type parameter bounded by an `Fn` trait is a call of a function
@@ -406,7 +466,18 @@ impl<'a, 'tcx> Visitor<'tcx> for GenericCalls<'a, 'tcx> {
         self.tcx
     }
 
+    fn visit_pat(&mut self, p: &'tcx hir::Pat<'tcx>) {
+        if self.fe.has_drop_impls && matches!(p.kind, hir::PatKind::Binding(..)) && self.typeck.pat_ty(p).has_param() {
+            self.dependent = true;
+        }
+        intravisit::walk_pat(self, p);
+    }
+
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
+        // a value of a type with parameters (a temporary dropped at once, an argument, ...)
+        if self.fe.has_drop_impls && self.typeck.node_type_opt(e.hir_id).is_some_and(|t| t.has_param()) {
+            self.dependent = true;
+        }
         if let Some(did) = self.typeck.type_dependent_def_id(e.hir_id) {
             self.call(did, self.typeck.node_args(e.hir_id));
         }
@@ -438,7 +509,7 @@ fn mono_fns<'tcx>(fe: &Frontend<'tcx>, bodies: &[DefId], default_methods: &[DefI
         let ld = did.expect_local();
         let mut v = GenericCalls { fe, tcx, typeck: tcx.typeck(ld), dependent: false, callees: vec![] };
         v.visit_body(tcx.hir_body_owned_by(ld));
-        if v.dependent {
+        if v.dependent || fe.has_const_params(did) {
             mono.insert(did);
         }
         callees.push((did, v.callees));
@@ -588,7 +659,8 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         fn_placeholder(fe, &mut fd, "C-variadic function");
         return fd;
     }
-    if tcx.generics_of(did).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. })) {
+    // an instance has values for the const generic parameters (see `BodyTr::path_value`)
+    if !matches!(key.1, Inst::Mono(_)) && fe.has_const_params(did) {
         fn_placeholder(fe, &mut fd, "const generic parameter");
         return fd;
     }
@@ -1640,8 +1712,14 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
             writeln!(te, "(* {} *)\ndatatype ({}) {} = Opaque_{} {}\n", cmt(&t.comment), args, n, n, vs.join(" ")).unwrap();
         }
     }
+    te.push_str("end\n");
     // the external ADTs declared with their constructors (see `ExtType::ctors`), each after the
-    // ones its fields use; types using each other are one datatype declaration
+    // ones its fields use; types using each other are one datatype declaration. They are complete
+    // translations, not templates: their own theory.
+    let mut tx = header(&format!("{}_TypesExternal", c));
+    writeln!(tx, "  imports {}_TypesExternal_Template\nbegin\n", c).unwrap();
+    tx.push_str(GROUND);
+    tx.push_str("text \\<open>External types declared with their constructors (all their fields have models).\\<close>\n\n");
     let mut left: Vec<&String> = fe.ext_types.iter().filter(|(_, t)| !t.ctors.is_empty()).map(|(n, _)| n).collect();
     let mut mks = String::new();
     while !left.is_empty() {
@@ -1652,8 +1730,8 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
         if let [n] = group[..] && let Some((width, vals)) = &fe.ext_types[n].word {
             let t = &fe.ext_types[n];
             let ctors: Vec<String> = t.ctors.iter().map(|(c, _)| c.clone()).collect();
-            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
-            te.push_str(&word_enum_decl(n, *width, &ctors, vals));
+            writeln!(tx, "(* {} *)", cmt(&t.comment)).unwrap();
+            tx.push_str(&word_enum_decl(n, *width, &ctors, vals));
             left.retain(|m| *m != n);
             continue;
         }
@@ -1669,9 +1747,9 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
                 .iter()
                 .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
                 .collect();
-            writeln!(te, "(* {} *)", cmt(&t.comment)).unwrap();
+            writeln!(tx, "(* {} *)", cmt(&t.comment)).unwrap();
             if plain {
-                te.push_str(&enum_decl(&head, &ctors));
+                tx.push_str(&enum_decl(&head, &ctors));
             } else {
                 decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
             }
@@ -1682,15 +1760,15 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
             }
         }
         if !plain {
-            writeln!(te, "datatype {}\n", decls.join("\nand ")).unwrap();
+            writeln!(tx, "datatype {}\n", decls.join("\nand ")).unwrap();
         }
         left.retain(|n| !group.contains(n));
     }
-    te.push_str(&mks);
-    te.push_str("end\n");
+    tx.push_str(&mks);
+    tx.push_str("end\n");
 
     let mut ty = header(&format!("{}_Types", c));
-    writeln!(ty, "  imports {}_TypesExternal_Template\nbegin\n", c).unwrap();
+    writeln!(ty, "  imports {}_TypesExternal\nbegin\n", c).unwrap();
     ty.push_str(GROUND);
     ty.push_str(&types_text);
     ty.push_str("end\n");
@@ -1754,6 +1832,7 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
 
     let files = [
         (format!("{}_TypesExternal_Template.thy", c), te),
+        (format!("{}_TypesExternal.thy", c), tx),
         (format!("{}_Types.thy", c), ty),
         (format!("{}_Locale.thy", c), lo),
         (format!("{}_FunsExternal_Template.thy", c), fx),
