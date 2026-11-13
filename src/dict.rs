@@ -758,7 +758,6 @@ impl<'tcx> Frontend<'tcx> {
             for b in self.own_dict_bounds(m) {
                 t.push_str(&format!("{} \\<Rightarrow> ", paren_ty(&self.dict_type(b, menv))));
             }
-            self.proj_env = None;
             t.push_str(&self.fun_type(&ps, &ret));
             fields.push((f, t));
         }

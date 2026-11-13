@@ -975,9 +975,11 @@ impl<'tcx> Frontend<'tcx> {
 
     /// Visit the aliases and the ADTs (other than the standard ones whose models keep only some of
     /// their type arguments, see `hol_kept_args`) among the parts of `t` that `ty` translates, in
-    /// order: not the parts of aliases, of the types it renders as placeholders (raw and function
-    /// pointers, trait objects), nor the type arguments that a standard ADT's model drops.
+    /// order: not the parts of aliases, nor the type arguments that a standard ADT's model drops;
+    /// of a closure or function item its signature (its HOL type, see `ty`); and none of the types
+    /// it renders as placeholders (raw and function pointers, trait objects, coroutines, ...).
     fn visit_hol_parts(&self, t: Ty<'tcx>, visit: &mut impl FnMut(Ty<'tcx>)) {
+        let tcx = self.tcx;
         let mut w = t.walk();
         while let Some(g) = w.next() {
             let ty::GenericArgKind::Type(x) = g.kind() else { continue };
@@ -986,7 +988,6 @@ impl<'tcx> Frontend<'tcx> {
                     w.skip_current_subtree();
                     visit(x);
                 }
-                ty::RawPtr(..) | ty::FnPtr(..) | ty::Dynamic(..) => w.skip_current_subtree(),
                 ty::Adt(def, args) => match self.hol_kept_args(def.did()) {
                     Some(k) => {
                         w.skip_current_subtree();
@@ -996,7 +997,21 @@ impl<'tcx> Frontend<'tcx> {
                     }
                     None => visit(x),
                 },
-                _ => {}
+                ty::Closure(_, args) => {
+                    w.skip_current_subtree();
+                    for a in tcx.instantiate_bound_regions_with_erased(args.as_closure().sig()).inputs_and_output {
+                        self.visit_hol_parts(a, visit);
+                    }
+                }
+                ty::FnDef(..) => {
+                    w.skip_current_subtree();
+                    for a in tcx.instantiate_bound_regions_with_erased(x.fn_sig(tcx)).inputs_and_output {
+                        self.visit_hol_parts(a, visit);
+                    }
+                }
+                ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Str | ty::Ref(..) | ty::Slice(_) | ty::Array(..) | ty::Tuple(_)
+                | ty::Never | ty::Param(_) => {}
+                _ => w.skip_current_subtree(),
             }
         }
     }
@@ -1034,9 +1049,9 @@ impl<'tcx> Frontend<'tcx> {
     /// reachable from `root` through fields take as extra type parameters: those in an ADT's fields
     /// (see `ext_proj_fields`, `projections_except`), where the ADTs of its strongly connected
     /// component (itself and those it is mutually recursive with through fields) add none. The
-    /// members of a component are one datatype declaration (see `translate::write_all`), which
-    /// shares the type parameters: with the same numbers of type parameters, they share their
-    /// projections (see `shared_projections`). The components are computed after those they use,
+    /// members of a component with constructors are one datatype declaration (see
+    /// `translate::write_all`), whose members have the same type parameters: the members with the
+    /// same numbers of type parameters share their projections (see `shared_projections`). The components are computed after those they use,
     /// each ADT's once, as a function of its definition.
     fn ext_adt_projs(&self, root: DefId) {
         // the external ADTs whose projections are not known yet, with their fields and the
@@ -1064,11 +1079,20 @@ impl<'tcx> Frontend<'tcx> {
             graph.insert(d, (fields, uses));
         }
         for comp in crate::translate::sccs(&nodes, &|d| graph[&d].1.clone()) {
-            let own: Vec<Vec<Ty<'tcx>>> = comp.iter().map(|&d| self.projections_except(d, &graph[&d].0, &comp)).collect();
+            // by numbers of type parameters (a datatype declaration's members have the same)
             let arity = |d: DefId| self.tcx.generics_of(d).own_counts().types;
-            let ps = if comp.iter().all(|&d| arity(d) == arity(comp[0])) { self.shared_projections(&comp, &own) } else { own };
-            for (d, p) in comp.into_iter().zip(ps) {
-                self.ext_adt_projs_memo.borrow_mut().insert(d, p);
+            let mut classes: Vec<Vec<DefId>> = vec![];
+            for &d in &comp {
+                match classes.iter_mut().find(|c| arity(c[0]) == arity(d)) {
+                    Some(c) => c.push(d),
+                    None => classes.push(vec![d]),
+                }
+            }
+            for class in classes {
+                let own: Vec<Vec<Ty<'tcx>>> = class.iter().map(|&d| self.projections_except(d, &graph[&d].0, &comp)).collect();
+                for (&d, p) in class.iter().zip(self.shared_projections(&class, &own)) {
+                    self.ext_adt_projs_memo.borrow_mut().insert(d, p);
+                }
             }
         }
     }

@@ -312,6 +312,9 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     // groups come after the ADTs they use. (After the decisions above which ADTs are abstract,
     // whose datatypes take no projections, see `Frontend::adt_proj_params`.)
     for comp in &adt_sccs {
+        if comp.iter().any(|d| fe.opaque_adts.contains_key(d)) {
+            continue;
+        }
         if comp.len() == 1 {
             let ps = fe.projections(comp[0], &fields[&comp[0]]);
             if !ps.is_empty() {
@@ -319,12 +322,9 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             }
             continue;
         }
-        // (members with other numbers of type parameters make the group a placeholder, see above;
-        // const parameters are not shared by position)
-        let shareable = comp.iter().all(|&d| {
-            own_types(d).len() == own_types(comp[0]).len()
-                && tcx.generics_of(d).own_params.iter().all(|p| !matches!(p.kind, ty::GenericParamDefKind::Const { .. }))
-        });
+        // (members with other numbers of type parameters made the group abstract above; const
+        // parameters are not shared by position)
+        let shareable = comp.iter().all(|&d| tcx.generics_of(d).own_params.iter().all(|p| !matches!(p.kind, ty::GenericParamDefKind::Const { .. })));
         if !shareable {
             if comp.iter().any(|&d| !fe.projections(d, &fields[&d]).is_empty()) {
                 opaque(
