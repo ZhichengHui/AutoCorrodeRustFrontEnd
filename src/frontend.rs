@@ -1056,10 +1056,10 @@ impl<'tcx> Frontend<'tcx> {
     /// members of a component with constructors are one datatype declaration (see
     /// `translate::write_all`), whose members have the same type parameters: the members with the
     /// same numbers of type parameters share their projections (see `shared_projections`). A
-    /// member whose fields use another member at other type arguments (non-uniform recursion) or
-    /// a member with other numbers of type parameters thus has projections in its fields that are
-    /// not its own: they are placeholder types (see `ty`), so its fields are not all modelled and
-    /// it is declared abstractly (see `ext_datatype`). The components are computed after those they use,
+    /// projection in a member's fields that is not among its own (one of a member with other
+    /// numbers of type parameters, or one at other type arguments that does not normalise) is a
+    /// placeholder type (see `ty`), so the member's fields are not all modelled and it is declared
+    /// abstractly (see `ext_datatype`). The components are computed after those they use,
     /// each ADT's once, as a function of its definition.
     fn ext_adt_projs(&self, root: DefId) {
         // the external ADTs whose projections are not known yet, with their fields and the
