@@ -1,6 +1,7 @@
 // Dictionary fields whose types have associated types of the trait's other type parameters, as
 // type parameters of a datatype: `Graph<L, N>` takes `L::Op` and `N::Data`, which the methods of
-// `Analysis<L>` and `Searcher<L, N>` (bounded in their `where` clauses) take.
+// `Analysis<L>` and `Searcher<L, N>` (bounded in their `where` clauses) take; and a supertrait
+// whose argument is such an associated type (`OpHolder<L>: Holder<L::Op>`).
 pub trait Language {
     type Op;
     fn op(&self) -> Self::Op;
@@ -43,3 +44,13 @@ impl Searcher<Sym, Count> for Len {
     fn search(&self, g: &Graph<Sym, Count>) -> usize { g.nodes.len() + g.data.len() }
 }
 pub fn concrete(g: &Graph<Sym, Count>) -> usize { search_all(&Len, g) + make_first(g).map_or(0, |d| d as usize) }
+pub trait Holder<G> {
+    fn get(&self) -> G;
+}
+pub trait OpHolder<L: Language>: Holder<L::Op> {}
+pub fn get_op<L: Language, H: OpHolder<L>>(h: &H) -> L::Op { h.get() }
+impl Holder<u8> for Len {
+    fn get(&self) -> u8 { 7 }
+}
+impl OpHolder<Sym> for Len {}
+pub fn concrete_op() -> u8 { get_op::<Sym, Len>(&Len) }

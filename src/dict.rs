@@ -193,6 +193,9 @@ impl<'tcx> Frontend<'tcx> {
     /// ADTs in them take as type parameters (see `projections`; normalised in `m`'s typing
     /// environment, as `dict_decl` translates them).
     fn field_projections(&self, m: DefId) -> Vec<Ty<'tcx>> {
+        if let Some(ps) = self.field_projections_memo.borrow().get(&m) {
+            return ps.clone();
+        }
         let tcx = self.tcx;
         let env = ty::TypingEnv::post_analysis(tcx, m);
         let mut tys = self.sig_types(m);
@@ -200,7 +203,14 @@ impl<'tcx> Frontend<'tcx> {
             tys.extend(b.args.types());
             tys.extend(self.dict_slots(b).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
         }
-        self.projections(m, &tys)
+        let ps = self.assoc_projections(m, &tys);
+        self.field_projections_memo.borrow_mut().insert(m, ps.clone());
+        ps
+    }
+
+    /// The associated-type projections among `projections(did, tys)`.
+    fn assoc_projections(&self, did: DefId, tys: &[Ty<'tcx>]) -> Vec<Ty<'tcx>> {
+        self.projections(did, tys)
             .into_iter()
             .filter(|p| matches!(p.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Projection { .. })))
             .collect()
@@ -213,7 +223,11 @@ impl<'tcx> Frontend<'tcx> {
     /// these and the trait's other slots (see `trait_slots`), in order of occurrence: exactly the
     /// projections other than those slots in the fields' types. A projection in a field's type may
     /// be written or be one that the datatype of an ADT in it takes as a type parameter
-    /// (`&mut EGraph<L, Self>`, whose datatype takes `<L as Language>::Discriminant`).
+    /// (`&mut EGraph<L, Self>`, whose datatype takes `<L as Language>::Discriminant`). Then those
+    /// such projections in the dictionary types of the supertraits and associated type bounds
+    /// (see `dict_parents`; their arguments and slots, normalised in the trait's typing
+    /// environment, as `dict_decl` translates them), which are fields in any case: a projection
+    /// there that is not a slot is a placeholder type.
     fn param_slots(&self, tr: DefId) -> Vec<Ty<'tcx>> {
         if let Some(ps) = self.param_slots_memo.borrow().get(&tr) {
             return ps.clone();
@@ -231,17 +245,27 @@ impl<'tcx> Frontend<'tcx> {
             .map(|s| self.proj_key(s).expect("slots are projections"))
             .collect();
         let bounds = self.bound_keys(tr);
+        let new = |ps: Vec<Ty<'tcx>>| -> Vec<Ty<'tcx>> { ps.into_iter().filter(|&p| !self.proj_key(p).is_some_and(|k| base.contains(&k))).collect() };
         let mut out: Vec<Ty<'tcx>> = vec![];
-        for m in self.field_candidates(tr) {
-            let new: Vec<Ty<'tcx>> =
-                self.field_projections(m).into_iter().filter(|&p| !self.proj_key(p).is_some_and(|k| base.contains(&k))).collect();
-            if new.iter().all(|&p| self.on_trait_param(&bounds, p)) {
-                for p in new {
-                    if !out.iter().any(|&q| self.proj_key(q) == self.proj_key(p)) {
-                        out.push(p);
-                    }
+        let add = |ps: Vec<Ty<'tcx>>, out: &mut Vec<Ty<'tcx>>| {
+            for p in ps {
+                if !out.iter().any(|&q| self.proj_key(q) == self.proj_key(p)) {
+                    out.push(p);
                 }
             }
+        };
+        for m in self.field_candidates(tr) {
+            let ps = new(self.field_projections(m));
+            if ps.iter().all(|&p| self.on_trait_param(&bounds, p)) {
+                add(ps, &mut out);
+            }
+        }
+        let env = ty::TypingEnv::post_analysis(tcx, tr);
+        for p in self.dict_parents(tr) {
+            let mut tys: Vec<Ty<'tcx>> = p.args.types().collect();
+            tys.extend(self.dict_slots(p).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
+            let ps = new(self.assoc_projections(tr, &tys)).into_iter().filter(|&q| self.on_trait_param(&bounds, q)).collect();
+            add(ps, &mut out);
         }
         out
     }
@@ -265,9 +289,10 @@ impl<'tcx> Frontend<'tcx> {
 
     /// Is the projection `p` (in the parameters of a trait whose bounds are `bounds`, see
     /// `bound_keys`) an associated type of a type parameter of the trait other than `Self` (index
-    /// 0), or of such a projection (e.g. `<L::A as B>::C`), each named by one of `bounds` (not by a
-    /// method's own bound), so that wherever a trait reference of the trait holds, its projection
-    /// is well-formed?
+    /// 0), or of such a projection (e.g. `<L::A as B>::C` with the bound `L::A: B`), each named by
+    /// one of `bounds` (not by a method's own bound, nor by the bounds of an associated type's
+    /// declaration, which `bounds` does not have), so that wherever a trait reference of the trait
+    /// holds, its projection is well-formed?
     fn on_trait_param(&self, bounds: &[ty::TraitRef<'tcx>], p: Ty<'tcx>) -> bool {
         let tcx = self.tcx;
         let mut t = p;
@@ -737,6 +762,8 @@ impl<'tcx> Frontend<'tcx> {
             fields.push((f, t));
         }
         let env = ty::TypingEnv::post_analysis(tcx, tr);
+        // (the projections that the datatypes of ADTs take, normalised as `param_slots` finds them)
+        self.proj_env = Some(env);
         for (k, p) in self.dict_parents(tr).into_iter().enumerate() {
             let f = self.dict_parent_field(tr, k);
             let t = self.dict_type(p, env);

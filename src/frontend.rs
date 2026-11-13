@@ -58,6 +58,15 @@ pub struct GenCall<'tcx> {
     pub args: Option<Vec<String>>,
 }
 
+/// The state of `Frontend::ext_adt_sccs`: the visited external ADTs by visiting order, the stack of
+/// those whose components are open, and their field types.
+#[derive(Default)]
+struct ExtSccs<'tcx> {
+    index: HashMap<DefId, usize>,
+    stack: Vec<DefId>,
+    fields: HashMap<DefId, Vec<Ty<'tcx>>>,
+}
+
 /// A placeholder or external type, declared in the types template.
 #[derive(Clone)]
 pub struct ExtType {
@@ -184,7 +193,7 @@ pub struct Frontend<'tcx> {
     /// (see `collect_adts`; for all ADTs see `adt_proj_params`).
     pub adt_projs: HashMap<DefId, Vec<Ty<'tcx>>>,
     /// The projections that the datatype of each external ADT takes as extra type parameters (see
-    /// `ext_adt_projs`).
+    /// `ext_adt_sccs`).
     ext_adt_projs_memo: std::cell::RefCell<HashMap<DefId, Vec<Ty<'tcx>>>>,
     /// While a datatype is declared: its projections' type variables (see `adt_projs`).
     pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
@@ -197,6 +206,8 @@ pub struct Frontend<'tcx> {
     /// The slots of each trait's dictionaries that are associated types of its other type
     /// parameters (see `param_slots`).
     pub param_slots_memo: std::cell::RefCell<HashMap<DefId, Vec<Ty<'tcx>>>>,
+    /// The projections in the dictionary field type of each trait method (see `field_projections`).
+    pub field_projections_memo: std::cell::RefCell<HashMap<DefId, Vec<Ty<'tcx>>>>,
     /// The own bounds of each trait method that are dictionary parameters (see `own_dict_bounds`).
     pub own_dict_bounds_memo: std::cell::RefCell<HashMap<DefId, Vec<ty::TraitRef<'tcx>>>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
@@ -420,6 +431,7 @@ impl<'tcx> Frontend<'tcx> {
             proj_env: None,
             dict_methods_memo: Default::default(),
             param_slots_memo: Default::default(),
+            field_projections_memo: Default::default(),
             own_dict_bounds_memo: Default::default(),
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
@@ -938,32 +950,15 @@ impl<'tcx> Frontend<'tcx> {
     /// The associated types of type parameters in the types `tys` (normalised in `did`'s typing
     /// environment), in order of occurrence: those written, and those the datatypes of ADTs in them
     /// take as extra type parameters (see `adt_proj_params`). Only the parts of `tys` that `ty`
-    /// translates count: not those inside types it renders as placeholders (raw and function
-    /// pointers, trait objects) or that the model of a standard ADT drops (see `hol_kept_args`).
+    /// translates count (see `visit_hol_parts`).
     pub fn projections(&self, did: DefId, tys: &[Ty<'tcx>]) -> Vec<Ty<'tcx>> {
-        self.projections_in(did, tys, &mut vec![]).0
+        self.projections_except(did, tys, &[])
     }
 
-    /// `projections`, while the projections of the external ADTs `stack` are computed (see
-    /// `ext_adt_projs`); also the lowest position in `stack` that the result depends on.
-    fn projections_in(&self, did: DefId, tys: &[Ty<'tcx>], stack: &mut Vec<DefId>) -> (Vec<Ty<'tcx>>, usize) {
+    /// `projections`, where the ADTs `except` add none.
+    fn projections_except(&self, did: DefId, tys: &[Ty<'tcx>], except: &[DefId]) -> Vec<Ty<'tcx>> {
         let env = ty::TypingEnv::post_analysis(self.tcx, did);
         let mut out: Vec<Ty<'tcx>> = vec![];
-        let mut dep = usize::MAX;
-        for &t in tys {
-            self.collect_projections(env, self.tcx.erase_and_anonymize_regions(t), stack, &mut out, &mut dep);
-        }
-        (out, dep)
-    }
-
-    fn collect_projections(
-        &self,
-        env: ty::TypingEnv<'tcx>,
-        t: Ty<'tcx>,
-        stack: &mut Vec<DefId>,
-        out: &mut Vec<Ty<'tcx>>,
-        dep: &mut usize,
-    ) {
         let add = |p: Ty<'tcx>, out: &mut Vec<Ty<'tcx>>| {
             if let ty::Alias(_, a) = p.kind()
                 && p.has_param()
@@ -972,31 +967,43 @@ impl<'tcx> Frontend<'tcx> {
                 out.push(p);
             }
         };
+        for &t in tys {
+            self.visit_hol_parts(self.tcx.erase_and_anonymize_regions(t), &mut |x| match x.kind() {
+                ty::Alias(..) => add(x, &mut out),
+                ty::Adt(def, args) if !except.contains(&def.did()) => {
+                    for p in self.adt_proj_params(def.did()) {
+                        let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
+                        add(normalize(self.tcx, env, at), &mut out);
+                    }
+                }
+                _ => {}
+            });
+        }
+        out
+    }
+
+    /// Visit the aliases and the ADTs (other than the standard ones whose models keep only some of
+    /// their type arguments, see `hol_kept_args`) among the parts of `t` that `ty` translates, in
+    /// order: not the parts of aliases, of the types it renders as placeholders (raw and function
+    /// pointers, trait objects), nor the type arguments that a standard ADT's model drops.
+    fn visit_hol_parts(&self, t: Ty<'tcx>, visit: &mut impl FnMut(Ty<'tcx>)) {
         let mut w = t.walk();
         while let Some(g) = w.next() {
             let ty::GenericArgKind::Type(x) = g.kind() else { continue };
             match x.kind() {
                 ty::Alias(..) => {
                     w.skip_current_subtree();
-                    add(x, out);
+                    visit(x);
                 }
-                // placeholder types (see `ty`)
                 ty::RawPtr(..) | ty::FnPtr(..) | ty::Dynamic(..) => w.skip_current_subtree(),
                 ty::Adt(def, args) => match self.hol_kept_args(def.did()) {
                     Some(k) => {
                         w.skip_current_subtree();
                         for a in args.types().take(k) {
-                            self.collect_projections(env, a, stack, out, dep);
+                            self.visit_hol_parts(a, visit);
                         }
                     }
-                    None => {
-                        let (ps, d) = self.adt_proj_params_in(def.did(), stack);
-                        *dep = (*dep).min(d);
-                        for p in ps {
-                            let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
-                            add(normalize(self.tcx, env, at), out);
-                        }
-                    }
+                    None => visit(x),
                 },
                 _ => {}
             }
@@ -1005,49 +1012,75 @@ impl<'tcx> Frontend<'tcx> {
 
     /// The associated-type projections (in its own parameters) that the HOL type of the ADT `did`
     /// takes as extra type parameters after its type arguments (see `ty`): for a local ADT those
-    /// of `adt_projs` (none if it is declared abstractly, see `opaque_adts`), for an external one
-    /// see `ext_adt_projs`. It is a function of the ADT's definition: it does not depend on which
-    /// types have been translated.
+    /// of `adt_projs`, fixed by `collect_adts` before any type is translated (none if it is
+    /// declared abstractly, see `opaque_adts`); for an external one see `ext_adt_sccs`. It does
+    /// not depend on which types have been translated.
     pub fn adt_proj_params(&self, did: DefId) -> Vec<Ty<'tcx>> {
-        self.adt_proj_params_in(did, &mut vec![]).0
-    }
-
-    fn adt_proj_params_in(&self, did: DefId, stack: &mut Vec<DefId>) -> (Vec<Ty<'tcx>>, usize) {
         if did.is_local() {
-            let ps = if self.opaque_adts.contains_key(&did) { vec![] } else { self.adt_projs.get(&did).cloned().unwrap_or_default() };
-            return (ps, usize::MAX);
+            if self.opaque_adts.contains_key(&did) {
+                return vec![];
+            }
+            return self.adt_projs.get(&did).cloned().unwrap_or_default();
         }
-        self.ext_adt_projs(did, stack)
+        if let Some(ps) = self.ext_adt_projs_memo.borrow().get(&did) {
+            return ps.clone();
+        }
+        self.ext_adt_sccs(did, &mut ExtSccs::default());
+        self.ext_adt_projs_memo.borrow()[&did].clone()
     }
 
-    /// The projections that the datatype of the external ADT `did` takes as extra type parameters:
-    /// for one that may be declared with its constructors (see `ext_datatype_fields`), the
-    /// projections in its fields (see `projections`), else none. An ADT among its own fields
-    /// (directly or through the ADTs being computed, `stack`) adds none there. Also returns the
-    /// lowest position in `stack` that the result depends on (`usize::MAX`: none): a result that
-    /// depends on an ADT whose computation started earlier depends on where it started, and is
-    /// not kept.
-    fn ext_adt_projs(&self, did: DefId, stack: &mut Vec<DefId>) -> (Vec<Ty<'tcx>>, usize) {
-        if let Some(ps) = self.ext_adt_projs_memo.borrow().get(&did) {
-            return (ps.clone(), usize::MAX);
-        }
-        if let Some(k) = stack.iter().position(|&d| d == did) {
-            return (vec![], k);
-        }
+    /// The field types of the external ADT `did` that decide its projections (see
+    /// `ext_adt_sccs`): all of them if it may be declared with its constructors (see
+    /// `ext_datatype_fields`; not a standard ADT with a model), else none.
+    fn ext_proj_fields(&self, did: DefId) -> Vec<Ty<'tcx>> {
         if self.std_adt(did).is_some() {
-            return (vec![], usize::MAX);
+            return vec![];
         }
-        let Some(ftys) = self.ext_datatype_fields(did) else { return (vec![], usize::MAX) };
-        let all: Vec<Ty<'tcx>> = ftys.into_iter().flatten().collect();
-        let k = stack.len();
-        stack.push(did);
-        let (ps, dep) = self.projections_in(did, &all, stack);
-        stack.pop();
-        if dep < k {
-            return (ps, dep);
+        self.ext_datatype_fields(did).map(|(_, _, ftys)| ftys.into_iter().flatten().collect()).unwrap_or_default()
+    }
+
+    /// The projections that the datatype of an external ADT takes as extra type parameters are
+    /// those in its fields (see `ext_proj_fields`, `projections_except`), where the ADTs of its own
+    /// strongly connected component (itself and those it is mutually recursive with through
+    /// fields) add none. Compute them (into `ext_adt_projs_memo`) for the external ADTs reachable
+    /// from `v` through fields, by components (Tarjan), each after those it uses: each ADT's once,
+    /// and as a function of its definition. Returns the lowest visiting index `v` reaches.
+    fn ext_adt_sccs(&self, v: DefId, st: &mut ExtSccs<'tcx>) -> usize {
+        let index = st.index.len();
+        st.index.insert(v, index);
+        st.stack.push(v);
+        let mut low = index;
+        let fields = self.ext_proj_fields(v);
+        let mut uses = vec![];
+        for &t in &fields {
+            self.visit_hol_parts(self.tcx.erase_and_anonymize_regions(t), &mut |x| {
+                if let ty::Adt(def, _) = x.kind()
+                    && !def.did().is_local()
+                {
+                    uses.push(def.did());
+                }
+            });
         }
-        self.ext_adt_projs_memo.borrow_mut().insert(did, ps.clone());
-        (ps, usize::MAX)
+        st.fields.insert(v, fields);
+        for w in uses {
+            if self.ext_adt_projs_memo.borrow().contains_key(&w) {
+                continue;
+            }
+            match st.index.get(&w) {
+                None => low = low.min(self.ext_adt_sccs(w, st)),
+                Some(&i) if st.stack.contains(&w) => low = low.min(i),
+                Some(_) => {}
+            }
+        }
+        if low == index {
+            let at = st.stack.iter().position(|&d| d == v).expect("on the stack");
+            let comp: Vec<DefId> = st.stack.split_off(at);
+            for &d in &comp {
+                let ps = self.projections_except(d, &st.fields[&d], &comp);
+                self.ext_adt_projs_memo.borrow_mut().insert(d, ps);
+            }
+        }
+        low
     }
 
     /// The HOL type of `str` and `String`: the list of the UTF-8 bytes, written as the HOL type of
@@ -1341,7 +1374,9 @@ impl<'tcx> Frontend<'tcx> {
     /// parameters, whose field types contain no `&mut` reference (a `&mut` reference in a field is a
     /// HOL type over the store's type variables `'addr`, `'gv`, which a datatype in the external
     /// types template does not have as parameters).
-    fn ext_datatype_fields(&self, did: DefId) -> Option<Vec<Vec<Ty<'tcx>>>> {
+    /// Also returns the ADT's own generic arguments and typing environment, in which the field
+    /// types are given.
+    fn ext_datatype_fields(&self, did: DefId) -> Option<(GenericArgsRef<'tcx>, ty::TypingEnv<'tcx>, Vec<Vec<Ty<'tcx>>>)> {
         let tcx = self.tcx;
         if !matches!(tcx.def_kind(did), DefKind::Enum | DefKind::Struct) { return None }
         let def = tcx.adt_def(did);
@@ -1357,7 +1392,7 @@ impl<'tcx> Frontend<'tcx> {
         if ftys.iter().flatten().any(|&t| has_mut_ref(t)) {
             return None;
         }
-        Some(ftys)
+        Some((own, env, ftys))
     }
 
     /// The datatype of the external ADT `did` (named `n`), if it may be declared with its
@@ -1366,13 +1401,14 @@ impl<'tcx> Frontend<'tcx> {
     /// Also tells whether a field mentions the ADT itself (see `mentions_adt`).
     fn ext_datatype(&mut self, did: DefId, n: &str) -> Option<(Vec<String>, Vec<(String, Vec<String>)>, Vec<String>, bool)> {
         let tcx = self.tcx;
-        let ftys = self.ext_datatype_fields(did)?;
+        let (own, env, ftys) = self.ext_datatype_fields(did)?;
         let def = tcx.adt_def(did);
-        let (own, env) = (ty::GenericArgs::identity_for_item(tcx, did), ty::TypingEnv::post_analysis(tcx, did));
         let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
         let projs = self.adt_proj_params(did);
         let proj_names: Vec<String> = (0..projs.len()).map(|k| format!("'proj{}", k)).collect();
-        let saved = (self.proj_tvars.take(), self.proj_env.replace(env));
+        // (the fields' projections are its own: also under `ext_fun`, whose `alias_tvars` would make
+        // other projections fresh type variables, which a datatype does not have)
+        let saved = (self.proj_tvars.take(), self.proj_env.replace(env), self.alias_tvars.take());
         self.proj_tvars = Some(
             projs
                 .iter()
@@ -1408,7 +1444,7 @@ impl<'tcx> Frontend<'tcx> {
             params.extend(proj_names.iter().cloned());
             (params, ctors, deps, mentions_adt(&all, did))
         });
-        (self.proj_tvars, self.proj_env) = saved;
+        (self.proj_tvars, self.proj_env, self.alias_tvars) = saved;
         result
     }
 
