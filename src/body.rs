@@ -333,6 +333,41 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
+    fn is_vec(&self, t: Ty<'tcx>) -> bool {
+        matches!(t.kind(), ty::Adt(def, _) if self.fe.std_adt(def.did()) == Some("Vec"))
+    }
+
+    /// The elements of a `Vec` (AutoCorrode's `rvec`, see `Frontend::ty`) as a list: the
+    /// `rvec_elems` of a value, the reference focused on them of a reference.
+    fn vec_elems(&self, pv: PV) -> PV {
+        match pv {
+            PV::Val(v) => PV::Val(Tr::new(format!("\\<llangle>rvec_elems\\<rrangle>\\<^sub>1({})", v.s), 999)),
+            PV::Ref(r) => PV::Ref(self.vec_elems_ref(&r)),
+        }
+    }
+
+    /// The reference to the elements of the `Vec` that the reference `r` refers to.
+    fn vec_elems_ref(&self, r: &Tr) -> Tr {
+        Tr::new(format!("\\<llangle>focus_reference rvec_elems_focus\\<rrangle>\\<^sub>1({})", r.s), 999)
+    }
+
+    /// The layout (size and alignment, AutoCorrode's `elem_layout`) of the element type `t` of a
+    /// `Vec`: rustc's; for a type with parameters, AutoCorrode's unspecified `rvec_layout_of`.
+    fn elem_layout(&mut self, t: Ty<'tcx>) -> Tr {
+        if t.has_param() {
+            return Tr::atom(format!("\\<llangle>rvec_layout_of TYPE({})\\<rrangle>", self.hty(t)));
+        }
+        let env = ty::TypingEnv::fully_monomorphized();
+        let l = self.tcx.layout_of(env.as_query_input(t)).expect("the element type of a `Vec` has a layout");
+        Tr::atom(format!("\\<llangle>make_elem_layout {} {}\\<rrangle>", l.size.bytes(), l.align.abi.bytes()))
+    }
+
+    /// The layout of the elements of the `Vec` type `t`.
+    fn vec_layout(&mut self, t: Ty<'tcx>) -> Tr {
+        let ty::Adt(_, args) = t.peel_refs().kind() else { panic!("not a `Vec`: {}", t) };
+        self.elem_layout(args.type_at(0))
+    }
+
     /// Bind the pattern variable `hid` to the uRust local `name`; a `mut` binding is a mutable
     /// local (a cell), which needs storage for its type: returns its allocator, if not the
     /// locale's (see `alloc`).
@@ -881,8 +916,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     PV::Val(self.never_as(v, &h))
                 }
                 Adjust::Deref(DerefAdjustKind::Builtin) => self.deref_pv(pv, cur)?,
+                // Vec<T> to [T]: the elements
+                Adjust::Deref(DerefAdjustKind::Overloaded(_)) if self.is_vec(cur.peel_refs()) && target.peel_refs().is_slice() => {
+                    self.vec_elems(pv)
+                }
                 Adjust::Deref(DerefAdjustKind::Overloaded(_)) => {
-                    // Box<T> ~ T, Vec<T> ~ [T] ~ list, String ~ str ~ byte list
+                    // Box<T> ~ T, String ~ str ~ byte list
                     let a = self.hty(cur.peel_refs());
                     let b = self.hty(target.peel_refs());
                     if a != b { return unsup(format!("overloaded dereference of `{}`", cur)) }
@@ -1029,6 +1068,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(bpv)
     }
 
+    /// The sequence `base` of `base[..]` as a list place: the elements of a `Vec`.
+    fn index_seq(&mut self, base: &'tcx hir::Expr<'tcx>) -> R<PV> {
+        let bpv = self.index_base(base)?;
+        Ok(if self.is_vec(self.ty_adj(base).peel_refs()) { self.vec_elems(bpv) } else { bpv })
+    }
+
     fn pv_unadj(&mut self, e: &'tcx hir::Expr<'tcx>) -> R<PV> {
         match e.kind {
             ExprKind::Path(ref qp) if let Res::Local(hid) = self.typeck.qpath_res(qp, e.hir_id) => {
@@ -1045,6 +1090,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             ExprKind::Unary(UnOp::Deref, inner) => {
                 if self.typeck.type_dependent_def_id(e.hir_id).is_some() {
+                    // `*v` of a `Vec`: the elements of the place (through the auto-borrow)
+                    if self.is_vec(self.ty_adj(inner).peel_refs()) && self.ty_of(e).is_slice() {
+                        let p = self.index_base(inner)?;
+                        return Ok(self.vec_elems(p));
+                    }
                     let a = self.hty(self.ty_adj(inner).peel_refs());
                     let b = self.hty(self.ty_of(e));
                     if a == b { return self.pv_adjusted(inner) }
@@ -1137,7 +1187,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     return Ok(if is_mut { PV::Ref(r) } else { PV::Val(r) });
                 }
                 let is_range = self.range_kind(self.ty_adj(idx).peel_refs()).is_some();
-                let bpv = self.index_base(base)?;
+                let bpv = self.index_seq(base)?;
                 if let PV::Ref(r) = &bpv
                     && let Some(p) = self.index_place(e, base, idx, r)?
                 {
@@ -2412,6 +2462,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let lam2 = |b: String| format!("\\<lambda>a b. FunctionBody \\<lbrakk> {} \\<rbrakk>", b);
         if tcx.is_lang_item(tr, LangItem::Clone) {
             return match name.as_str() {
+                "clone" if self.is_vec(r.self_ty()) => Some("rvec_clone".to_string()),
                 "clone" => Some("\\<lambda>x. FunctionBody (literal x)".to_string()),
                 "clone_from" => Some("\\<lambda>d s. FunctionBody \\<lbrakk> * d = s; \\<rbrakk>".to_string()),
                 _ => None,
@@ -2424,6 +2475,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let this = r.self_ty();
         let rhs = r.args.types().nth(1);
         let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same && self.vec_of_hol_eq(this) {
+            return match name.as_str() {
+                "eq" => Some("rvec_eq".into()),
+                "ne" => Some("rvec_ne".into()),
+                _ => None,
+            };
+        }
         if tcx.is_lang_item(tr, LangItem::PartialEq) && same && !self.holds_hashmap(this, &mut HashSet::new()) {
             return match name.as_str() {
                 "eq" => Some(lam2("a == b".into())),
@@ -2862,11 +2920,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("Result", "is_ok") => ResultIsOk,
             ("Result", "is_err") => ResultIsErr,
             ("Result", "unwrap_or") => ResultUnwrapOr,
-            ("Vec" | "slice", "len") => Len,
+            ("slice", "len") => Len,
             ("slice", "iter_mut") => SliceIterMut,
-            ("slice", "into_vec" | "to_vec") => ToVec,
-            ("Vec", "push") => VecPush,
-            ("Vec", "pop") => VecPop,
+            // a boxed slice keeps its length as the capacity; a copy gets a new allocation
+            ("slice", "into_vec") => VecFromList,
+            ("slice", "to_vec") => VecAlloc,
             ("slice", "swap") => SliceSwap,
             ("uint" | "int", "checked_add") => IntOp("checked_add"),
             ("uint" | "int", "checked_mul") => IntOp("checked_mul"),
@@ -2883,7 +2941,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("Option", "copied" | "cloned" | "as_ref") => Conversion,
             ("Result", "map") => Model("result_map"),
             ("Result", "map_err") => Model("result_map_err"),
-            ("Vec" | "slice", "is_empty") => Model("slice_is_empty"),
+            ("slice", "is_empty") => Model("slice_is_empty"),
             ("slice", "first") => Model("slice_first"),
             ("slice", "last") => Model("slice_last"),
             ("slice", "get") => SliceGet,
@@ -2895,14 +2953,25 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("slice", "copy_from_slice") => Model("slice_copy_from_slice"),
             ("slice", "fill") => Model("slice_fill"),
             ("slice", "reverse") => Model("slice_reverse"),
-            ("Vec", "truncate") => Model("vec_truncate"),
-            ("Vec", "clear") => Model("vec_clear"),
-            ("Vec", "resize") => Model("vec_resize"),
-            ("Vec", "extend_from_slice") => Model("vec_extend_from_slice"),
-            ("Vec", "into_boxed_slice") => Conversion,
-            // the capacity is not modelled
-            ("Vec", "shrink_to_fit") => Model("vec_shrink_to_fit"),
-            ("Vec", "swap_remove") => Model("vec_swap_remove"),
+            // the models of a `Vec` with its capacity (AutoCorrode's `StdLib_Vec`)
+            ("Vec", "len") => Model("rvec_len"),
+            ("Vec", "is_empty") => Model("rvec_is_empty"),
+            ("Vec", "capacity") => Model("rvec_capacity"),
+            ("Vec", "push") => Model("rvec_push"),
+            ("Vec", "pop") => Model("rvec_pop"),
+            ("Vec", "truncate") => Model("rvec_truncate"),
+            ("Vec", "clear") => Model("rvec_clear"),
+            ("Vec", "resize") => Model("rvec_resize"),
+            ("Vec", "extend_from_slice") => Model("rvec_extend_from_slice"),
+            ("Vec", "reserve") => Model("rvec_reserve"),
+            ("Vec", "reserve_exact") => Model("rvec_reserve_exact"),
+            ("Vec", "shrink_to_fit") => Model("rvec_shrink_to_fit"),
+            ("Vec", "shrink_to") => Model("rvec_shrink_to"),
+            ("Vec", "insert") => Model("rvec_insert"),
+            ("Vec", "remove") => Model("rvec_remove"),
+            ("Vec", "swap_remove") => Model("rvec_swap_remove"),
+            ("Vec", "as_mut_slice") => Model("rvec_as_mut_slice"),
+            ("Vec", "into_boxed_slice") => VecElems,
             ("Vec", "dedup") => VecDedup,
             ("slice", "sort") => SliceSort,
             // a hash map whose iteration order is not observed (see `STD_MODELS.md`)
@@ -2920,8 +2989,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             // `StdLib_Utf8`
             ("str" | "String", "len") => Len,
             ("str" | "String", "is_empty") => Model("slice_is_empty"),
-            ("String", "new" | "with_capacity") => VecNew,
-            ("String", "as_bytes" | "into_bytes" | "from_utf8_unchecked" | "into_boxed_str") => Conversion,
+            ("String", "new" | "with_capacity") => StringNew,
+            ("String", "as_bytes" | "into_boxed_str") => Conversion,
+            // a `Vec<u8>` of the bytes, and the string of the bytes of a `Vec<u8>`
+            ("String", "into_bytes") => VecAlloc,
+            ("String", "from_utf8_unchecked") => VecElems,
             ("String", "push_str") => Model("vec_extend_from_slice"),
             ("String", "push") => Model("string_push"),
             ("String", "pop") => Model("string_pop"),
@@ -2947,11 +3019,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("str" | "slice", "to_ascii_lowercase") => Model("bytes_to_ascii_lowercase"),
             ("str", "from_utf8") => Model("str_from_utf8"),
             ("str", "from_utf8_unchecked") => Conversion,
-            ("String", "from_utf8") => Model("string_from_utf8"),
+            ("String", "from_utf8") => StringFromUtf8,
             ("Utf8Error", "valid_up_to") => Model("utf8_error_valid_up_to_fn"),
             ("Utf8Error", "error_len") => Model("utf8_error_error_len_fn"),
             ("FromUtf8Error", "utf8_error") => Model("from_utf8_error_utf8_error"),
-            ("FromUtf8Error", "into_bytes" | "as_bytes") => Model("from_utf8_error_into_bytes"),
+            ("FromUtf8Error", "as_bytes") => Model("from_utf8_error_into_bytes"),
+            ("FromUtf8Error", "into_bytes") => FromUtf8ErrorIntoBytes,
             // only followed by `as_bytes` (see `encode_utf8_bytes`)
             ("char", "encode_utf8") => CharEncodeUtf8,
             ("str", "starts_with") => StrPattern("str_starts_with"),
@@ -3053,7 +3126,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         };
         use StdFn::*;
         let r = match f {
+            // a `Vec`'s clone is a new allocation (AutoCorrode's `rvec_clone`)
+            Clone if self.is_vec(self.ty_adj(arg_exprs[0]).peel_refs()) => Some(self.named_call("rvec_clone", vec![a(0)])),
             Clone => Some(a(0)),
+            // the elements of `Vec`s whose elements HOL's equality compares (not the capacities)
+            Eq | Ne if same_operands(self) && self.vec_of_hol_eq(self.ty_adj(arg_exprs[0]).peel_refs()) => {
+                Some(self.named_call(if matches!(f, Eq) { "rvec_eq" } else { "rvec_ne" }, vec![a(0), a(1)]))
+            }
             Eq if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut HashSet::new()) => {
                 Some(Self::mk_bin("==", 44, &a(0), &a(1)))
             }
@@ -3082,8 +3161,35 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ResultOk => Some(self.named_call("ok", vec![a(0)])),
             ResultUnwrapOr => Some(self.named_call("result_unwrap_or", vec![a(0), a(1)])),
             Len => Some(self.named_call("len", vec![a(0)])),
-            VecNew => Some(Tr::atom("[]")),
-            ToVec | BoxNew => Some(a(0)),
+            VecNew | VecWithCapacity => {
+                let t = self.ty_of(e);
+                let mut args = vec![self.vec_layout(t)];
+                let model = if matches!(f, VecNew) { "rvec_new" } else {
+                    args.push(a(0));
+                    "rvec_with_capacity"
+                };
+                let call = self.named_call(model, args);
+                let h = self.hty(t);
+                Some(self.typed("vec", call, &h))
+            }
+            StringNew => Some(Tr::atom("[]")),
+            VecFromList | VecAlloc | FromUtf8ErrorIntoBytes => {
+                let l = self.vec_layout(self.ty_of(e));
+                Some(match f {
+                    VecFromList => self.named_call("rvec_from_list", vec![l, a(0)]),
+                    VecAlloc => self.named_call("rvec_of_list_alloc", vec![l, a(0)]),
+                    _ => {
+                        let bytes = self.named_call("from_utf8_error_into_bytes", vec![a(0)]);
+                        self.named_call("rvec_of_list_alloc", vec![l, bytes])
+                    }
+                })
+            }
+            VecElems => Some(self.to_val(self.vec_elems(PV::Val(a(0))))),
+            StringFromUtf8 => {
+                let bytes = self.to_val(self.vec_elems(PV::Val(a(0))));
+                Some(self.named_call("string_from_utf8", vec![bytes]))
+            }
+            BoxNew => Some(a(0)),
             // the destructor, if any
             Drop => {
                 let t = self.ty_adj(arg_exprs[0]);
@@ -3092,6 +3198,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Some(Tr::block(format!("{{ let {} = {}; {} () }}", tmp, a(0).s, g.join("\n"))))
             }
             RangeInclusiveNew => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
+            // between a `Vec` and the list of its elements (`IntoIterator::into_iter`, `From`, ...):
+            // the elements; a new `Vec` of the elements of an array by value (`From<[T; N]>`, a
+            // boxed slice) or of a copy of a list (`From<&[T]>`, `to_owned`); `to_owned` of a `Vec`
+            // is its clone
+            Conversion if !arg_exprs.is_empty() && let Some(c) = self.vec_conversion(self.ty_adj(arg_exprs[0]), self.ty_of(e), target) => {
+                let x = a(0);
+                Some(match c {
+                    VecConversion::Elems => self.to_val(self.vec_elems(PV::Val(x))),
+                    VecConversion::FromList(l) => self.named_call("rvec_from_list", vec![l, x]),
+                    VecConversion::Alloc(l) => self.named_call("rvec_of_list_alloc", vec![l, x]),
+                    VecConversion::Clone => self.named_call("rvec_clone", vec![x]),
+                })
+            }
             Conversion | SliceIter | ToString if same_hol(self) => Some(a(0)),
             // the `Display` text of a value of a type with a model of `Display` (see `fmt_model`),
             // with the default options; a character's is its encoding
@@ -3183,9 +3302,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     // from `&[T]` (the value of a `&mut [T]` is a reference, not the list)
                     ty::Ref(_, s, m) if !m.is_mut() && s.is_slice() => Some("slice_try_into_array"),
                     // `TryFrom<Vec<T>>`, `TryFrom<Box<[T]>>` (by value): the error is the argument
-                    ty::Adt(d, a) if self.fe.std_adt(d.did()) == Some("Vec") || (d.is_box() && a.type_at(0).is_slice()) => {
-                        Some("vec_try_into_array")
-                    }
+                    ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("Vec") => Some("rvec_try_into_array"),
+                    ty::Adt(d, a) if d.is_box() && a.type_at(0).is_slice() => Some("vec_try_into_array"),
                     _ => None,
                 };
                 match (model, target.map(|t| *t.kind())) {
@@ -3262,7 +3380,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => None,
             },
             VecDedup => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
-                ty::Adt(_, va) if self.structural_eq_ty(va.type_at(0), &mut HashSet::new()) => Some(self.named_call("vec_dedup", vec![a(0)])),
+                ty::Adt(_, va) if self.structural_eq_ty(va.type_at(0), &mut HashSet::new()) => Some(self.named_call("rvec_dedup", vec![a(0)])),
                 _ => None,
             },
             PartialCmp => {
@@ -3272,10 +3390,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             DefaultFn if argv.is_empty() => self.default_value(self.ty_of(e), &mut vec![])?,
             // the models of AutoCorrode's `StdLib_Frontend_Models`
-            VecPush => Some(self.named_call("vec_push", vec![a(0), a(1)])),
-            VecPop => Some(self.named_call("vec_pop", vec![a(0)])),
             SliceSwap => Some(self.named_call("slice_swap", vec![a(0), a(1), a(2)])),
-            VecFromElem => Some(self.named_call("vec_from_elem", vec![a(0), a(1)])),
+            VecFromElem => {
+                let l = self.vec_layout(self.ty_of(e));
+                Some(self.named_call("rvec_from_elem", vec![l, a(0), a(1)]))
+            }
             // a method of `Formatter` (or of `fmt::Write` on a `Formatter`)
             FmtMethod(n) if self.is_formatter(self.ty_adj(arg_exprs[0])) => Some(self.named_call(n, argv.to_vec())),
             // a formatting trait's `fmt` on a primitive type
@@ -3289,7 +3408,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Whether `PartialEq` on `t` is structural (HOL's equality): on the primitive types, `str`,
-    /// `String`, and the tuples, arrays, slices, `Vec`s and `Option`s of such types, and on local
+    /// `String`, and the tuples, arrays, slices and `Option`s of such types, and on local
     /// ADTs whose `PartialEq` is derived, with such fields. `seen`: the ADTs checked or being
     /// checked, each once (otherwise exponential in mutually recursive ADTs sharing fields, see
     /// `glue_in`). One in `seen` counts as structural: every case is a conjunction of its parts,
@@ -3304,7 +3423,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Tuple(ts) => ts.iter().all(|x| self.structural_eq_ty(x, seen)),
             ty::Adt(d, args) => match self.fe.std_adt(d.did()) {
                 Some("String") => true,
-                Some("Vec" | "Option") => self.structural_eq_ty(args.type_at(0), seen),
+                // not `Vec`: HOL's equality also compares the capacities
+                Some("Option") => self.structural_eq_ty(args.type_at(0), seen),
                 Some(_) => false,
                 None if d.did().is_local() => {
                     if seen.contains(&t) { return true }
@@ -3402,8 +3522,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     self.typed("dflt", Tr::atom("None"), &h)
                 }
                 Some("Vec") => {
+                    let l = self.vec_layout(t);
+                    let call = self.named_call("rvec_new", vec![l]);
                     let h = self.hty(t);
-                    self.typed("dflt", Tr::atom("[]"), &h)
+                    self.typed("dflt", call, &h)
                 }
                 Some("String") => Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_str(""))),
                 None if d.is_struct() && d.did().is_local() && !seen.contains(&d.did()) => {
@@ -3476,7 +3598,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             },
             Collect => match res.kind() {
                 ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("Vec") => {
-                    step(self, recv).map(|s| self.named_call("iter_collect_list", vec![fuel, s, a(0)]))
+                    let l = self.vec_layout(res);
+                    step(self, recv).map(|s| {
+                        let xs = self.named_call("iter_collect_list", vec![fuel, s, a(0)]);
+                        self.named_call("rvec_of_list_alloc", vec![l, xs])
+                    })
                 }
                 _ => None,
             },
@@ -3507,14 +3633,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// Whether a value of type `t` holds a `HashMap` (also in the fields of local ADTs): its
-    /// model is a list in insertion order, so HOL's equality is not the map's. A search over the
-    /// types not in `seen`, each explored once (see `glue_in`).
+    /// Whether a value of type `t` holds a `HashMap` or a `Vec` (also in the fields of local
+    /// ADTs): the model of a map is a list in insertion order, that of a vector has its capacity,
+    /// so HOL's equality is not Rust's. A search over the types not in `seen`, each explored once
+    /// (see `glue_in`).
     fn holds_hashmap(&self, t: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> bool {
         if !seen.insert(t) { return false }
         t.walk().any(|g| match g.kind() {
             ty::GenericArgKind::Type(x) => match x.kind() {
-                ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("HashMap") => true,
+                ty::Adt(d, _) if matches!(self.fe.std_adt(d.did()), Some("HashMap" | "Vec")) => true,
                 ty::Adt(d, _) if d.did().is_local() && x != t => self.holds_hashmap(x, seen),
                 ty::Adt(d, args) if d.did().is_local() => {
                     d.all_fields().any(|f| self.holds_hashmap(f.ty(self.tcx, args).skip_normalization(), seen))
@@ -3523,6 +3650,36 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             },
             _ => false,
         })
+    }
+
+    /// A conversion by `f` from `src` to `dst` (see `StdFn::Conversion`) between a `Vec` and the
+    /// list of its elements, or `to_owned` of a `Vec`.
+    fn vec_conversion(&mut self, src: Ty<'tcx>, dst: Ty<'tcx>, f: DefId) -> Option<VecConversion> {
+        let (s, d) = (src.peel_refs(), dst.peel_refs());
+        let elems_of = |this: &mut Self, v: Ty<'tcx>, l: Ty<'tcx>| match v.kind() {
+            ty::Adt(_, args) => this.fe.ty(Ty::new_slice(this.tcx, args.type_at(0))) == this.fe.ty(l),
+            _ => false,
+        };
+        match (self.is_vec(s), self.is_vec(d)) {
+            (true, true) if self.tcx.is_diagnostic_item(Symbol::intern("to_owned_method"), f) => Some(VecConversion::Clone),
+            (true, false) if elems_of(self, s, d) => Some(VecConversion::Elems),
+            (false, true) if elems_of(self, d, s) => {
+                let l = self.vec_layout(d);
+                // an array by value (a `Box` of one is the same HOL value)
+                let by_value = matches!(src.kind(), ty::Array(..)) || matches!(src.kind(), ty::Adt(b, a) if b.is_box() && matches!(a.type_at(0).kind(), ty::Array(..) | ty::Slice(_)));
+                Some(if by_value { VecConversion::FromList(l) } else { VecConversion::Alloc(l) })
+            }
+            _ => None,
+        }
+    }
+
+    /// A `Vec` whose elements are compared by HOL's equality (they hold no `HashMap` or `Vec`):
+    /// its `PartialEq` is AutoCorrode's `rvec_eq`.
+    fn vec_of_hol_eq(&self, t: Ty<'tcx>) -> bool {
+        match t.kind() {
+            ty::Adt(_, args) if self.is_vec(t) => !self.holds_hashmap(args.type_at(0), &mut HashSet::new()),
+            _ => false,
+        }
     }
 
     fn derived(&self, did: DefId) -> bool {
@@ -3856,6 +4013,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         // over `&mut` of a slice, array or Vec (or `xs.iter_mut()`) the items are references to
         // the elements: AutoCorrode's `iter_mut`
         let mut_items = match ht.kind() {
+            // a `Vec`'s elements by the reference focused on them
+            ty::Ref(_, inner, m) if m.is_mut() && self.is_vec(*inner) => {
+                let r = self.val(head)?;
+                Some(self.vec_elems_ref(&r))
+            }
             ty::Ref(_, inner, m) if m.is_mut() && self.list_like(*inner) => Some(self.val(head)?),
             _ if let Some(recv) = self.std_method_recv(head, StdFn::SliceIterMut) => Some(self.val(recv)?),
             _ => None,
@@ -3863,6 +4025,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let iter_s = match ht.peel_refs().kind() {
             _ if let Some(r) = mut_items => Tr::new(format!("iter_mut({})", r.at(11)), 999),
             ty::Adt(def, _) if matches!(self.fe.std_adt(def.did()), Some("Range") | Some("RangeInclusive")) => self.val(head)?,
+            _ if self.is_vec(ht.peel_refs()) => {
+                let v = self.val(head)?;
+                self.to_val(self.vec_elems(PV::Val(v)))
+            }
             _ if self.list_like(ht) => self.val(head)?,
             // `xs.iter()` over a slice, array or Vec: iterate over `xs`
             _ if let Some(recv) = self.std_method_recv(head, StdFn::SliceIter) => self.val(recv)?,
@@ -4634,7 +4800,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Adt(d, args) if self.fe.std_adt(d.did()) == Some("Vec") => {
                 let e = self.fresh("dropped");
                 let inner = self.drop_glue(args.type_at(0), PV::Val(Tr::atom(e.clone())))?;
-                out.push(format!("for {} in {} {{\n{}\n}};", e, self.to_val(pv).at(20), inner.join("\n")));
+                let elems = self.vec_elems(PV::Val(self.to_val(pv)));
+                out.push(format!("for {} in {} {{\n{}\n}};", e, self.to_val(elems).at(20), inner.join("\n")));
             }
             _ => return unsup(format!("destructor of a value of type `{}`", t)),
         }
@@ -5044,6 +5211,18 @@ fn decode_fmt_template(b: &[u8]) -> Option<Vec<FmtPart>> {
     }
 }
 
+/// A conversion between a `Vec` and a list (see `Body::vec_conversion`).
+enum VecConversion {
+    /// the elements of the `Vec`
+    Elems,
+    /// a `Vec` whose capacity is the number of the elements, with the given layout
+    FromList(Tr),
+    /// a `Vec` of the elements in a new allocation, with the given layout
+    Alloc(Tr),
+    /// a clone of the `Vec`
+    Clone,
+}
+
 /// The standard library functions with a uRust counterpart (see `std_call`).
 #[derive(Clone, Copy, PartialEq)]
 enum StdFn {
@@ -5064,8 +5243,22 @@ enum StdFn {
     ResultOk,
     ResultUnwrapOr,
     Len,
+    /// `Vec::new`, `Vec::with_capacity` (AutoCorrode's `StdLib_Vec`, with the elements' layout)
     VecNew,
-    ToVec,
+    VecWithCapacity,
+    /// `String::new`, `String::with_capacity`: the empty byte list
+    StringNew,
+    /// a `Vec` of the elements of a boxed slice (`into_vec`, the expansion of `vec![..]`), whose
+    /// capacity is their number
+    VecFromList,
+    /// a `Vec` of the elements of a list in a new allocation (`to_vec`, `String::into_bytes`)
+    VecAlloc,
+    /// the elements of a `Vec` (`into_boxed_slice`, `String::from_utf8_unchecked`)
+    VecElems,
+    /// `String::from_utf8` of a `Vec<u8>`
+    StringFromUtf8,
+    /// `FromUtf8Error::into_bytes`: the `Vec<u8>`
+    FromUtf8ErrorIntoBytes,
     BoxNew,
     Drop,
     RangeInclusiveNew,
@@ -5074,8 +5267,6 @@ enum StdFn {
     Conversion,
     SliceIter,
     SliceIterMut,
-    VecPush,
-    VecPop,
     VecFromElem,
     SliceSwap,
     /// an operation of integers, by its AutoCorrode name
@@ -5169,14 +5360,14 @@ const STD_ITEMS: &[(Item, StdFn)] = &[
     (Item::Diag("option_expect"), StdFn::OptionExpect),
     (Item::Diag("result_ok_method"), StdFn::ResultOk),
     (Item::Diag("vec_new"), StdFn::VecNew),
-    (Item::Diag("vec_with_capacity"), StdFn::VecNew),
+    (Item::Diag("vec_with_capacity"), StdFn::VecWithCapacity),
     (Item::Diag("box_new"), StdFn::BoxNew),
     (Item::Diag("mem_drop"), StdFn::Drop),
     (Item::Lang(LangItem::RangeInclusiveNew), StdFn::RangeInclusiveNew),
     (Item::Diag("to_string_method"), StdFn::ToString),
     (Item::Diag("to_owned_method"), StdFn::Conversion),
     (Item::Lang(LangItem::FromFn), StdFn::Conversion),
-    (Item::Diag("vec_as_slice"), StdFn::Conversion),
+    (Item::Diag("vec_as_slice"), StdFn::VecElems),
     (Item::Diag("string_as_str"), StdFn::Conversion),
     (Item::Diag("slice_iter"), StdFn::SliceIter),
     (Item::Diag("vec_from_elem"), StdFn::VecFromElem),

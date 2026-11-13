@@ -1028,7 +1028,8 @@ impl<'tcx> Frontend<'tcx> {
                         format!("({}, {}) result", a, b)
                     }
                     Some("Box") => self.ty(targs[0]),
-                    Some("Vec") => format!("{} list", paren_ty(&self.ty(targs[0]))),
+                    // AutoCorrode's model with capacity (`StdLib_Vec`)
+                    Some("Vec") => format!("{} rvec", paren_ty(&self.ty(targs[0]))),
                     Some("String") => self.str_ty(),
                     Some("Ordering") => "ordering".into(),
                     // AutoCorrode's model of `core::fmt` (`StdLib_Fmt`)

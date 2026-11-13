@@ -7,11 +7,11 @@
 - **模型只是暂时的替代。** 每个模型最终都应被按 Rust 源码翻译的定义取代。没有模型的标准库条目不做替代：类型按外部类型、函数按外部函数生成模板（`*_External_Template.thy`），由用户补充定义。
 - **模型的三种来源。**
   1. AutoCorrode 已有的类型和函数（`Micro_Rust_Std_Lib`、`Shallow_Micro_Rust`）。
-  2. 手写的模型：放在 AutoCorrode 的 `Micro_Rust_Std_Lib/StdLib_Frontend_Models.thy`（AutoCorrode 分支 `urust-frontend-std-models`），属于 `Micro_Rust_Std_Lib` 会话，由 `Micro_Rust_Std_Lib.thy` 导入，因而生成的每个 crate 都能使用。这个文件只放标准库函数的模型，不限于某一个类型。
+  2. 手写的模型：放在 AutoCorrode 的 `Micro_Rust_Std_Lib/StdLib_Frontend_Models.thy`（AutoCorrode 分支 `urust-frontend-std-models`），属于 `Micro_Rust_Std_Lib` 会话，由 `Micro_Rust_Std_Lib.thy` 导入，因而生成的每个 crate 都能使用。这个文件只放标准库函数的模型，不限于某一个类型。例外是 `Vec`：它的类型、模型和契约自成一体，放在同一会话的 `StdLib_Vec.thy`。
   3. 前端直接生成的写法（例如恒等、`[]`），不对应任何 Isabelle 定义。
-- **序列的表示。** `Vec<T>` 和切片 `[T]` 都表示为元素的列表 `T list`，`&mut` 引用指向这个列表。这与 AutoCorrode 对切片的表示（`StdLib_Slice.thy` 的 `slice_index`）一致。代价是 `Vec` 的容量、内存位置没有建模。AutoCorrode 另有一个长度受类型参数限定的 `('v, 'l) vector` 类型，目前没有使用。
+- **序列的表示。** 切片 `[T]` 和数组表示为元素的列表 `T list`，`&mut` 引用指向这个列表，与 AutoCorrode 对切片的表示（`StdLib_Slice.thy` 的 `slice_index`）一致。`Vec<T>` 表示为 AutoCorrode `StdLib_Vec` 的 `T rvec`：元素的列表、容量和元素类型的布局（大小、对齐）。它有 `Vec` 的长度上界（`Layout::array` 的 `n * size <= isize::MAX - (align - 1)`，零大小元素的容量为 `usize::MAX`）和超出上界时的 `capacity overflow` panic；标准库没有规定的容量（扩容的增量，`with_capacity`、`reserve_exact`、`shrink_to(_fit)`、`clone` 的结果）是只知道上下界的未指定值。`Vec` 用作列表的地方（到切片的 `Deref`、下标、`for`）取它的元素：值取 `rvec_elems`，引用经 `rvec_elems_focus` 聚焦到元素。布局写在创建 `Vec` 的地方（`make_elem_layout size align`，取自 rustc 的 `layout_of`），因为 `&T`、`Box<T>` 与 `T` 的 HOL 类型相同而大小不同；元素类型含类型参数时布局未知，用 AutoCorrode 的未指定常量 `rvec_layout_of TYPE(..)`，它对每个 HOL 类型是一个值，证明不能用到它的任何性质。元素的内存位置没有建模（缓冲区不在 store 中，重新分配不可见），分配失败（Rust 中 abort）也没有建模。
 - **未定义行为。** 模型若需要表示 Rust 中的未定义行为，以消息以 `undefined behaviour` 开头的 panic 中止，与 Rust 自身的 panic 区分开（目前没有模型用到）。
-- **重载解引用。** 编译器插入的 `Deref::deref`/`DerefMut::deref_mut`（自动解引用）不翻译成函数调用：解引用前后的类型（去掉引用后）翻译成的 HOL 类型相同时，当作恒等，否则登记为占位符（`pv_adjusted`）。这条规则依赖上面的类型替换，按现有的类型映射，满足它的只有 `Vec` 到切片、`String` 到 `str`、`Box<T>` 到 `T` 三种，下面各组分别列出。
+- **重载解引用。** 编译器插入的 `Deref::deref`/`DerefMut::deref_mut`（自动解引用）不翻译成函数调用：`Vec` 到切片取元素（见上）；其余解引用前后的类型（去掉引用后）翻译成的 HOL 类型相同时，当作恒等，否则登记为占位符（`pv_adjusted`）。按现有的类型映射，后者只有 `String` 到 `str`、`Box<T>` 到 `T` 两种，下面各组分别列出。
 - **模型目前没有契约和证明**（手写模型只有定义）。
 
 ## 语言内建类型的模型
@@ -71,39 +71,42 @@
 ### Vec 与切片
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| `Vec<T>` | `T list` | Isabelle/HOL | `Frontend::ty` |
-| `Vec::new`、`Vec::with_capacity` | `[]` | 前端写法 | `std_call` |
-| `Vec::len`、`<[T]>::len` | `len` | AutoCorrode `Range_Type.thy` | `std_fn`/`std_call` |
-| `<[T]>::to_vec`、`into_vec` | 恒等 | 前端写法 | 同上 |
-| `Vec::as_slice`、`Vec` 到切片的 `Deref` | 恒等 | 前端写法 | `std_call`、`pv_adjusted` |
-| `v[i]`（`Index`/`IndexMut`） | uRust 的列表下标 | AutoCorrode | `pv_unadj` 的 `Index` |
+| `Vec<T>` | `T rvec`（见“序列的表示”） | 手写 `StdLib_Vec` | `Frontend::ty` |
+| `Vec` 到切片的 `Deref`/`DerefMut`、`*v`、`Vec::as_slice`、`Vec::into_boxed_slice`、`v[i]` 与 `for` 中的 `Vec` | 值的 `rvec_elems`，引用经 `rvec_elems_focus` 聚焦 | 手写 `StdLib_Vec` | `pv_adjusted`、`pv_unadj`（`index_seq`）、`for_loop`、`std_call` |
+| `Vec::new`、`Vec::with_capacity(n)`、`Default::default()` | `rvec_new`、`rvec_with_capacity`（`n` 超出上界时 panic，容量未指定、不小于 `n`），布局为元素类型的布局，结果标注 HOL 类型 | 手写 `StdLib_Vec` | `std_call`、`default_value` |
+| `vec![x; n]`（`alloc::vec::from_elem`） | `rvec_from_elem`：`n` 个 `x`，容量同 `with_capacity(n)` | 手写 `StdLib_Vec` | `std_call` |
+| `<[T]>::into_vec`（`Box<[T]>` 到 `Vec`）、`From<[T; N]>` | `rvec_from_list`：容量为元素个数 | 手写 `StdLib_Vec` | `std_call`、`vec_conversion` |
+| `<[T]>::to_vec`、`From<&[T]>`、`ToOwned::to_owned`（切片）、`collect`（到 `Vec`）、`String::into_bytes`、`FromUtf8Error::into_bytes` | `rvec_of_list_alloc`：新分配，容量未指定、不小于长度；元素过多时 panic。`into_bytes` 的容量在 Rust 中是字符串的容量，字符串的模型没有容量 | 手写 `StdLib_Vec` | 同上 |
+| `IntoIterator::into_iter`（`Vec`、`&Vec` 到 `vec::IntoIter`、`slice::Iter`）、其他从 `Vec` 到其元素列表的同 HOL 类型转换 | `rvec_elems` | 手写 `StdLib_Vec` | `vec_conversion` |
+| `Clone::clone`、`ToOwned::to_owned`（`Vec`） | `rvec_clone`：新分配，元素相同，容量未指定、不小于长度 | 手写 `StdLib_Vec` | `std_call`、`model_field` |
+| `PartialEq`（`==`、`!=`）：元素不含 `Vec`、`HashMap` 的 `Vec` | `rvec_eq`、`rvec_ne`：比较元素，不比较容量 | 手写 `StdLib_Vec` | `std_call`、`model_field` |
+| `Vec::len`、`capacity`、`is_empty`；`<[T]>::len` | `rvec_len`、`rvec_capacity`、`rvec_is_empty`；uRust 的 `len` | 手写 `StdLib_Vec`；AutoCorrode `Range_Type.thy` | `std_fn`/`std_call` |
+| `Vec::push`、`extend_from_slice`、`reserve`、`reserve_exact`、`resize` | `rvec_push`、`rvec_extend_from_slice`、`rvec_reserve`、`rvec_reserve_exact`、`rvec_resize`：容量不够时扩容，新容量未指定（`reserve_exact` 不小于所需；其余在所需与 `max(2 * cap, 所需, MIN_NON_ZERO_CAP)` 之间），超出上界时 panic `capacity overflow` | 手写 `StdLib_Vec` | 同上 |
+| `Vec::insert` | `rvec_insert`：下标大于长度时 panic，满时扩容 | 手写 `StdLib_Vec` | 同上 |
+| `Vec::pop`、`remove`、`swap_remove`、`truncate`、`clear`、`dedup`（元素的 `PartialEq` 是结构相等，见下） | `rvec_pop`、`rvec_remove`、`rvec_swap_remove`（越界时 panic）、`rvec_truncate`、`rvec_clear`、`rvec_dedup`：容量不变 | 手写 `StdLib_Vec` | 同上 |
+| `Vec::shrink_to_fit`、`shrink_to` | `rvec_shrink_to_fit`、`rvec_shrink_to`：容量减到目标与当前容量之间的未指定值；零大小元素的容量不变 | 手写 `StdLib_Vec` | 同上 |
+| `Vec::as_mut_slice` | `rvec_as_mut_slice`：经 `rvec_elems_focus` 聚焦的引用 | 手写 `StdLib_Vec` | 同上 |
+| `TryFrom<Vec<T>>`（及 `TryInto`）到 `[T; N]`、`Box<[T; N]>` | `rvec_try_into_array`：长度为 `N` 时 `Ok`（元素），否则 `Err` 为原值 | 手写 `StdLib_Vec` | 同上 |
+| `TryFrom<Box<[T]>>`（及 `TryInto`）到 `[T; N]`、`Box<[T; N]>` | `vec_try_into_array`：长度为 `N` 时 `Ok`，否则 `Err` 为原值 | 手写 | 同上 |
+| `v[i]`（`Index`/`IndexMut`，`v` 是切片、数组或 `Vec` 的元素） | uRust 的列表下标 | AutoCorrode | `pv_unadj` 的 `Index` |
 | `<[T]>::iter()`（在 `for` 中） | 直接遍历列表 | AutoCorrode | `for_loop` |
 | `<[T]>::iter_mut()`、`for` 遍历 `&mut` 序列 | `iter_mut` | AutoCorrode `StdLib_Iterators` | `for_loop` |
-| `<[T]>::is_empty`、`Vec::is_empty`、`first`、`last` | `slice_is_empty`、`slice_first`、`slice_last` | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
+| `<[T]>::is_empty`、`first`、`last` | `slice_is_empty`、`slice_first`、`slice_last` | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
 | `<[T]>::get(i)`（下标是 `usize`） | `slice_get`：越界时 `None` | 手写 | 同上 |
 | `<[T]>::get(r)`（`r` 是 `a..b`、`a..=b`、`..b`、`..=b`、`a..`、`..`） | `slice_get_range`（`range` 值）、`slice_get_to`、`slice_get_to_inclusive`、`slice_get_from`、`slice_get_full`（后四者的参数是区间唯一的字段或 `()`）：区间递减或超出切片时 `None`（`a..=usize::MAX` 也是 `None`） | 手写 | 同上 |
 | `<[T]>::copy_within(src, dest)`（`src` 是 `Range`、`RangeInclusive`） | `slice_copy_within`：复制 `src` 的元素到 `dest`（可以重叠）；`src` 递减、越界或目标越界时 panic | 手写 | 同上 |
 | `TryFrom<&[T]>`（及 `TryInto`）到 `[T; N]`、`&[T; N]` | `slice_try_into_array`：长度为 `N` 时 `Ok`，否则 `Err(TryFromSliceError)`；`core::array::TryFromSliceError` 为 `try_from_slice_error`。从 `&mut [T]`、到 `&mut [T; N]` 的转换没有模型（结果与切片别名） | 手写 | 同上 |
-| `TryFrom<Vec<T>>`、`TryFrom<Box<[T]>>`（及 `TryInto`）到 `[T; N]`、`Box<[T; N]>` | `vec_try_into_array`：长度为 `N` 时 `Ok`，否则 `Err` 为原值 | 手写 | 同上 |
-| `Vec::shrink_to_fit` | `vec_shrink_to_fit`：无操作（只改变容量，模型没有容量） | 手写 | 同上 |
-| `Vec::swap_remove` | `vec_swap_remove`：越界时 panic | 手写 | 同上 |
-| `Vec::dedup`（元素的 `PartialEq` 是结构相等，见下） | `vec_dedup`：去掉相邻的重复元素 | 手写 | 同上 |
 | `<[T]>::sort`（`T` 的 `Ord` 是整数、`bool`、`char` 的序，或派生的、字段都满足此条件的本地结构体的字典序） | `slice_sort_by`，比较函数由前端按类型给出（`ord_cmp`、`ordering_then`）：稳定插入排序，与 Rust 的稳定排序结果相同 | 手写 + 前端写法 | `ord_cmp_term` |
 | `<[T]>::chunks(n)` | `slice_chunks`：`n` 为 0 时 panic；状态见“迭代器” | 手写 | 同上 |
 | `<[T]>::chunks_exact(n)` | `slice_chunks_exact`：`n` 为 0 时 panic；状态见“迭代器” | 手写 | 同上 |
 | `<[T]>::copy_from_slice`、`fill`、`reverse` | `slice_copy_from_slice`（长度不等时 panic）、`slice_fill`、`slice_reverse` | 手写 | 同上 |
-| `Vec::truncate`、`clear`、`resize`、`extend_from_slice` | `vec_truncate`、`vec_clear`、`vec_resize`、`vec_extend_from_slice` | 手写 | 同上 |
-| `Vec::into_boxed_slice` | 恒等 | 前端写法 | 同上 |
 | 可变位置（`&mut`、赋值的左边、可变的自动借用）中的子切片 `v[r]`（`r` 是 `a..b`、`a..=b`、`a..`、`..b`、`..=b`、`..` 或存放区间的变量），以及读取时基有副作用的开区间、存放在变量中的区间 | `slice_range_mut`（`range` 值）、`slice_range_from_mut`、`slice_range_to_mut`、`slice_range_to_inclusive_mut`（区间唯一的字段）：指向子切片的引用，即 `v` 的引用经 `sublist_focus a k` 聚焦到前 `a` 个、后 `k` 个元素之间的部分；区间递减或超出切片时 panic；`..` 是 `v` 的引用本身。这个 focus 满足 AutoCorrode 对 focus 的全部定律（固定位置 `a..b` 的 focus 不满足，见 AutoCorrode `StdLib_Slice` 中注释掉的 `slice_index_range`）；借用存活期间切片的长度不变，所以它总是聚焦在区间 `r` 的元素上，与 Rust 一致 | 手写 `StdLib_Frontend_Models` | `pv_unadj` 的 `Index`（`index_place`）、`mark_mut_place` |
 | `<[T]>::get_mut(i)`（下标是 `usize`）、`get_mut(r)`（`r` 是 `a..b`、`a..=b`） | `slice_get_mut`（`focus_nth` 的引用）、`slice_get_range_mut`（`sublist_focus` 的引用）：越界时 `None` | 手写 | `std_fn`/`std_call` |
 | `<[T]>::iter_mut()` 作为值 | `slice_iter_mut_list`：各元素的引用的列表（`slice::IterMut` 的状态，见“迭代器”） | 手写 | 同上 |
-| `Vec::push` | `vec_push`：追加到末尾 | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
-| `Vec::pop` | `vec_pop`：空时 `None`，否则去掉并返回最后一个元素 | 手写 | 同上 |
 | `<[T]>::swap` | `slice_swap`：交换两个位置，越界时 panic | 手写 | 同上 |
-| `vec![x; n]`（`alloc::vec::from_elem`） | `vec_from_elem`：`replicate n x` | 手写 | 同上 |
-| 数组重复表达式 `[x; N]`（语言构造，`N` 已知） | `vec_from_elem(x, N)` | 手写 | `BodyTr::expr`（`ExprKind::Repeat`） |
+| 数组重复表达式 `[x; N]`（语言构造，`N` 已知） | `vec_from_elem(x, N)`（`replicate N x`，一个列表） | 手写 | `BodyTr::expr`（`ExprKind::Repeat`） |
 
-丢掉的语义：容量（`with_capacity`、`reserve` 的效果、`capacity()`）和元素的内存位置。
+丢掉的语义：元素的内存位置（重新分配不可见）和分配失败。未指定的容量是元素个数（或所需容量）与布局的一个确定的函数：同样的参数总得到同样的容量。含 `Vec` 的其他类型（`Option<Vec<T>>`、含 `Vec` 字段的本地类型）的 `clone` 仍是恒等（见“Clone”），所以其中 `Vec` 的容量不变，而 Rust 的克隆容量通常等于长度；它们的 `PartialEq` 不是 HOL 的相等（会比较容量），因此不再译成 `==`，而是外部函数模板。
 
 ### Box
 | Rust | 模型 | 来源 | 位置 |
@@ -152,9 +155,9 @@
 ### Clone
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| 标准库实现与派生实现的 `clone` | 恒等 | 前端写法 | `std_call`；标准库、派生和内建实现的字典字段（`model_field`，`clone_from` 为赋值） |
+| 标准库实现与派生实现的 `clone`（`Vec` 的见“Vec 与切片”） | 恒等 | 前端写法 | `std_call`；标准库、派生和内建实现的字典字段（`model_field`，`clone_from` 为赋值） |
 
-丢掉的语义：字段类型有自定义的 `clone` 时，派生实现不是恒等。
+丢掉的语义：字段类型有自定义的 `clone` 时，派生实现不是恒等；含 `Vec` 的类型的克隆中 `Vec` 的容量不变。
 
 ### 转换 trait
 | Rust | 模型 | 来源 | 位置 |
@@ -216,7 +219,7 @@
 
 ### HashMap
 
-`HashMap<K, V, S>` 表示为键值对的列表 `(K × V × tnil) list`（键互不相同）。只为不暴露迭代顺序的方法提供模型，所以哈希和迭代顺序都观察不到；键用 HOL 的相等比较，只在 `K` 的 `PartialEq` 是结构相等时使用：整数、`bool`、`char`、`str`、`String`，它们的元组、数组、切片、`Vec`、`Option`，以及派生 `PartialEq` 且字段都满足此条件的本地类型（`structural_eq_ty`）。泛型代码中以含类型参数的键调用这些方法的函数按实例翻译（`GenericCalls`）。
+`HashMap<K, V, S>` 表示为键值对的列表 `(K × V × tnil) list`（键互不相同）。只为不暴露迭代顺序的方法提供模型，所以哈希和迭代顺序都观察不到；键用 HOL 的相等比较，只在 `K` 的 `PartialEq` 是结构相等时使用：整数、`bool`、`char`、`str`、`String`，它们的元组、数组、切片、`Option`，以及派生 `PartialEq` 且字段都满足此条件的本地类型（`structural_eq_ty`）。泛型代码中以含类型参数的键调用这些方法的函数按实例翻译（`GenericCalls`）。
 
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
