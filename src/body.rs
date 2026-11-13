@@ -2510,18 +2510,38 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// (a local implementation's translated methods or default-method copies, an external one's
     /// templates), then the dictionaries of the trait's supertraits.
     ///
-    /// A dictionary is a HOL term built from its fields; when a field (a method's function value
-    /// with its own dictionaries, or a supertrait's dictionary) needs the dictionary being built
-    /// itself (jaq-core: a method of an implementation called at the same implementation), that
-    /// term would be infinite: not supported.
+    /// A dictionary is a HOL term built from its fields. A field (a method's function value with
+    /// the dictionaries for its implementation's bounds, or a supertrait's or associated type
+    /// bound's dictionary) may need the dictionary of the same implementation again: at the same
+    /// arguments, the term would contain itself (jaq-core: the dictionary of `DataT for
+    /// JustLut<V>` has, for the bound `Data<'a>: HasLut<'a, Self>`, the dictionary of `HasLut`
+    /// for `&Lut<JustLut<V>>`, whose implementation requires `JustLut<V>: DataT`); at arguments
+    /// containing the earlier ones, the terms would grow without end. Neither is supported. (At
+    /// smaller arguments, e.g. the dictionary of `Vec<Vec<u8>>` needing that of `Vec<u8>`, the
+    /// nesting ends.) A failed dictionary leaves no calls behind: the calls recorded for the
+    /// fields built before the failure are dropped with the term.
     fn impl_dict(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
-        let key = (imp, self.tcx.erase_and_anonymize_regions(args));
-        if self.impl_dicts_building.contains(&key) {
-            return unsup("dictionary of an implementation that contains itself (a method of the implementation needs its own dictionary)");
+        let args = self.tcx.erase_and_anonymize_regions(args);
+        for &(i, a) in &self.impl_dicts_building {
+            if i != imp {
+                continue;
+            }
+            if a == args {
+                return unsup("dictionary that contains itself (an implementation's dictionary needed again, through its bounds, while it is built)");
+            }
+            let earlier: Vec<Ty<'tcx>> = a.types().collect();
+            if !earlier.is_empty() && args.types().any(|t| t.walk().any(|g| g.as_type().is_some_and(|x| x != t && earlier.contains(&x)))) {
+                return unsup("dictionaries growing without end (an implementation's dictionary needed again, through its bounds, at arguments containing the earlier ones)");
+            }
         }
-        self.impl_dicts_building.push(key);
+        let (calls, gen_calls) = (self.calls.0.len(), self.fe.gen_calls.len());
+        self.impl_dicts_building.push((imp, args));
         let r = self.impl_dict_fields(imp, args);
         self.impl_dicts_building.pop();
+        if r.is_err() {
+            self.calls.0.truncate(calls);
+            self.fe.gen_calls.truncate(gen_calls);
+        }
         r
     }
 

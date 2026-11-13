@@ -1,8 +1,10 @@
-// A dictionary that contains itself (as in jaq-core): the dictionary of `Data for J<V>` has, for
-// the bound `Self::D: Has<Self>` of its associated type, the dictionary of `Has<J<V>> for
-// L<J<V>>`, whose implementation requires `J<V>: Data`, the dictionary being built (generic code
-// passes dictionaries; at concrete types functions are translated per instance). As a HOL term it
-// would be infinite, so it is a placeholder instead of an endless recursion of the frontend.
+// Dictionaries that contain themselves (as in jaq-core). The dictionary of `Data for J<V>` has,
+// for the bound `Self::D: Has<Self>` of its associated type, the dictionary of `Has<J<V>> for
+// L<J<V>>`, whose implementation requires `J<V>: Data`: the dictionary being built. In `G`, the
+// same cycle needs the dictionary at a bigger argument each round (`G<V>` needs `G<Box<V>>`).
+// Generic code passes dictionaries: as HOL terms they would be infinite, so its calls are
+// placeholders instead of an endless recursion of the frontend. At concrete types the functions
+// are translated per instance and need no dictionaries.
 
 use core::marker::PhantomData;
 
@@ -36,6 +38,27 @@ pub fn run<V: 'static>(d: &L<J<V>>) -> u32 {
     use_data::<J<V>>(d)
 }
 
-pub fn plain(a: u32) -> u32 {
-    a + 1
+pub fn run_u8(d: &L<J<u8>>) -> u32 {
+    use_data::<J<u8>>(d)
+}
+
+pub struct G<V>(pub PhantomData<V>);
+
+pub struct M<T>(pub PhantomData<T>, pub u32);
+
+impl<V: 'static> Data for G<V> {
+    type D = M<G<V>>;
+}
+
+impl<V: 'static> Has<G<V>> for M<G<V>>
+where
+    G<Box<V>>: Data,
+{
+    fn get(&self) -> u32 {
+        self.1
+    }
+}
+
+pub fn run_growing<V: 'static>(d: &M<G<V>>) -> u32 {
+    use_data::<G<V>>(d)
 }
