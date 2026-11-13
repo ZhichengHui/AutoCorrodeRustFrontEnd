@@ -168,6 +168,7 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         }
         let tr = tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization().def_id;
         let implementors = tcx.impl_item_implementor_ids(imp);
+        fe.prepare_dict(tr);
         let fields = fe.dict_methods(tr);
         for &m in &default_methods {
             if tcx.trait_of_assoc(m) == Some(tr) && fields.contains(&m) && !implementors.contains_key(&m) {
@@ -597,6 +598,9 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let name = fe.fn_name(key);
     // the dictionary parameters come first (see `crate::dict`)
     let dicts = if is_fn { fe.dict_params(key) } else { vec![] };
+    for (r, _) in &dicts {
+        fe.prepare_dict(r.def_id);
+    }
     let rust_path = match key.1 {
         Inst::Generic => tcx.def_path_str(did),
         Inst::Mono(args) => tcx.def_path_str_with_args(did, args),

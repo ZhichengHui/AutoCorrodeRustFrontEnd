@@ -193,6 +193,8 @@ pub struct Frontend<'tcx> {
     /// The slots of each trait's dictionaries that are associated types of its other type
     /// parameters (see `param_slots`).
     pub param_slots_memo: std::cell::RefCell<HashMap<DefId, Vec<Ty<'tcx>>>>,
+    /// The traits whose dictionaries' field types are known (see `prepare_dict`).
+    pub dicts_prepared: HashSet<DefId>,
     /// The own bounds of each trait method that are dictionary parameters (see `own_dict_bounds`).
     pub own_dict_bounds_memo: std::cell::RefCell<HashMap<DefId, Vec<ty::TraitRef<'tcx>>>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
@@ -415,6 +417,7 @@ impl<'tcx> Frontend<'tcx> {
             proj_env: None,
             dict_methods_memo: Default::default(),
             param_slots_memo: Default::default(),
+            dicts_prepared: HashSet::new(),
             own_dict_bounds_memo: Default::default(),
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
@@ -618,10 +621,7 @@ impl<'tcx> Frontend<'tcx> {
 
     /// `base` made unique among the HOL names of constants and types, and reserved.
     pub fn unique_global(&mut self, base: String) -> String {
-        let n = unique(base, |n| self.used_names.contains(n) || self.used_type_names.contains(n));
-        self.used_names.insert(n.clone());
-        self.used_type_names.insert(n.clone());
-        n
+        self.unique_global_with(base, |_| vec![])
     }
 
     /// `base` made unique as by `unique_global`, such that the names `with(n)` declared with it

@@ -80,19 +80,6 @@ fn record_decl(name: &str, tparams: &[String], fields: &[(String, String)]) -> S
     out
 }
 
-/// Is the projection `p` an associated type of a type parameter of its trait other than `Self`
-/// (index 0), or of such a projection (e.g. `<L::A as B>::C`)?
-fn on_trait_param(p: Ty<'_>) -> bool {
-    let mut t = p;
-    loop {
-        match t.kind() {
-            ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Projection { .. }) => t = a.self_ty(),
-            ty::Param(q) => return q.index != 0,
-            _ => return false,
-        }
-    }
-}
-
 /// The number of fields per group of a datatype of `n` fields declared by `record_decl` (more
 /// than `MAX_FIELDS`).
 fn group_size(n: usize) -> usize {
@@ -133,13 +120,42 @@ impl<'tcx> Frontend<'tcx> {
     /// by a trait whose dictionaries contain those of `tr` (see `reaches_through_methods`; e.g.
     /// `Iterator::rev`, `where Self: DoubleEndedIterator`, a subtrait of `Iterator`): the datatypes
     /// would be mutually recursive through a function argument, which HOL does not admit.
+    ///
+    /// The field types are known once the trait is prepared (see `prepare_dict`); only then is
+    /// the result kept.
     pub fn dict_methods(&self, tr: DefId) -> Vec<DefId> {
         if let Some(ms) = self.dict_methods_memo.borrow().get(&tr) {
             return ms.clone();
         }
         let ms = self.find_dict_methods(tr);
-        self.dict_methods_memo.borrow_mut().insert(tr, ms.clone());
+        if self.dicts_prepared.contains(&tr) {
+            self.dict_methods_memo.borrow_mut().insert(tr, ms.clone());
+        }
         ms
+    }
+
+    /// Register the external ADTs in the types of the methods of `tr` that may be dictionary
+    /// fields (see `field_types`), and so in those of the traits whose dictionaries its
+    /// dictionaries contain or take: whether the datatype of such an ADT takes associated types as
+    /// type parameters (see `register_ext_adts`) decides the projections in the field types (see
+    /// `dict_methods`, `param_slots`), which must not change once the dictionaries are used.
+    pub fn prepare_dict(&mut self, tr: DefId) {
+        if !self.dicts_prepared.insert(tr) {
+            return;
+        }
+        let mut tys = vec![];
+        let mut next: Vec<DefId> = self.dict_parents(tr).iter().map(|p| p.def_id).collect();
+        for m in self.monomorphic_methods(tr) {
+            tys.extend(self.sig_types(m));
+            for b in self.own_dict_bounds(m) {
+                tys.extend(b.args.types());
+                next.push(b.def_id);
+            }
+        }
+        self.register_ext_adts(&tys);
+        for t in next {
+            self.prepare_dict(t);
+        }
     }
 
     fn find_dict_methods(&self, tr: DefId) -> Vec<DefId> {
@@ -151,15 +167,7 @@ impl<'tcx> Frontend<'tcx> {
             .collect();
         self.field_candidates(tr)
             .into_iter()
-            .filter(|&m| {
-                let env = ty::TypingEnv::post_analysis(tcx, m);
-                let mut tys = self.sig_types(m);
-                for b in self.own_dict_bounds(m) {
-                    tys.extend(b.args.types());
-                    tys.extend(self.dict_slots(b).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
-                }
-                self.field_projections(m, &tys).iter().all(|&p| self.proj_key(p).is_some_and(|k| slots.contains(&k)))
-            })
+            .filter(|&m| self.field_projections(m).iter().all(|&p| self.proj_key(p).is_some_and(|k| slots.contains(&k))))
             .collect()
     }
 
@@ -179,30 +187,43 @@ impl<'tcx> Frontend<'tcx> {
         tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization()).inputs_and_output.to_vec()
     }
 
-    /// The associated-type projections in the HOL types of `tys` (types of the trait method `m`):
-    /// those written, and those that the datatypes of ADTs in them take as type parameters (see
-    /// `projections`; normalised in `m`'s typing environment, as `dict_decl` translates them).
-    fn field_projections(&self, m: DefId, tys: &[Ty<'tcx>]) -> Vec<Ty<'tcx>> {
-        self.projections(m, tys)
+    /// The associated-type projections in the type of the dictionary field of the trait method `m`
+    /// (see `dict_decl`): in its signature and in the dictionary types of its own bounds (their
+    /// arguments and slots, see `own_dict_bounds`), those written and those that the datatypes of
+    /// ADTs in them take as type parameters (see `projections`; normalised in `m`'s typing
+    /// environment, as `dict_decl` translates them).
+    fn field_projections(&self, m: DefId) -> Vec<Ty<'tcx>> {
+        let tcx = self.tcx;
+        let env = ty::TypingEnv::post_analysis(tcx, m);
+        let mut tys = self.sig_types(m);
+        for b in self.own_dict_bounds(m) {
+            tys.extend(b.args.types());
+            tys.extend(self.dict_slots(b).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
+        }
+        self.projections(m, &tys)
             .into_iter()
             .filter(|p| matches!(p.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Projection { .. })))
             .collect()
     }
 
     /// The slots of the dictionaries of `tr` that are associated types of its type parameters other
-    /// than `Self`, which the bounds in its `where` clauses (not supertraits) name: e.g.
-    /// `<L as Language>::Discriminant` for `trait Analysis<L: Language>`. They are those in the
-    /// types of its methods that may be fields (see `field_candidates`) whose types have no
-    /// projections other than these and the trait's other slots (see `trait_slots`), in order of
-    /// occurrence. A projection in a field's type may be written or be one that the datatype of an
-    /// ADT in it takes as a type parameter (`&mut EGraph<L, Self>`, whose datatype takes
-    /// `<L as Language>::Discriminant`).
-    pub fn param_slots(&self, tr: DefId) -> Vec<Ty<'tcx>> {
+    /// than `Self` named by its bounds (see `on_trait_param`; e.g. `<L as Language>::Discriminant`
+    /// for `trait Analysis<L: Language>`). They are those in the field types of its methods that
+    /// may be fields (see `field_candidates`, `field_projections`) without projections other than
+    /// these and the trait's other slots (see `trait_slots`), in order of occurrence: exactly the
+    /// projections other than those slots in the fields' types. A projection in a field's type may
+    /// be written or be one that the datatype of an ADT in it takes as a type parameter
+    /// (`&mut EGraph<L, Self>`, whose datatype takes `<L as Language>::Discriminant`).
+    ///
+    /// As `dict_methods`, the result is kept once the trait is prepared (see `prepare_dict`).
+    fn param_slots(&self, tr: DefId) -> Vec<Ty<'tcx>> {
         if let Some(ps) = self.param_slots_memo.borrow().get(&tr) {
             return ps.clone();
         }
         let ps = self.find_param_slots(tr);
-        self.param_slots_memo.borrow_mut().insert(tr, ps.clone());
+        if self.dicts_prepared.contains(&tr) {
+            self.param_slots_memo.borrow_mut().insert(tr, ps.clone());
+        }
         ps
     }
 
@@ -215,9 +236,9 @@ impl<'tcx> Frontend<'tcx> {
             .collect();
         let mut out: Vec<Ty<'tcx>> = vec![];
         for m in self.field_candidates(tr) {
-            let ps = self.field_projections(m, &self.sig_types(m));
-            let new: Vec<Ty<'tcx>> = ps.into_iter().filter(|&p| !self.proj_key(p).is_some_and(|k| base.contains(&k))).collect();
-            if new.iter().all(|&p| on_trait_param(p)) {
+            let new: Vec<Ty<'tcx>> =
+                self.field_projections(m).into_iter().filter(|&p| !self.proj_key(p).is_some_and(|k| base.contains(&k))).collect();
+            if new.iter().all(|&p| self.on_trait_param(tr, p)) {
                 for p in new {
                     if !out.iter().any(|&q| self.proj_key(q) == self.proj_key(p)) {
                         out.push(p);
@@ -226,6 +247,35 @@ impl<'tcx> Frontend<'tcx> {
             }
         }
         out
+    }
+
+    /// Is the projection `p` (in the parameters of the trait `tr`) an associated type of a type
+    /// parameter of `tr` other than `Self` (index 0), or of such a projection (e.g. `<L::A as B>::C`),
+    /// each named by a bound of `tr` (its `where` clauses, elaborated; not by a method's own bound),
+    /// so that wherever a trait reference of `tr` holds, its projection is well-formed?
+    fn on_trait_param(&self, tr: DefId, p: Ty<'tcx>) -> bool {
+        let tcx = self.tcx;
+        let key = |r: ty::TraitRef<'tcx>| ty::set_aliases_to_non_rigid(tcx, tcx.erase_and_anonymize_regions(r)).skip_normalization();
+        let bounds: Vec<ty::TraitRef<'tcx>> = tcx
+            .param_env(tr)
+            .caller_bounds()
+            .filter_map(|c| c.as_trait_clause())
+            .filter(|c| c.polarity() == ty::ClausePolarity::Positive)
+            .map(|c| key(tcx.instantiate_bound_regions_with_erased(c).trait_ref))
+            .collect();
+        let mut t = p;
+        loop {
+            match t.kind() {
+                ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Projection { .. }) => {
+                    if !bounds.contains(&key(a.trait_ref(tcx))) {
+                        return false;
+                    }
+                    t = a.self_ty();
+                }
+                ty::Param(q) => return q.index != 0,
+                _ => return false,
+            }
+        }
     }
 
     /// The methods of `tr` without type or const parameters of their own, other than those with
@@ -409,6 +459,7 @@ impl<'tcx> Frontend<'tcx> {
         }
         segs.extend(self.path_segments(tr));
         segs.push("dict".into());
+        self.prepare_dict(tr);
         let methods = self.dict_methods(tr);
         let parents = self.dict_parents(tr);
         let nfields = methods.len() + parents.len();
@@ -670,12 +721,12 @@ impl<'tcx> Frontend<'tcx> {
             self.proj_env = Some(menv);
             let ps: Vec<String> = sig.inputs().iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(*t))).collect();
             let ret = self.ty(tcx.erase_and_anonymize_regions(sig.output()));
-            self.proj_env = None;
             let f = self.dict_field(tr, m);
             let mut t = String::new();
             for b in self.own_dict_bounds(m) {
                 t.push_str(&format!("{} \\<Rightarrow> ", paren_ty(&self.dict_type(b, menv))));
             }
+            self.proj_env = None;
             t.push_str(&self.fun_type(&ps, &ret));
             fields.push((f, t));
         }

@@ -2253,6 +2253,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let tcx = self.tcx;
         let tr = tcx.trait_of_assoc(did).expect("a default method is a trait item");
         // only the methods that are dictionary fields have copies (see `translate::run`)
+        self.fe.prepare_dict(tr);
         if !self.fe.dict_methods(tr).contains(&did) {
             return unsup("call of a trait default method that is not a dictionary field (with generic parameters of its own, returning `impl Trait`, or with associated types in its signature other than the slots of its dictionaries)");
         }
@@ -2386,6 +2387,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn model_dict(&mut self, r: ty::TraitRef<'tcx>, what: &str) -> R<String> {
         let tcx = self.tcx;
         let mut fields = vec![];
+        self.fe.prepare_dict(r.def_id);
         for m in self.fe.dict_methods(r.def_id) {
             let Some(f) = self.model_field(r, m) else {
                 return unsup(format!("dictionary of the {} implementation of `{}`", what, r));
@@ -2608,6 +2610,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !self.fe.has_dict(tr) {
             return unsup("trait method call in generic code (a trait without dictionaries)");
         }
+        self.fe.prepare_dict(tr);
         if !self.fe.dict_methods(tr).contains(&did) {
             return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, has associated types in its signature other than the slots of its dictionaries, or is an internal method of the standard library) in generic code");
         }
