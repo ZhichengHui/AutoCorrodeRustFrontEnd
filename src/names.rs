@@ -59,6 +59,7 @@ const OUTER_KEYWORDS: &[&str] = &[
     "qualified", "monos", "binder", "infix", "infixl", "infixr", "structure", "ML", "setup",
     "simproc_setup", "hide_const", "hide_type", "hide_fact", "adhoc_overloading", "nitpick",
     "quickcheck", "sledgehammer", "print_theorems", "find_theorems", "datatype_record",
+    "scalable_datatype_record", "urust_const_data", "simple_word_enum", "simple_word_enum_benchmark", "enum",
     "micro_rust_record", "micro_rust_notation", "nonterminal", "parse_translation",
     "print_translation", "parse_ast_translation", "type_notation", "default_sort", "oracle",
     "partial_function", "nominal_function", "fun_cases", "inductive_set", "specification",

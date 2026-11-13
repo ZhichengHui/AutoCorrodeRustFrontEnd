@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 
-use crate::frontend::{FnKey, Frontend, Inst};
+use crate::frontend::{FnKey, Frontend, Inst, paren_ty};
 use crate::names;
 
 /// The type parameters every dictionary datatype takes first: those of `function_body` and of
@@ -86,8 +86,64 @@ impl<'tcx> Frontend<'tcx> {
     }
 
     /// The methods of `tr` that are fields of its dictionaries: those without type parameters of
-    /// their own (a field cannot be polymorphic: HOL has no rank-2 types).
+    /// their own (a field cannot be polymorphic: HOL has no rank-2 types; see `monomorphic_methods`)
+    /// whose field types have no associated types other than the slots of the dictionaries of `tr`
+    /// (the type variables of a field's type): neither their signatures nor the dictionary types of
+    /// their own bounds (see `own_dict_bounds`; e.g. not `where Self::Item: HasAssoc`, whose
+    /// dictionaries have the slot `<Self::Item as HasAssoc>::Assoc`). Nor are those with an own bound
+    /// by a trait whose dictionaries contain those of `tr` (see `reaches_through_methods`; e.g.
+    /// `Iterator::rev`, `where Self: DoubleEndedIterator`, a subtrait of `Iterator`): the datatypes
+    /// would be mutually recursive through a function argument, which HOL does not admit.
     pub fn dict_methods(&self, tr: DefId) -> Vec<DefId> {
+        if let Some(ms) = self.dict_methods_memo.borrow().get(&tr) {
+            return ms.clone();
+        }
+        let ms = self.find_dict_methods(tr);
+        self.dict_methods_memo.borrow_mut().insert(tr, ms.clone());
+        ms
+    }
+
+    fn find_dict_methods(&self, tr: DefId) -> Vec<DefId> {
+        let tcx = self.tcx;
+        let slots: Vec<ty::AliasTy<'tcx>> = self
+            .dict_slots(ty::TraitRef::identity(tcx, tr))
+            .into_iter()
+            .map(|s| self.proj_key(s).expect("slots are projections"))
+            .collect();
+        self.monomorphic_methods(tr)
+            .into_iter()
+            .filter(|&m| !self.own_dict_bounds(m).iter().any(|b| self.reaches_through_methods(b.def_id, tr, &mut vec![])))
+            .filter(|&m| {
+                let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization());
+                let env = ty::TypingEnv::post_analysis(tcx, m);
+                let mut tys: Vec<Ty<'tcx>> = sig.inputs_and_output.to_vec();
+                for b in self.own_dict_bounds(m) {
+                    tys.extend(b.args.types());
+                    tys.extend(self.dict_slots(b).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
+                }
+                tys.iter().all(|t| {
+                    let mut w = tcx.erase_and_anonymize_regions(*t).walk();
+                    while let Some(g) = w.next() {
+                        if let Some(x) = g.as_type()
+                            && let ty::Alias(_, a) = x.kind()
+                        {
+                            w.skip_current_subtree();
+                            if matches!(a.kind, ty::AliasTyKind::Projection { .. })
+                                && !self.proj_key(x).is_some_and(|k| slots.contains(&k))
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+            })
+            .collect()
+    }
+
+    /// The methods of `tr` without type or const parameters of their own, other than those with
+    /// `impl Trait` types and the standard library's internals.
+    fn monomorphic_methods(&self, tr: DefId) -> Vec<DefId> {
         self.tcx
             .associated_items(tr)
             .in_definition_order()
@@ -129,7 +185,7 @@ impl<'tcx> Frontend<'tcx> {
         let mut clauses: Vec<(ty::Clause<'tcx>, bool)> =
             tcx.explicit_super_clauses_of(tr).skip_binder().iter().map(|(c, _)| (*c, true)).collect();
         for i in tcx.associated_items(tr).in_definition_order() {
-            if matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_params.is_empty() && tcx.opt_rpitit_info(i.def_id).is_none() {
+            if matches!(i.kind, ty::AssocKind::Type { .. }) && self.is_slot(i.def_id) {
                 clauses.extend(tcx.explicit_item_self_bounds(i.def_id).skip_binder().iter().map(|(c, _)| (*c, false)));
             }
         }
@@ -157,6 +213,22 @@ impl<'tcx> Frontend<'tcx> {
         self.trait_bounds(from).into_iter().any(|(r, _)| self.reaches(r.def_id, to, seen))
     }
 
+    /// Does `from` reach the trait `to` through supertraits, associated type bounds and the own bounds
+    /// of its methods (see `own_dict_bounds`): may the dictionaries of `from` contain those of `to`
+    /// (as fields, or as arguments of method fields)?
+    fn reaches_through_methods(&self, from: DefId, to: DefId, seen: &mut Vec<DefId>) -> bool {
+        if from == to {
+            return true;
+        }
+        if seen.contains(&from) {
+            return false;
+        }
+        seen.push(from);
+        let own = self.monomorphic_methods(from).into_iter().flat_map(|m| self.own_dict_bounds(m));
+        let next: Vec<DefId> = self.trait_bounds(from).into_iter().map(|(r, _)| r.def_id).chain(own.map(|r| r.def_id)).collect();
+        next.into_iter().any(|t| self.reaches_through_methods(t, to, seen))
+    }
+
     /// The bounds whose dictionaries are fields of the dictionaries of `tr` (see `trait_bounds`),
     /// those by traits with dictionaries. A bound of an associated type by a trait that reaches
     /// `tr` again (e.g. `trait Node { type Child: Node; }`) is not: the dictionary would contain
@@ -169,13 +241,17 @@ impl<'tcx> Frontend<'tcx> {
             .collect()
     }
 
-    /// Does a bound by `tr` take a dictionary: does it have a method field or a supertrait with a
-    /// dictionary (`Fn` bounds are function values instead)?
+    /// Does a bound by `tr` take a dictionary: does it have a method without type parameters of its
+    /// own, a supertrait with a dictionary, or an associated type (a trait with associated types
+    /// only has dictionaries without fields, whose slots are the type variables of its associated
+    /// types, see `translate::slot_tvars`)? `Fn` bounds are function values instead.
     pub fn has_dict(&self, tr: DefId) -> bool {
         if self.is_fn_trait(tr) {
             return false;
         }
-        !self.dict_methods(tr).is_empty() || !self.dict_parents(tr).is_empty()
+        // (not `dict_methods`, which needs the slots: a trait none of whose methods is a field has
+        // dictionaries without method fields)
+        !self.monomorphic_methods(tr).is_empty() || !self.dict_parents(tr).is_empty() || !self.own_slots(tr).is_empty()
     }
 
     /// The associated types of a trait reference that its dictionary datatype takes as type
@@ -183,17 +259,16 @@ impl<'tcx> Frontend<'tcx> {
     /// supertraits with dictionaries, in order.
     pub fn dict_slots(&self, r: ty::TraitRef<'tcx>) -> Vec<Ty<'tcx>> {
         let tcx = self.tcx;
-        let mut out: Vec<Ty<'tcx>> = tcx
-            .associated_items(r.def_id)
-            .in_definition_order()
-            .filter(|i| matches!(i.kind, ty::AssocKind::Type { .. }) && tcx.generics_of(i.def_id).own_counts().types == 0 && tcx.opt_rpitit_info(i.def_id).is_none())
+        let mut out: Vec<Ty<'tcx>> = self
+            .own_slots(r.def_id)
+            .into_iter()
             .map(|i| {
-                let own = tcx.generics_of(i.def_id).own_params.len();
+                let own = tcx.generics_of(i).own_params.len();
                 let args = tcx.mk_args_from_iter(
                     r.args.iter().chain((0..own).map(|_| tcx.lifetimes.re_erased.into())),
                 );
                 // with erased regions, as the types the slots stand for in (erased) signatures
-                tcx.erase_and_anonymize_regions(Ty::new_projection(tcx, ty::IsRigid::No, i.def_id, args))
+                tcx.erase_and_anonymize_regions(Ty::new_projection(tcx, ty::IsRigid::No, i, args))
             })
             .collect();
         for p in self.dict_parents(r.def_id) {
@@ -201,6 +276,25 @@ impl<'tcx> Frontend<'tcx> {
             out.extend(self.dict_slots(pr));
         }
         out
+    }
+
+    /// The associated types of `tr` that are slots of its dictionaries (see `is_slot`).
+    pub fn own_slots(&self, tr: DefId) -> Vec<DefId> {
+        self.tcx
+            .associated_items(tr)
+            .in_definition_order()
+            .filter(|i| matches!(i.kind, ty::AssocKind::Type { .. }) && self.is_slot(i.def_id))
+            .map(|i| i.def_id)
+            .collect()
+    }
+
+    /// Is the associated type `at` a slot of its trait's dictionaries: has it no type or const
+    /// parameters of its own (a slot cannot be a type constructor), and is it not the hidden type
+    /// of a method returning `impl Trait`?
+    pub fn is_slot(&self, at: DefId) -> bool {
+        let tcx = self.tcx;
+        tcx.generics_of(at).own_params.iter().all(|p| matches!(p.kind, ty::GenericParamDefKind::Lifetime))
+            && tcx.opt_rpitit_info(at).is_none()
     }
 
     /// The HOL name of the dictionary datatype of `tr` (also the name of its constructor).
@@ -241,7 +335,7 @@ impl<'tcx> Frontend<'tcx> {
             a.push(self.ty(t));
         }
         for s in self.dict_slots(r) {
-            let s = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(s)).unwrap_or(s);
+            let s = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s));
             a.push(self.ty(s));
         }
         format!("({}) {}", a.join(", "), n)
@@ -270,16 +364,58 @@ impl<'tcx> Frontend<'tcx> {
         out
     }
 
+    /// The bounds of the method `m` of its own (its `where` clauses, not those of its trait or
+    /// implementation) that are dictionary parameters (as in `dict_bounds`). A dictionary field of
+    /// a trait method takes them before the method's arguments (see `dict_decl`), as Aeneas's
+    /// method clauses.
+    pub fn own_dict_bounds(&self, m: DefId) -> Vec<ty::TraitRef<'tcx>> {
+        if let Some(bs) = self.own_dict_bounds_memo.borrow().get(&m) {
+            return bs.clone();
+        }
+        let bs = self.find_own_dict_bounds(m);
+        self.own_dict_bounds_memo.borrow_mut().insert(m, bs.clone());
+        bs
+    }
+
+    fn find_own_dict_bounds(&self, m: DefId) -> Vec<ty::TraitRef<'tcx>> {
+        let tcx = self.tcx;
+        let mut out: Vec<ty::TraitRef<'tcx>> = vec![];
+        for (c, _) in tcx.clauses_of(m).instantiate_own_identity() {
+            let Some(p) = c.skip_normalization().as_trait_clause() else { continue };
+            let p = tcx.instantiate_bound_regions_with_erased(p);
+            if p.polarity != ty::ClausePolarity::Positive || !self.has_dict(p.def_id()) {
+                continue;
+            }
+            let r = tcx.erase_and_anonymize_regions(p.trait_ref);
+            if r.args.has_param() && !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     /// The dictionary parameters of the translation `key`, with their names: the bounds (see
-    /// `dict_bounds`) of a generic item, or of the implementation of a default method's copy; an
-    /// instance has none.
+    /// `dict_bounds`) of a generic item, or of the implementation of a default method's copy and
+    /// the method's own bounds (see `own_dict_bounds`) there; an instance has none.
     pub fn dict_params(&self, key: FnKey<'tcx>) -> Vec<(ty::TraitRef<'tcx>, String)> {
-        let owner = match key.1 {
-            Inst::Generic => key.0,
-            Inst::ImplCopy(imp) => imp,
+        let tcx = self.tcx;
+        let bounds = match key.1 {
+            Inst::Generic => self.dict_bounds(key.0),
+            Inst::ImplCopy(imp) => {
+                let mut bs = self.dict_bounds(imp);
+                let at = self.inst_args(key).expect("a copy has the arguments of its implementation");
+                // (those still on types with generic parameters, as in `dict_bounds`)
+                for b in self.own_dict_bounds(key.0) {
+                    let b = tcx.erase_and_anonymize_regions(ty::EarlyBinder::bind(tcx, b).instantiate(tcx, at).skip_normalization());
+                    if b.args.has_param() && !bs.contains(&b) {
+                        bs.push(b);
+                    }
+                }
+                bs
+            }
             Inst::Mono(_) => return vec![],
         };
-        self.dict_bounds(owner)
+        bounds
             .into_iter()
             .enumerate()
             .map(|(k, r)| {
@@ -298,7 +434,7 @@ impl<'tcx> Frontend<'tcx> {
         for (index, ins, ret) in self.fn_bounded_params(owner) {
             let norm = |t: Ty<'tcx>| {
                 let t = tcx.erase_and_anonymize_regions(t);
-                tcx.try_normalize_erasing_regions(ty::TypingEnv::post_analysis(tcx, owner), ty::Unnormalized::new_wip(t)).unwrap_or(t)
+                crate::frontend::normalize(tcx, ty::TypingEnv::post_analysis(tcx, owner), ty::Unnormalized::new_wip(t))
             };
             let ps: Vec<String> = ins.iter().map(|t| self.ty(norm(*t))).collect();
             let r = self.ty(norm(ret));
@@ -364,8 +500,15 @@ impl<'tcx> Frontend<'tcx> {
             return;
         }
         done.push(tr);
+        // the datatypes of the dictionaries in its fields first: of its supertraits and associated
+        // type bounds, and of its methods' own bounds
         for p in self.dict_parents(tr) {
             self.dict_order(p.def_id, done, order);
+        }
+        for m in self.dict_methods(tr) {
+            for b in self.own_dict_bounds(m) {
+                self.dict_order(b.def_id, done, order);
+            }
         }
         order.push(tr);
     }
@@ -387,10 +530,7 @@ impl<'tcx> Frontend<'tcx> {
         let map: HashMap<ty::AliasTy<'tcx>, String> = slots
             .iter()
             .zip(slot_vars.iter())
-            .filter_map(|(s, v)| match s.kind() {
-                ty::Alias(_, a) => Some((*a, v.clone())),
-                _ => None,
-            })
+            .map(|(s, v)| (self.proj_key(*s).expect("slots are projections"), v.clone()))
             .collect();
         self.proj_tvars = Some(map);
         let mut fields = vec![];
@@ -399,7 +539,13 @@ impl<'tcx> Frontend<'tcx> {
             let ps: Vec<String> = sig.inputs().iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(*t))).collect();
             let ret = self.ty(tcx.erase_and_anonymize_regions(sig.output()));
             let f = self.dict_field(tr, m);
-            fields.push((f, self.fun_type(&ps, &ret)));
+            let menv = ty::TypingEnv::post_analysis(tcx, m);
+            let mut t = String::new();
+            for b in self.own_dict_bounds(m) {
+                t.push_str(&format!("{} \\<Rightarrow> ", paren_ty(&self.dict_type(b, menv))));
+            }
+            t.push_str(&self.fun_type(&ps, &ret));
+            fields.push((f, t));
         }
         let env = ty::TypingEnv::post_analysis(tcx, tr);
         for (k, p) in self.dict_parents(tr).into_iter().enumerate() {

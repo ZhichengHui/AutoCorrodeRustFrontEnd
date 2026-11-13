@@ -9,10 +9,11 @@ use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
+use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 
 use crate::body::{BodyTr, Unsup};
-use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, one_line, paren_ty};
+use crate::frontend::{ExtFun, FnKey, Frontend, FunDef, Inst, field_ty, mentions_adt, one_line, paren_ty};
 use crate::names;
 
 pub struct Options {
@@ -205,6 +206,17 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
             fe.item_placeholder("function with const generic parameters (not called at constant arguments)", tcx.def_span(d));
         }
     }
+    // a default method without copies or instances (not a dictionary field, and not called at a
+    // concrete type) is translated once, generically: in `Self` and the trait's parameters, with
+    // the dictionaries of the trait and of its own bounds (as Aeneas does)
+    for d in default_methods {
+        if !fe.fun_defs.iter().any(|f| f.key.0 == d) {
+            translate_item(&mut fe, (d, Inst::Generic));
+            while let Some(key) = fe.pending.pop() {
+                translate_item(&mut fe, key);
+            }
+        }
+    }
 
     let (funs_text, alloc_decls) = emit_funs(&mut fe);
     let types_text = types_text + &fe.dict_decls() + &alloc_decls;
@@ -254,35 +266,78 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
             fe.item_placeholder(what, tcx.def_span(d));
         }
     };
+    let own_types = |d: DefId| -> Vec<Ty<'_>> { ty::GenericArgs::identity_for_item(tcx, d).types().collect() };
+    // the generic arguments of `d` that are the `k`-th type parameters of `e` at its `k`-th ones
+    // (the members of a group share their type parameters by position, see `emit_types`)
+    let at_params_of = |d: DefId, e: DefId| {
+        let tys = own_types(e);
+        let mut k = 0;
+        ty::GenericArgs::for_item(tcx, d, |p, _| match p.kind {
+            ty::GenericParamDefKind::Type { .. } => {
+                k += 1;
+                tys[k - 1].into()
+            }
+            _ => tcx.lifetimes.re_erased.into(),
+        })
+    };
     // associated types of an ADT's type parameters in its fields (`S::Unit` in
-    // `struct H<S: Shape> { u: S::Unit }`) become extra type parameters of its datatype; the
+    // `struct H<S: Shape> { u: S::Unit }`, normalised in its typing environment) become extra
+    // type parameters of its datatype; the members of a recursive group share them (the union of
+    // theirs, at the group's type parameters, in order), as they share their type parameters. The
     // groups come after the ADTs they use
     for comp in &adt_sccs {
+        // external ADTs in the fields first: their datatypes may take associated types too
         for &d in comp {
-            // external ADTs in the fields first: their datatypes may take associated types too
             fe.register_ext_adts(&fields[&d]);
-            let ps = fe.projections(d, &fields[&d]);
+        }
+        if comp.len() == 1 {
+            let ps = fe.projections(comp[0], &fields[&comp[0]]);
             if !ps.is_empty() {
-                fe.adt_projs.insert(d, ps);
+                fe.adt_projs.insert(comp[0], ps);
             }
+            continue;
+        }
+        // (members with other numbers of type parameters make the group a placeholder, see below;
+        // const parameters are not shared by position)
+        let shareable = comp.iter().all(|&d| {
+            own_types(d).len() == own_types(comp[0]).len()
+                && tcx.generics_of(d).own_params.iter().all(|p| !matches!(p.kind, ty::GenericParamDefKind::Const { .. }))
+        });
+        if !shareable {
+            if comp.iter().any(|&d| !fe.projections(d, &fields[&d]).is_empty()) {
+                opaque(
+                    fe,
+                    comp,
+                    "mutually recursive with associated types",
+                    "mutually recursive type with an associated type of a type parameter in a field, and with members of other generic parameters (declared as an abstract type)",
+                );
+            }
+            continue;
+        }
+        let mut union: Vec<Ty<'tcx>> = vec![];
+        for &d in comp {
+            for p in fe.projections(d, &fields[&d]) {
+                let q = ty::EarlyBinder::bind(tcx, p).instantiate(tcx, at_params_of(d, comp[0])).skip_normalization();
+                let key = fe.proj_key(q);
+                if !union.iter().any(|u| fe.proj_key(*u) == key) {
+                    union.push(q);
+                }
+            }
+        }
+        if union.is_empty() {
+            continue;
+        }
+        for &d in comp {
+            let back = at_params_of(comp[0], d);
+            let ps = union.iter().map(|u| ty::EarlyBinder::bind(tcx, *u).instantiate(tcx, back).skip_normalization()).collect();
+            fe.adt_projs.insert(d, ps);
         }
     }
     // the datatypes of a HOL `datatype ... and ...` have the same type parameters, and each recurs
     // with exactly these, in order (`emit_types` names them after the first member): a group of
-    // ADTs with different numbers of type parameters, or in which an ADT `d` refers to a member
-    // with other type arguments than `d`'s own parameters, is a placeholder
-    let own_types = |d: DefId| -> Vec<Ty<'_>> { ty::GenericArgs::identity_for_item(tcx, d).types().collect() };
+    // ADTs with different numbers of type parameters (or const parameters), or in which an ADT `d`
+    // refers to a member with other type arguments than `d`'s own parameters, is a placeholder
     for comp in &adt_sccs {
-        // the members of a group would have to share their extra type parameters (see `adt_projs`)
-        if comp.len() > 1 && comp.iter().any(|d| fe.adt_projs.contains_key(d)) {
-            opaque(
-                fe,
-                comp,
-                "mutually recursive with associated types",
-                "mutually recursive type with an associated type of a type parameter in a field (declared as an abstract type)",
-            );
-            continue;
-        }
         let arity = own_types(comp[0]).len();
         let nonuniform = comp.iter().any(|&d| {
             let own = own_types(d);
@@ -478,37 +533,58 @@ fn proj_tvar(k: usize) -> String {
     format!("'proj{}", k)
 }
 
-fn alias_of(t: Ty<'_>) -> ty::AliasTy<'_> {
-    match t.kind() {
-        ty::Alias(_, a) => *a,
-        _ => unreachable!("projections are aliases"),
+/// The type variables of the associated types in a generic item (as in Aeneas): the slots of its
+/// dictionaries (see `Frontend::dict_slots`), normalised in its typing environment `env`. A slot that
+/// normalises to a type (`Item = u8` in a bound) is that type; the others are rigid projections,
+/// one variable each (as normalised, so that two ways of writing an associated type that the
+/// bounds make equal, e.g. `<I::IntoIter as Iterator>::Item` and `I::Item`, are one variable). A
+/// projection in the signature or the body, normalised in `env` (see `Frontend::ty`), is one of them:
+/// naming one needs a bound, whose dictionary parameter is in the signature, so that every variable
+/// occurs in the signature. A projection in the signature (or in the types of its `Fn` bounds, see
+/// `Frontend::fn_param_types`) that is no slot is a variable of its own: one of a generic
+/// associated type with type or const parameters (`F::Of<u32>`; a slot cannot be a type
+/// constructor), or one reached through an associated type bound that is no dictionary field (see
+/// `Frontend::dict_parents`, e.g. `<N::Child as Node>::Child` for `type Child: Node`).
+fn slot_tvars<'tcx>(
+    fe: &Frontend<'tcx>,
+    dicts: &[(ty::TraitRef<'tcx>, String)],
+    owner: DefId,
+    sig_tys: &[Ty<'tcx>],
+    env: ty::TypingEnv<'tcx>,
+) -> HashMap<ty::AliasTy<'tcx>, String> {
+    let tcx = fe.tcx;
+    let norm = |t: Ty<'tcx>| {
+        let t = tcx.erase_and_anonymize_regions(t);
+        crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(t))
+    };
+    let slots = dicts.iter().flat_map(|(r, _)| fe.dict_slots(*r)).map(norm);
+    let mut sig: Vec<Ty<'tcx>> = sig_tys.to_vec();
+    for (_, ins, ret) in fe.fn_bounded_params(owner) {
+        sig.extend(ins.into_iter().chain([ret]).map(norm));
     }
-}
-
-/// A generic function is a HOL constant polymorphic also in the associated types of its type
-/// parameters in its signature (`T::Output` in `fn first<T: Index<usize>>(x: &T) -> &T::Output`):
-/// they are type variables, which each instance fixes (`Output = u32` at `T = Buf`). Independent
-/// variables cannot express that two associated types of the same type are equal through an
-/// implementation (e.g. `<T as IntoIterator>::Item` and `<T as Iterator>::Item`), so with two of
-/// them the signature's types are not modelled. One occurring only in the body is not a variable
-/// (it would be an extra type variable of the definition).
-fn proj_tvars<'tcx>(fe: &Frontend<'tcx>, did: DefId, sig_tys: &[Ty<'tcx>]) -> Option<HashMap<ty::AliasTy<'tcx>, String>> {
-    let ps: Vec<ty::AliasTy<'tcx>> = fe.projections(did, sig_tys).into_iter().map(alias_of).collect();
-    let selves: Vec<Ty<'tcx>> = ps.iter().filter(|a| a.try_to_projection().is_some()).map(|a| a.args.type_at(0)).collect();
-    if (1..selves.len()).all(|i| !selves[..i].contains(&selves[i])) {
-        Some(ps.into_iter().enumerate().map(|(k, a)| (a, proj_tvar(k))).collect())
-    } else {
-        None
+    let others = fe.projections(owner, &sig);
+    let mut out: HashMap<ty::AliasTy<'tcx>, String> = HashMap::new();
+    for n in slots.chain(others) {
+        if let ty::Alias(_, a) = n.kind()
+            && matches!(a.kind, ty::AliasTyKind::Projection { .. })
+            && let Some(k) = fe.proj_key(n)
+            && !out.contains_key(&k)
+        {
+            let v = proj_tvar(out.len());
+            out.insert(k, v);
+        }
     }
+    out
 }
 
 /// Translate the function or constant `key` and record its definition.
 fn translate_item<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) {
     let mut fd = translate_fn(fe, key);
-    // the projections' type variables (see `proj_tvars`) and the function types of `Fn`-bounded
+    // the projections' type variables (see `slot_tvars`) and the function types of `Fn`-bounded
     // parameters are those of one definition; they are kept for its allocation record (see
     // `alloc_sets`)
     fd.proj_ctx = fe.proj_tvars.take();
+    fe.proj_env = None;
     fd.fn_ctx = std::mem::take(&mut fe.fn_params);
     fe.fun_defs.push(fd);
 }
@@ -534,23 +610,10 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
         if !matches!(key.1, Inst::Mono(_)) {
             fe.register_ext_adts(&tys);
-            // the associated types of the dictionaries' slots are type variables too
             let env = fe.inst_env(key);
-            let mut all = tys.clone();
-            for (r, _) in &dicts {
-                all.extend(fe.dict_slots(*r).into_iter().map(|t| {
-                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
-                }));
-            }
-            // and so are those in the types of the `Fn` bounds (see `Frontend::fn_param_types`)
             let owner = match key.1 { Inst::ImplCopy(imp) => imp, _ => did };
-            for (_, ins, ret) in fe.fn_bounded_params(owner) {
-                all.extend(ins.into_iter().chain([ret]).map(|t| {
-                    let t = tcx.erase_and_anonymize_regions(t);
-                    tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(t)).unwrap_or(t)
-                }));
-            }
-            fe.proj_tvars = proj_tvars(fe, owner, &all);
+            fe.proj_tvars = Some(slot_tvars(fe, &dicts, owner, &tys, env));
+            fe.proj_env = Some(env);
             fe.fn_params = fe.fn_param_types(owner);
         }
         let (out, ins) = tys.split_last().expect("a signature has an output");
@@ -572,6 +635,7 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         ret_ty,
         params: vec![],
         body: String::new(),
+        data: None,
         calls: crate::frontend::DefSet::default(),
         comments: vec![],
         n_dicts: dicts.len(),
@@ -620,6 +684,10 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         fn_placeholder(fe, &mut fd, "item without body");
         return fd;
     }
+    if let Some(data) = const_data(fe, did) {
+        fd.data = Some(data);
+        return fd;
+    }
     let body = tcx.hir_body_owned_by(ld);
     let mut bt = BodyTr::new(fe, key);
     let res = bt.fn_body(body);
@@ -635,6 +703,114 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         Err(Unsup(m)) => fn_placeholder(fe, &mut fd, &m),
     }
     fd
+}
+
+/// The value of the constant `did`, computed by rustc's const evaluation, as the data of an
+/// `urust_const_data` definition (a HOL value, elaborated against the constant's HOL type): the
+/// HOL term of a large table (e.g. an array of thousands of elements) written as an initialiser
+/// expression takes Isabelle's parser and type inference superlinear time. Only free, non-generic
+/// constants are evaluated (see below). `None` when the
+/// evaluation fails or the value contains a part without a data form (see `value_data`): the
+/// constant is then translated from its initialiser.
+fn const_data<'tcx>(fe: &mut Frontend<'tcx>, did: DefId) -> Option<String> {
+    let tcx = fe.tcx;
+    // a free constant (not an associated one: rustc does not evaluate an unused associated
+    // constant, and its evaluation's failure would be a compilation error here)
+    if !matches!(tcx.def_kind(did), DefKind::Const) || tcx.generics_of(did).requires_monomorphization(tcx) {
+        return None;
+    }
+    let val = tcx.const_eval_poly(did).ok()?;
+    let t = tcx.type_of(did).instantiate_identity().skip_normalization();
+    let t = tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), ty::Unnormalized::new_wip(t)).ok()?;
+    let mut out = String::new();
+    value_data(fe, val, t, &mut out)?;
+    Some(out)
+}
+
+/// Append the HOL value of the constant value `val` of type `t` (see `Frontend::ty`) to `out`:
+/// integers as numbers, `bool` as `True` / `False`, arrays as lists, tuples as tuples ending in
+/// `TNil`, `()` as `()`, `Option` and `Result` by their HOL constructors, and local ADTs (not
+/// unions, not declared as abstract types) by their datatype constructors. Anything else
+/// (floats, `char`, references, pointers, other external or standard library types, ...) has
+/// no data form: `None`.
+fn value_data<'tcx>(fe: &mut Frontend<'tcx>, val: ConstValue, t: Ty<'tcx>, out: &mut String) -> Option<()> {
+    let tcx = fe.tcx;
+    // the fields of an aggregate value (array elements, tuple components, a variant's fields)
+    let fields = |val: ConstValue| tcx.try_destructure_mir_constant_for_user_output(val, t);
+    let list = |fe: &mut Frontend<'tcx>, fs: &[(ConstValue, Ty<'tcx>)], out: &mut String| -> Option<()> {
+        for (i, &(v, ft)) in fs.iter().enumerate() {
+            if i > 0 {
+                // lines of bounded length
+                let line = out.len() - out.rfind('\n').map_or(0, |k| k + 1);
+                out.push_str(if line > 100 { ",\n    " } else { ", " });
+            }
+            value_data(fe, v, ft, out)?;
+        }
+        Some(())
+    };
+    match t.kind() {
+        ty::Bool => out.push_str(if val.try_to_bool()? { "True" } else { "False" }),
+        ty::Int(_) | ty::Uint(_) => {
+            let s = val.try_to_scalar_int()?;
+            let bits = s.to_bits(s.size());
+            if t.is_signed() {
+                let shift = 128 - s.size().bits();
+                write!(out, "{}", (bits as i128) << shift >> shift).unwrap();
+            } else {
+                write!(out, "{}", bits).unwrap();
+            }
+        }
+        ty::Tuple(ts) if ts.is_empty() => out.push_str("()"),
+        // `(a, b)` is `a × b × tnil` (see `Frontend::ty`)
+        ty::Tuple(_) => {
+            out.push('(');
+            list(fe, fields(val)?.fields, out)?;
+            out.push_str(", TNil)");
+        }
+        ty::Array(..) => {
+            out.push('[');
+            list(fe, fields(val)?.fields, out)?;
+            out.push(']');
+        }
+        ty::Adt(def, _) => {
+            let adt = def.did();
+            if def.is_union() || fe.opaque_adts.contains_key(&adt) {
+                return None;
+            }
+            let local = match fe.std_adt(adt) {
+                Some("Option") | Some("Result") => false,
+                Some(_) => return None,
+                None if adt.is_local() => true,
+                None => return None,
+            };
+            let d = fields(val)?;
+            let vidx = d.variant.expect("an ADT value has a variant");
+            let name = if local {
+                fe.variant_ctor_name(adt, vidx.as_usize())
+            } else {
+                let vdid = def.variant(vidx).def_id;
+                let item = [LangItem::OptionSome, LangItem::OptionNone, LangItem::ResultOk, LangItem::ResultErr]
+                    .into_iter()
+                    .find(|&i| tcx.is_lang_item(vdid, i))
+                    .expect("a variant of Option or Result is a lang item");
+                match item {
+                    LangItem::OptionSome => "Some",
+                    LangItem::OptionNone => "None",
+                    LangItem::ResultOk => "Ok",
+                    _ => "Err",
+                }
+                .to_string()
+            };
+            out.push_str(&name);
+            if !d.fields.is_empty() {
+                out.push('(');
+                list(fe, d.fields, out)?;
+                out.push(')');
+            }
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 // ----------------------------------------------------------------------
@@ -682,10 +858,17 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             });
             let (own, env) = (ty::GenericArgs::identity_for_item(tcx, d), ty::TypingEnv::post_analysis(tcx, d));
             let shared_field_ty = |f: &ty::FieldDef| ty::EarlyBinder::bind(tcx, field_ty(tcx, f, own, env)).instantiate(tcx, to_shared).skip_normalization();
-            // a group with associated types in fields has one member (see `run`)
+            // the members of a group share their projections' type parameters (see `collect_adts`);
+            // the field types are at the group's parameters, and so are the projections and the
+            // typing environment (`d`'s bounds there) in which the ADTs in them are normalised
+            let at_shared = |p: Ty<'tcx>| ty::EarlyBinder::bind(tcx, p).instantiate(tcx, to_shared).skip_normalization();
             let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
-            fe.proj_tvars = Some(projs.into_iter().map(alias_of).zip(proj_names.iter().cloned()).collect());
+            fe.proj_tvars = Some(
+                projs.into_iter().map(|p| fe.proj_key(at_shared(p)).expect("projections are aliases")).zip(proj_names.iter().cloned()).collect(),
+            );
+            let bounds = tcx.param_env(d).caller_bounds().map(|c| ty::EarlyBinder::bind(tcx, c).instantiate(tcx, to_shared).skip_normalization());
+            fe.proj_env = Some(ty::TypingEnv::new(ty::ParamEnv::new(tcx, bounds), ty::TypingMode::non_body_analysis()).with_post_analysis_normalized(tcx));
             let has_const = tcx.generics_of(d).own_params.iter().any(|p| matches!(p.kind, ty::GenericParamDefKind::Const { .. }));
             let mut tparams = tparams.clone();
             tparams.extend(proj_names);
@@ -704,6 +887,13 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 writeln!(out, "(* {} *)\ntypedecl {}\n", cmt(&m), head).unwrap();
                 continue;
             }
+            // an enum without fields has no type parameters (they would be unused), hence no
+            // others in its group
+            if let Some((width, vals)) = fe.word_enum(d, &tn) {
+                let ctors: Vec<String> = (0..def.variants().len()).map(|vi| fe.variant_ctor_name(d, vi)).collect();
+                out.push_str(&word_enum_decl(&tn, width, &ctors, &vals));
+                continue;
+            }
             if def.is_enum() && def.variants().iter().any(|v| matches!(v.discr, ty::VariantDiscr::Explicit(_))) {
                 let m = fe.placeholder("explicit enum discriminants (dropped)", Some(tcx.def_span(d)));
                 writeln!(out, "(* {} *)", cmt(&m)).unwrap();
@@ -715,7 +905,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                 if v.fields.is_empty() {
                     decls.push(format!("{} = make_{}", head, tn));
                 } else if fe.record_adts.contains(&d) {
-                    let mut s = format!("datatype_record {} =\n", head);
+                    let mut s = format!("scalable_datatype_record {} =\n", head);
                     for (n, t) in fnames.iter().zip(ftys.iter()) {
                         writeln!(s, "  {} :: {}", n, cart(t)).unwrap();
                     }
@@ -740,16 +930,73 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
                         after.push_str(&ctor_fun(&format!("{}_mk", cn), &cn, &ftys, &head));
                     }
                 }
-                decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+                // a monomorphic enum that is not recursive (alone in its group, not in its own
+                // fields) is an `enum`, whose declaration scales with the number of variants
+                let fields: Vec<Ty<'tcx>> = def.all_fields().map(|f| field_ty(tcx, f, own, env)).collect();
+                if comp.len() == 1 && tparams.is_empty() && !mentions_adt(&fields, d) {
+                    out.push_str(&enum_decl(&head, &ctors));
+                } else {
+                    decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+                }
             }
         }
         fe.proj_tvars = None;
+        fe.proj_env = None;
         if !decls.is_empty() {
             writeln!(out, "datatype {}\n", decls.join("\nand ")).unwrap();
         }
         out.push_str(&after);
     }
     out
+}
+
+/// The `simple_word_enum` declaration of the enum `name` (see `Frontend::word_enum`): each
+/// constructor is its discriminant, a word of the given width. The plugin `word_conversion`
+/// would define functions `name_to_uN`, `name_try_from_uN`, whose names may be taken by
+/// translated functions (the frontend does not use them).
+fn word_enum_decl(name: &str, width: u64, ctors: &[String], vals: &[u128]) -> String {
+    let vs: Vec<String> = ctors.iter().zip(vals).map(|(c, v)| format!("{} = {}", c, v)).collect();
+    format!("simple_word_enum (plugins del: word_conversion) ({}) {} =\n    {}\n\n", width, name, vs.join("\n  | "))
+}
+
+/// Among the external types `left` (each depending on another of them), types using each other
+/// whose dependencies in `left` are all among themselves: a strongly connected component of the
+/// dependencies with no dependency on another component, found by moving from a type to a
+/// dependency outside its component.
+fn ext_cycle<'a>(fe: &Frontend<'_>, left: &[&'a String]) -> Vec<&'a String> {
+    let deps = |n: &String| -> Vec<&'a String> {
+        fe.ext_types[n].deps.iter().filter_map(|d| left.iter().copied().find(|m| *m == d)).collect()
+    };
+    let reach = |n: &'a String| -> Vec<&'a String> {
+        let mut seen = vec![n];
+        let mut todo = vec![n];
+        while let Some(m) = todo.pop() {
+            for d in deps(m) {
+                if !seen.contains(&d) {
+                    seen.push(d);
+                    todo.push(d);
+                }
+            }
+        }
+        seen
+    };
+    let mut n = left[0];
+    loop {
+        let from_n = reach(n);
+        let comp: Vec<&String> = from_n.iter().copied().filter(|m| reach(m).contains(&n)).collect();
+        match from_n.iter().copied().find(|m| !comp.contains(m)) {
+            Some(below) => n = below,
+            None => return comp,
+        }
+    }
+}
+
+/// The `enum` declaration (AutoCorrode, `Enum_Theory`) of a monomorphic enum that is not
+/// recursive, with the given constructors (each with its argument types): unlike a `datatype`,
+/// it does not prove a theorem per pair of constructors, so its declaration scales with the number
+/// of variants.
+fn enum_decl(head: &str, ctors: &[String]) -> String {
+    format!("enum {} =\n    {}\n\n", head, ctors.join("\n  | "))
 }
 
 /// Constructor function `NAME = (λa0 .. an. FunctionBody (literal (CTOR a0 .. an)))`.
@@ -779,34 +1026,219 @@ fn ctor_fun(name: &str, ctor: &str, ftys: &[String], self_ty: &str) -> String {
 
 /// The markers (`\u{1}<kind><n>\u{2}`) in `text`, with those in the dictionaries and arguments of
 /// the generic calls among them (see `GenCall`), transitively.
-fn markers_in(fe: &Frontend<'_>, text: &str, out: &mut Vec<(char, usize)>) {
+/// The markers in `text` (with those in the arguments of its calls), except the calls in `poly`
+/// (see `poly_rec_calls`), which are not emitted.
+fn markers_in(fe: &Frontend<'_>, text: &str, poly: &HashSet<usize>, out: &mut Vec<(char, usize)>) {
     let mut rest = text;
     while let Some(i) = rest.find('\u{1}') {
         let j = rest[i..].find('\u{2}').expect("a marker is closed") + i;
         let kind = rest[i + 1..].chars().next().expect("a marker has a kind");
         let n: usize = rest[i + 2..j].parse().expect("a marker has an index");
+        rest = &rest[j + 1..];
+        if matches!(kind, 'F' | 'V') && poly.contains(&n) {
+            continue;
+        }
         out.push((kind, n));
         if matches!(kind, 'F' | 'V') {
             let c = &fe.gen_calls[n];
             for t in c.dicts.iter().chain(c.args.iter().flatten()) {
-                markers_in(fe, t, out);
+                markers_in(fe, t, poly, out);
             }
         }
-        rest = &rest[j + 1..];
     }
 }
 
-/// Allocation records beyond this size are not built (polymorphic recursion would make them grow
-/// without bound).
-const MAX_ALLOCS: usize = 64;
+/// The calls of generic functions within recursive groups that HOL cannot define: a group is one
+/// definition (see `emit_funs`), in which each member is used at one type, so a call within the
+/// group must rename the callee's type parameters to the caller's, consistently over the group
+/// (one class of the renaming has at most one parameter of each member). A call at other type
+/// arguments (`f::<Vec<T>>` in `f<T>`, or at concrete types) is polymorphic recursion. Without such
+/// calls the allocation records (see `alloc_sets`) are finite: their types grow only along cycles.
+fn poly_rec_calls<'tcx>(fe: &Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> (HashSet<usize>, HashMap<FnKey<'tcx>, Renaming<'tcx>>) {
+    let ids: Vec<FnKey<'tcx>> = defs.iter().map(|d| d.key).collect();
+    let by_id: HashMap<FnKey<'tcx>, usize> = defs.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+    let succ = |d: FnKey<'tcx>| -> Vec<FnKey<'tcx>> { defs[by_id[&d]].calls.iter().copied().collect() };
+    let mut poly = HashSet::new();
+    let mut renamings = HashMap::new();
+    for comp in sccs(&ids, &succ) {
+        let group: HashSet<FnKey<'tcx>> = comp.iter().copied().collect();
+        // union-find over (member, type parameter index); each class lists its members
+        let mut uf = Renaming::default();
+        for &caller in &comp {
+            let mut ms = vec![];
+            markers_in(fe, &defs[by_id[&caller]].body, &poly, &mut ms);
+            for (kind, n) in ms {
+                if !matches!(kind, 'F' | 'V') || !group.contains(&fe.gen_calls[n].callee) {
+                    continue;
+                }
+                let (callee, kargs) = (fe.gen_calls[n].callee, fe.gen_calls[n].kargs);
+                let renaming: Option<Vec<(u32, u32)>> = kargs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, a)| a.as_type().map(|t| (i as u32, t)))
+                    .map(|(i, t)| match (t.kind(), caller.1) {
+                        (ty::Param(p), Inst::Generic | Inst::ImplCopy(_)) => Some((i, p.index)),
+                        _ => None,
+                    })
+                    .collect();
+                // the call's renaming is added only if all of it is consistent
+                let consistent = renaming.is_some_and(|r| {
+                    let mut tried = uf.clone();
+                    let ok = r.into_iter().all(|(i, j)| tried.unite((callee, i), (caller, j)));
+                    if ok {
+                        uf = tried;
+                    }
+                    ok
+                });
+                if !consistent {
+                    poly.insert(n);
+                }
+            }
+        }
+        for &m in &comp {
+            renamings.insert(m, uf.clone());
+        }
+    }
+    (poly, renamings)
+}
+
+/// For each member of the recursive group `members` (see `emit_funs`), the renaming of its HOL
+/// type variables in the group's definition: the type parameters that the group's calls rename into
+/// each other (see `Renaming`) are one variable, others are distinct ones; the projections' type
+/// variables (see `slot_tvars`) are one where their projections are one at those parameters.
+fn group_tvars<'tcx>(fe: &Frontend<'tcx>, members: &[&FunDef<'tcx>], uf: &mut Renaming<'tcx>) -> Vec<HashMap<String, String>> {
+    let tcx = fe.tcx;
+    let mut used: HashSet<String> = HashSet::new();
+    let mut class_name: HashMap<usize, (String, u32)> = HashMap::new();
+    let fresh = |base: &str, used: &mut HashSet<String>| {
+        let mut n = base.to_string();
+        let mut k = 0;
+        while used.contains(&n) {
+            k += 1;
+            n = format!("{}{}", base, k);
+        }
+        used.insert(n.clone());
+        n
+    };
+    let mut proj_names: HashMap<ty::AliasTy<'tcx>, String> = HashMap::new();
+    let mut out = vec![];
+    for d in members {
+        let mut map = HashMap::new();
+        let owner = match d.key.1 {
+            Inst::Generic => d.key.0,
+            Inst::ImplCopy(imp) => imp,
+            Inst::Mono(_) => {
+                out.push(map);
+                continue;
+            }
+        };
+        // the group's variable of each type parameter (as a parameter type, for the projections)
+        let ident = ty::GenericArgs::identity_for_item(tcx, owner);
+        let mut at_group = vec![];
+        for (i, a) in ident.iter().enumerate() {
+            let ty::GenericArgKind::Type(t) = a.kind() else {
+                at_group.push(a);
+                continue;
+            };
+            let ty::Param(p) = t.kind() else { unreachable!("identity arguments are parameters") };
+            let old = names::tvar_name(p.name.as_str());
+            let c = uf.class_of((d.key, i as u32));
+            let (new, gid) = match class_name.get(&c) {
+                Some(x) => x.clone(),
+                None => {
+                    let x = (fresh(&old, &mut used), class_name.len() as u32);
+                    class_name.insert(c, x.clone());
+                    x
+                }
+            };
+            // (a `Fn`-bounded parameter is a function type, not a variable, see `Frontend::ty`)
+            if !d.fn_ctx.contains_key(&(i as u32)) {
+                map.insert(old, new.clone());
+            }
+            at_group.push(Ty::new_param(tcx, gid, rustc_span::Symbol::intern(&new)).into());
+        }
+        let at_group = tcx.mk_args(&at_group);
+        // (in the order of their variables, for a deterministic numbering)
+        let mut projs: Vec<(&ty::AliasTy<'tcx>, &String)> = d.proj_ctx.iter().flatten().collect();
+        projs.sort_by_key(|(_, v)| v[5..].parse::<usize>().expect("projection variables are 'projN"));
+        for (a, v) in projs {
+            let t = ty::EarlyBinder::bind(tcx, Ty::new_alias(tcx, ty::IsRigid::No, *a)).instantiate(tcx, at_group).skip_normalization();
+            let key = fe.proj_key(t).expect("projections are aliases");
+            let n = proj_names.len();
+            let new = proj_names.entry(key).or_insert_with(|| format!("'proj{}", n)).clone();
+            map.insert(v.clone(), new);
+        }
+        out.push(map);
+    }
+    out
+}
+
+/// `s` with its HOL type variables renamed by `map` (simultaneously).
+fn rename_tvars(s: &str, map: &HashMap<String, String>) -> String {
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            let tok = &s[i..j];
+            out.push_str(map.get(tok).map(|x| x.as_str()).unwrap_or(tok));
+            i = j;
+        } else {
+            let c = s[i..].chars().next().expect("in the string");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// Classes of type parameters (member, index) of a recursive group that its calls rename into
+/// each other (see `poly_rec_calls`), with the members each class has parameters of.
+#[derive(Clone, Default)]
+struct Renaming<'tcx> {
+    class: HashMap<(FnKey<'tcx>, u32), usize>,
+    members: Vec<Vec<FnKey<'tcx>>>,
+}
+
+impl<'tcx> Renaming<'tcx> {
+    fn class_of(&mut self, k: (FnKey<'tcx>, u32)) -> usize {
+        let members = &mut self.members;
+        *self.class.entry(k).or_insert_with(|| {
+            members.push(vec![k.0]);
+            members.len() - 1
+        })
+    }
+
+    /// Put `x` and `y` in one class, unless that would rename two parameters of a member into
+    /// each other.
+    fn unite(&mut self, x: (FnKey<'tcx>, u32), y: (FnKey<'tcx>, u32)) -> bool {
+        let (a, b) = (self.class_of(x), self.class_of(y));
+        if a == b {
+            return true;
+        }
+        if self.members[a].iter().any(|m| self.members[b].contains(m)) {
+            return false;
+        }
+        let moved = std::mem::take(&mut self.members[b]);
+        self.members[a].extend(moved);
+        for c in self.class.values_mut() {
+            if *c == b {
+                *c = a;
+            }
+        }
+        true
+    }
+}
 
 /// The allocation records (see `BodyTr::alloc`): for each translation, the types with generic
 /// parameters of the cells allocated by its body and by the generic functions it calls (at its
-/// generic parameters), with their HOL types, in order; and the translations whose record would
-/// exceed `MAX_ALLOCS`.
+/// generic parameters), with their HOL types, in order.
 struct Allocs<'tcx> {
     sets: HashMap<FnKey<'tcx>, Vec<(Ty<'tcx>, String)>>,
-    overflow: HashSet<FnKey<'tcx>>,
     /// the datatypes' names
     names: HashMap<FnKey<'tcx>, String>,
 }
@@ -822,26 +1254,29 @@ impl<'tcx> Allocs<'tcx> {
 fn at_call<'tcx>(fe: &Frontend<'tcx>, caller: FnKey<'tcx>, kargs: ty::GenericArgsRef<'tcx>, t: Ty<'tcx>) -> Ty<'tcx> {
     let tcx = fe.tcx;
     let x = ty::EarlyBinder::bind(tcx, t).instantiate(tcx, kargs);
-    tcx.erase_and_anonymize_regions(tcx.try_normalize_erasing_regions(fe.inst_env(caller), x).unwrap_or_else(|_| x.skip_normalization()))
+    tcx.erase_and_anonymize_regions(crate::frontend::normalize(tcx, fe.inst_env(caller), x))
 }
 
 /// The HOL type of `t` in the context of the definition `d` (its projections' type variables and
 /// `Fn`-bounded parameters).
 fn hol_in<'tcx>(fe: &mut Frontend<'tcx>, d: &FunDef<'tcx>, t: Ty<'tcx>) -> String {
-    let saved = (fe.proj_tvars.take(), std::mem::take(&mut fe.fn_params));
+    // (and its typing environment, in which the ADTs' projection arguments are normalised to its
+    // projections, as when it was translated, see `translate_fn`)
+    let env = (!matches!(d.key.1, Inst::Mono(_))).then(|| fe.inst_env(d.key));
+    let saved = (fe.proj_tvars.take(), std::mem::take(&mut fe.fn_params), std::mem::replace(&mut fe.proj_env, env));
     fe.proj_tvars = d.proj_ctx.clone();
     fe.fn_params = d.fn_ctx.clone();
     let h = fe.ty(t);
-    (fe.proj_tvars, fe.fn_params) = saved;
+    (fe.proj_tvars, fe.fn_params, fe.proj_env) = saved;
     h
 }
 
-fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'tcx> {
+fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>], poly: &HashSet<usize>) -> Allocs<'tcx> {
     let mut sets: HashMap<FnKey<'tcx>, Vec<(Ty<'tcx>, String)>> = HashMap::new();
     let mut calls: Vec<Vec<usize>> = vec![];
     for d in defs {
         let mut ms = vec![];
-        markers_in(fe, &d.body, &mut ms);
+        markers_in(fe, &d.body, poly, &mut ms);
         let set = sets.entry(d.key).or_default();
         for &(k, n) in &ms {
             if k == 'A' {
@@ -853,7 +1288,6 @@ fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'t
         }
         calls.push(ms.iter().filter(|(k, _)| matches!(k, 'F' | 'V')).map(|&(_, n)| n).collect());
     }
-    let mut overflow = HashSet::new();
     loop {
         let mut changed = false;
         for (d, cs) in defs.iter().zip(&calls) {
@@ -863,10 +1297,6 @@ fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'t
                 for t in needed {
                     let ti = at_call(fe, d.key, kargs, t);
                     if !ti.has_param() || sets[&d.key].iter().any(|(u, _)| *u == ti) {
-                        continue;
-                    }
-                    if sets[&d.key].len() >= MAX_ALLOCS {
-                        overflow.insert(d.key);
                         continue;
                     }
                     let h = hol_in(fe, d, ti);
@@ -881,11 +1311,11 @@ fn alloc_sets<'tcx>(fe: &mut Frontend<'tcx>, defs: &[FunDef<'tcx>]) -> Allocs<'t
     }
     let mut names = HashMap::new();
     for d in defs {
-        if !sets[&d.key].is_empty() && !overflow.contains(&d.key) {
+        if !sets[&d.key].is_empty() {
             names.insert(d.key, fe.unique_global(format!("{}_alloc", d.name)));
         }
     }
-    Allocs { sets, overflow, names }
+    Allocs { sets, names }
 }
 
 /// The type variables in the HOL types `tys`, in order, except those every record takes first.
@@ -962,6 +1392,7 @@ fn subst_markers<'tcx>(
     body: &str,
     caller_scc: Option<&HashSet<FnKey<'tcx>>>,
     names: &HashMap<FnKey<'tcx>, String>,
+    poly: &HashMap<usize, String>,
 ) -> String {
     let mut out = String::new();
     let mut rest = body;
@@ -977,13 +1408,14 @@ fn subst_markers<'tcx>(
                 let j = allocs.set(me).iter().position(|(u, _)| *u == t).expect("a cell's type is in its body's record");
                 format!("({}_{} {})", allocs.names[&me], j, ALLOC_PARAM)
             }
+            "F" if poly.contains_key(&idx) => poly[&idx].clone(),
             "F" | "V" => {
                 let callee = fe.gen_calls[idx].callee;
                 // every marked callee is a local item with a body, hence translated
                 let name = names.get(&callee).cloned().expect("callee of a call marker is translated");
                 let rec = caller_scc.map(|s| s.contains(&callee)).unwrap_or(false);
                 let head = if rec { format!("rec_{}", name) } else { name.clone() };
-                let mut extra: Vec<String> = fe.gen_calls[idx].dicts.clone().iter().map(|d| subst_markers(fe, allocs, me, d, caller_scc, names)).collect();
+                let mut extra: Vec<String> = fe.gen_calls[idx].dicts.clone().iter().map(|d| subst_markers(fe, allocs, me, d, caller_scc, names, poly)).collect();
                 extra.extend(record_arg(fe, allocs, me, idx));
                 let f = if extra.is_empty() { head.clone() } else { format!("{} {}", head, extra.join(" ")) };
                 match fe.gen_calls[idx].args.clone() {
@@ -992,7 +1424,7 @@ fn subst_markers<'tcx>(
                     None if extra.is_empty() => f,
                     None => format!("({})", f),
                     Some(args) => {
-                        let a: Vec<String> = args.iter().map(|x| subst_markers(fe, allocs, me, x, caller_scc, names)).collect();
+                        let a: Vec<String> = args.iter().map(|x| subst_markers(fe, allocs, me, x, caller_scc, names, poly)).collect();
                         if !extra.is_empty() {
                             crate::body::term_call(&f, &a)
                         } else if a.is_empty() {
@@ -1054,17 +1486,54 @@ fn indent(s: &str, n: usize) -> String {
 /// The definitions (and the allocation records' datatypes, for the types theory).
 fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
     let mut defs = std::mem::take(&mut fe.fun_defs);
-    let allocs = alloc_sets(fe, &defs);
-    let mut decls = String::new();
+    let (poly_calls, mut renamings) = poly_rec_calls(fe, &defs);
+    let allocs = alloc_sets(fe, &defs, &poly_calls);
+    // the polymorphic-recursive calls are placeholders (of the calls' result types); one as a
+    // function value makes its whole definition one (the value's function type is not known here)
+    let mut poly: HashMap<usize, String> = HashMap::new();
     for d in defs.iter_mut() {
-        if allocs.overflow.contains(&d.key) {
-            let m = fe.placeholder("mutable locals of generic types in polymorphic recursion (allocation record without bound)", Some(fe.tcx.def_span(d.key.0)));
+        let mut ms = vec![];
+        markers_in(fe, &d.body, &HashSet::new(), &mut ms);
+        ms.retain(|&(kind, n)| matches!(kind, 'F' | 'V') && poly_calls.contains(&n));
+        let what = |fe: &Frontend<'tcx>, n: usize| {
+            format!(
+                "call of `{}` at other type arguments within its recursive group (polymorphic recursion)",
+                fe.tcx.def_path_str(fe.gen_calls[n].callee.0)
+            )
+        };
+        if let Some(&(_, n)) = ms.iter().find(|(kind, _)| *kind == 'V') {
+            let m = fe.placeholder(&what(fe, n), Some(fe.tcx.def_span(d.key.0)));
+            d.comments.push(m.clone());
             d.params = (0..d.param_tys.len()).map(|i| format!("arg_{}", i)).collect();
             d.body = format!("unimplemented!(\"{}\")", names::string_token(&m));
             d.calls.clear();
-            d.comments.push(m);
             continue;
         }
+        for (_, n) in ms {
+            if poly.contains_key(&n) {
+                continue;
+            }
+            let m = fe.placeholder(&what(fe, n), Some(fe.tcx.def_span(d.key.0)));
+            d.comments.push(m.clone());
+            let (callee, kargs) = (fe.gen_calls[n].callee, fe.gen_calls[n].kargs);
+            let ret = fe.tcx.instantiate_bound_regions_with_erased(fe.tcx.fn_sig(callee.0).instantiate_identity().skip_normalization()).output();
+            let ret = match fe.inst_args(callee) {
+                Some(a) => ty::EarlyBinder::bind(fe.tcx, ret).instantiate(fe.tcx, a).skip_normalization(),
+                None => ret,
+            };
+            let ret = at_call(fe, d.key, kargs, ret);
+            let msg = names::string_token(&m);
+            let term = if ret.is_never() {
+                format!("unimplemented!(\"{}\")", msg)
+            } else {
+                let h = hol_in(fe, d, ret);
+                format!("\\<epsilon>\\<open>(unimplemented (STR ''{}'') :: (_, {}, _, _, _, _) expression)\\<close>", msg, h)
+            };
+            poly.insert(n, term);
+        }
+    }
+    let mut decls = String::new();
+    for d in defs.iter_mut() {
         if let Some(n) = allocs.names.get(&d.key) {
             let (t, decl) = alloc_decl(fe, n, allocs.set(d.key));
             writeln!(decls, "(* Rust: allocators of the mutable locals of {} and the functions it calls *)", cmt(&d.rust_path)).unwrap();
@@ -1083,7 +1552,7 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
         let recursive = comp.len() > 1 || defs[by_id[&comp[0]]].calls.contains(&comp[0]);
         if !recursive {
             let d = &defs[by_id[&comp[0]]];
-            let body = subst_markers(fe, &allocs, d.key, &d.body, None, &names);
+            let body = subst_markers(fe, &allocs, d.key, &d.body, None, &names, &poly);
             out.push_str(&emit_def(fe, d, &body));
             continue;
         }
@@ -1094,14 +1563,23 @@ fn emit_funs<'tcx>(fe: &mut Frontend<'tcx>) -> (String, String) {
         let k = members.len();
         let step = format!("{}_rec_step", members[0].name);
         let tys: Vec<String> = members.iter().map(|d| fe.fun_type(&d.param_tys, &d.ret_ty)).collect();
-        let tuple_ty = tys.iter().map(|t| format!("({})", t)).collect::<Vec<_>>().join(" \\<times> ");
+        // the members' type variables in the group's definition (see `group_tvars`)
+        let mut uf = renamings.remove(&comp[0]).expect("every group has a renaming");
+        let tvars = group_tvars(fe, &members, &mut uf);
+        let tuple_ty = tys
+            .iter()
+            .zip(&tvars)
+            .map(|(t, m)| format!("({})", rename_tvars(t, m)))
+            .collect::<Vec<_>>()
+            .join(" \\<times> ");
         let recs: Vec<String> = members.iter().map(|d| format!("rec_{}", d.name)).collect();
         let binder = if k == 1 { recs[0].clone() } else { format!("({})", recs.join(", ")) };
         let lam = |d: &FunDef<'_>| if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
         let bodies: Vec<String> = members
             .iter()
-            .map(|d| {
-                let body = subst_markers(fe, &allocs, d.key, &d.body, Some(&set), &names);
+            .zip(&tvars)
+            .map(|(d, m)| {
+                let body = rename_tvars(&subst_markers(fe, &allocs, d.key, &d.body, Some(&set), &names, &poly), m);
                 format!("{}FunctionBody \\<lbrakk>\n{}  \\<rbrakk>", lam(d), indent(&body, 4))
             })
             .collect();
@@ -1163,6 +1641,10 @@ fn emit_def(fe: &Frontend<'_>, d: &FunDef<'_>, body: &str) -> String {
         writeln!(out, "(* {} *)", cmt(c)).unwrap();
     }
     let ty = fe.fun_type(&d.param_tys, &d.ret_ty);
+    if let Some(data) = &d.data {
+        writeln!(out, "urust_const_data \"{}\" :: {} = {}\n", d.name, cart(&ty), cart(data)).unwrap();
+        return out;
+    }
     let lam = if d.params.is_empty() { String::new() } else { format!("\\<lambda>{}. ", d.params.join(" ")) };
     writeln!(
         out,
@@ -1243,7 +1725,19 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     while !left.is_empty() {
         let ready: Vec<&String> =
             left.iter().copied().filter(|n| fe.ext_types[*n].deps.iter().all(|d| !left.contains(&d))).collect();
-        let group = if ready.is_empty() { left.clone() } else { vec![ready[0]] };
+        let group = if ready.is_empty() { ext_cycle(fe, &left) } else { vec![ready[0]] };
+        // an enum without fields uses no other types, so it is a group of its own
+        if let [n] = group[..] && let Some((width, vals)) = &fe.ext_types[n].word {
+            let t = &fe.ext_types[n];
+            let ctors: Vec<String> = t.ctors.iter().map(|(c, _)| c.clone()).collect();
+            writeln!(tx, "(* {} *)", cmt(&t.comment)).unwrap();
+            tx.push_str(&word_enum_decl(n, *width, &ctors, vals));
+            left.retain(|m| *m != n);
+            continue;
+        }
+        // each type's constructors and constructor functions; a plain enum (see
+        // `ExtType::plain_enum`) that is not in a cycle of external types is an `enum`
+        let plain = matches!(group[..], [n] if fe.ext_types[n].plain_enum);
         let mut decls = vec![];
         for n in &group {
             let t = &fe.ext_types[*n];
@@ -1254,14 +1748,20 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
                 .map(|(c, fs)| if fs.is_empty() { c.clone() } else { format!("{} {}", c, fs.iter().map(|f| cart(f)).collect::<Vec<_>>().join(" ")) })
                 .collect();
             writeln!(tx, "(* {} *)", cmt(&t.comment)).unwrap();
-            decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            if plain {
+                tx.push_str(&enum_decl(&head, &ctors));
+            } else {
+                decls.push(format!("{} =\n    {}", head, ctors.join("\n  | ")));
+            }
             for (c, fs) in &t.ctors {
                 if !fs.is_empty() {
                     mks.push_str(&ctor_fun(&format!("{}_mk", c), c, fs, &head));
                 }
             }
         }
-        writeln!(tx, "datatype {}\n", decls.join("\nand ")).unwrap();
+        if !plain {
+            writeln!(tx, "datatype {}\n", decls.join("\nand ")).unwrap();
+        }
         left.retain(|n| !group.contains(n));
     }
     tx.push_str(&mks);

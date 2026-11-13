@@ -71,6 +71,12 @@ pub struct ExtType {
     pub params: Vec<String>,
     /// the external types its fields use
     pub deps: Vec<String>,
+    /// for an enum with constructors whose variants have no fields: it is a `simple_word_enum`
+    /// (see `Frontend::word_enum`)
+    pub word: Option<(u64, Vec<u128>)>,
+    /// for an enum with constructors, without type parameters, not in its own fields: it is an
+    /// `enum` (Enum_Theory), see `translate::enum_decl`
+    pub plain_enum: bool,
 }
 
 /// An external (or foreign) function for which a template definition is emitted.
@@ -92,6 +98,9 @@ pub struct FunDef<'tcx> {
     pub params: Vec<String>,
     /// Body (uRust, may contain call markers).
     pub body: String,
+    /// For a constant translated from its value (see `translate::const_data`): the value as
+    /// `urust_const_data` data; `body` is then empty.
+    pub data: Option<String>,
     pub calls: DefSet<'tcx>,
     pub comments: Vec<String>,
     /// how many of the parameters are dictionaries (they come first)
@@ -157,7 +166,7 @@ pub struct Frontend<'tcx> {
     /// finite values once shared references are values (e.g. `struct Node(&'static Node)`), or
     /// are in a recursive group with such a type. They are placeholders.
     pub opaque_adts: HashMap<DefId, &'static str>,
-    /// Structs translated as `datatype_record` (have lenses).
+    /// Structs translated as `scalable_datatype_record` (have lenses).
     pub record_adts: HashSet<DefId>,
     /// Local ADTs that contain `&mut` references (directly or through other ADTs):
     /// they take the type parameters `'addr, 'gv` first.
@@ -170,6 +179,14 @@ pub struct Frontend<'tcx> {
     pub adt_projs: HashMap<DefId, Vec<Ty<'tcx>>>,
     /// While a datatype is declared: its projections' type variables (see `adt_projs`).
     pub proj_tvars: Option<HashMap<ty::AliasTy<'tcx>, String>>,
+    /// While a generic item is translated: its typing environment, in which the associated types a
+    /// local ADT takes as type parameters are normalised at its uses (to the projections that
+    /// `proj_tvars` has, e.g. `<DP::VS as VersionSet>::V` to `DP::V`).
+    pub proj_env: Option<ty::TypingEnv<'tcx>>,
+    /// The methods of each trait that are fields of its dictionaries (see `dict_methods`).
+    pub dict_methods_memo: std::cell::RefCell<HashMap<DefId, Vec<DefId>>>,
+    /// The own bounds of each trait method that are dictionary parameters (see `own_dict_bounds`).
+    pub own_dict_bounds_memo: std::cell::RefCell<HashMap<DefId, Vec<ty::TraitRef<'tcx>>>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
     /// `Fn` traits (see `fn_param_types`).
     pub fn_params: HashMap<u32, String>,
@@ -183,8 +200,55 @@ pub struct Frontend<'tcx> {
 /// The type of field `f` of an ADT at its type arguments `args`, without regions and normalised in
 /// `env`. A field is this type wherever the frontend looks at it, as in Rust: a projection is the
 /// type it denotes (`<Foo as Tr>::Out` is `Bar`), and what remains of one depends on type parameters.
+/// Does the type `t` contain a `&mut` reference (outside function pointers, trait objects and raw
+/// pointers, whose HOL types are placeholder types without the store's type variables)?
+pub fn has_mut_ref(t: Ty<'_>) -> bool {
+    let mut w = t.walk();
+    while let Some(g) = w.next() {
+        match g.as_type().map(|x| *x.kind()) {
+            Some(ty::Ref(_, _, m)) if m.is_mut() => return true,
+            Some(ty::FnPtr(..) | ty::Dynamic(..) | ty::RawPtr(..)) => w.skip_current_subtree(),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Does one of the types `ts` (an ADT's field types) mention the ADT `did`?
+pub fn mentions_adt(ts: &[Ty<'_>], did: DefId) -> bool {
+    ts.iter().any(|t| t.walk().any(|g| matches!(g.as_type().map(|x| *x.kind()), Some(ty::Adt(a, _)) if a.did() == did)))
+}
+
+/// The constants the `simple_word_enum` declaration of the type `n` defines besides its
+/// constructors (AutoCorrode's `Simple_Word_Enums` and `Case_for_Typedefs`).
+pub fn word_enum_consts(n: &str) -> Vec<String> {
+    vec![format!("{}_variants", n), format!("{}_all", n), format!("{}_index", n), format!("match_{}", n), format!("case_{}", n)]
+}
+
 pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, f: &ty::FieldDef, args: GenericArgsRef<'tcx>, env: ty::TypingEnv<'tcx>) -> Ty<'tcx> {
-    tcx.erase_and_anonymize_regions(tcx.normalize_erasing_regions(env, f.ty(tcx, args)))
+    tcx.erase_and_anonymize_regions(try_normalize(tcx, env, f.ty(tcx, args)).expect("a field type normalises"))
+}
+
+/// `x` normalised in `env`, with erased regions. The aliases in types from type checking (and in
+/// their instantiations) are marked rigid in its environment and mode, and normalisation skips rigid
+/// aliases; the frontend normalises in other environments (post-analysis, the caller's for a callee's
+/// types), so they are first made non-rigid, as rustc does for MIR after type checking
+/// (`rustc_mir_transform::post_analysis_normalize`). Otherwise an `impl Trait` type is not revealed,
+/// and a projection on one is not normalised.
+pub fn try_normalize<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
+    tcx: TyCtxt<'tcx>,
+    env: ty::TypingEnv<'tcx>,
+    x: ty::Unnormalized<'tcx, T>,
+) -> Result<T, ty::normalize_erasing_regions::NormalizationError<'tcx>> {
+    tcx.try_normalize_erasing_regions(env, ty::set_aliases_to_non_rigid(tcx, x.skip_normalization()))
+}
+
+/// `x` normalised in `env` (see `try_normalize`), or `x` itself (with erased regions) where it does
+/// not normalise, as rustc keeps such types in MIR: a projection whose bound `env` implies only
+/// through an equality the trait solver does not use (resolvo: `<<I as Interner>::SolvableId as
+/// SolverId>::Set` under `I: Interner<SolvableId = S>`, without `S: SolverId`) stays a projection.
+pub fn normalize<'tcx, T: TypeFoldable<TyCtxt<'tcx>> + Copy>(tcx: TyCtxt<'tcx>, env: ty::TypingEnv<'tcx>, x: ty::Unnormalized<'tcx, T>) -> T {
+    try_normalize(tcx, env, x).unwrap_or_else(|_| tcx.erase_and_anonymize_regions(x.skip_normalization()))
 }
 
 /// A HOL type written without redundant parentheses (every compound argument and operand
@@ -338,6 +402,9 @@ impl<'tcx> Frontend<'tcx> {
             alias_tvars: None,
             adt_projs: HashMap::new(),
             proj_tvars: None,
+            proj_env: None,
+            dict_methods_memo: Default::default(),
+            own_dict_bounds_memo: Default::default(),
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
             gen_calls: Vec::new(),
@@ -448,12 +515,23 @@ impl<'tcx> Frontend<'tcx> {
     }
 
     /// The typing environment of the body of `key`: an instance has no generic parameters left,
-    /// a copy has those of its implementation.
+    /// a copy has those of its implementation, with the implementation's bounds and the method's
+    /// own (at the implementation's trait reference).
     pub fn inst_env(&self, key: FnKey<'tcx>) -> ty::TypingEnv<'tcx> {
+        let tcx = self.tcx;
         match key.1 {
-            Inst::Generic => ty::TypingEnv::post_analysis(self.tcx, key.0),
+            Inst::Generic => ty::TypingEnv::post_analysis(tcx, key.0),
             Inst::Mono(_) => ty::TypingEnv::fully_monomorphized(),
-            Inst::ImplCopy(imp) => ty::TypingEnv::post_analysis(self.tcx, imp),
+            Inst::ImplCopy(imp) => {
+                let at = self.inst_args(key).expect("a copy has the arguments of its implementation");
+                // (normalised there, as rustc normalises a typing environment: `<Foo<T> as Tr>::A:
+                // Clone` is `T: Clone` under `type A = T`)
+                let ienv = ty::TypingEnv::post_analysis(tcx, imp);
+                let own = tcx.clauses_of(key.0).instantiate_own(tcx, at).map(|(c, _)| normalize(tcx, ienv, c));
+                let clauses: Vec<ty::Clause<'tcx>> = tcx.param_env(imp).caller_bounds().chain(own).collect();
+                let pe = ty::ParamEnv::new(tcx, ty::elaborate::elaborate(tcx, clauses));
+                ty::TypingEnv::new(pe, ty::TypingMode::non_body_analysis()).with_post_analysis_normalized(tcx)
+            }
         }
     }
 
@@ -465,7 +543,7 @@ impl<'tcx> Frontend<'tcx> {
             Some(args) => ty::EarlyBinder::bind(self.tcx, x).instantiate(self.tcx, args),
             None => ty::Unnormalized::new_wip(x),
         };
-        self.tcx.try_normalize_erasing_regions(env, x).unwrap_or_else(|_| x.skip_normalization())
+        normalize(self.tcx, env, x)
     }
 
     // ------------------------------------------------------------------
@@ -544,8 +622,35 @@ impl<'tcx> Frontend<'tcx> {
         self.used_type_names.insert(n.clone());
         // constructor function / notation names derive from the type name
         self.used_names.insert(n.clone());
+        if self.word_enum(did, &n).is_some() {
+            self.used_names.extend(word_enum_consts(&n));
+        }
         self.type_names.insert(did, n.clone());
         n
+    }
+
+    /// For an enum whose variants (at least one) all have no fields: the bit width of its
+    /// discriminant type and each variant's discriminant, as a word of that width. Such an enum
+    /// is a `simple_word_enum` (AutoCorrode), whose declaration scales with the number of
+    /// variants, unlike a `datatype` (distinctness of all pairs of constructors).
+    /// `n` is its HOL name: an enum whose constructor names (`n_V`) would be among the constants
+    /// `simple_word_enum` defines (see `word_enum_consts`) is not one.
+    pub fn word_enum(&self, adt: DefId, n: &str) -> Option<(u64, Vec<u128>)> {
+        let tcx = self.tcx;
+        let def = tcx.adt_def(adt);
+        if !def.is_enum() || def.variants().is_empty() || def.variants().iter().any(|v| !v.fields.is_empty()) {
+            return None;
+        }
+        let consts = word_enum_consts(n);
+        if def.variants().iter().any(|v| consts.contains(&format!("{}_{}", n, names::ident_chars(v.name.as_str())))) {
+            return None;
+        }
+        let width = match def.repr().discr_type() {
+            rustc_abi::IntegerType::Pointer(_) => tcx.data_layout.pointer_size().bits(),
+            rustc_abi::IntegerType::Fixed(i, _) => i.size().bits(),
+        };
+        // `Discr::val` is the discriminant's bits in its type (e.g. `-1i8` is 0xff)
+        Some((width, def.discriminants(tcx).map(|(_, d)| d.val).collect()))
     }
 
     pub fn variant_ctor_name(&mut self, adt: DefId, vidx: usize) -> String {
@@ -695,11 +800,11 @@ impl<'tcx> Frontend<'tcx> {
                     return false;
                 }
                 seen.push(t);
-                // a field that does not normalise (e.g. a projection on an `impl Trait` type, which
-                // the environment does not reveal) stays a projection, which has none
+                // a field that does not normalise (only under impossible bounds, see `normalize`)
+                // stays a projection, which has none
                 def.all_fields().any(|f| {
                     let t = f.ty(tcx, args);
-                    let t = tcx.try_normalize_erasing_regions(env, t).unwrap_or_else(|_| t.skip_normalization());
+                    let t = normalize(tcx, env, t);
                     self.has_cell(tcx.erase_and_anonymize_regions(t), env, seen)
                 })
             }
@@ -718,7 +823,7 @@ impl<'tcx> Frontend<'tcx> {
         let name = format!("unsupported_{}", names::ident_chars(desc));
         if !self.ext_types.contains_key(&name) {
             let comment = self.placeholder(&format!("type {}", desc), None);
-            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
+            self.ext_types.insert(name.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None, plain_enum: false });
         }
         name
     }
@@ -793,6 +898,18 @@ impl<'tcx> Frontend<'tcx> {
         }
     }
 
+    /// The key of the alias type `t` in `proj_tvars`: with erased regions, and its projections
+    /// (also those in its arguments) not marked rigid, as normalisation marks some and not others
+    /// (e.g. the inner projection of a slot `<<I as A>::X as B>::Y` and of the same type written in
+    /// a signature).
+    pub fn proj_key(&self, t: Ty<'tcx>) -> Option<ty::AliasTy<'tcx>> {
+        let t = ty::set_aliases_to_non_rigid(self.tcx, self.tcx.erase_and_anonymize_regions(t)).skip_normalization();
+        match t.kind() {
+            ty::Alias(_, a) => Some(*a),
+            _ => None,
+        }
+    }
+
     /// The associated types of type parameters in the types `tys` (normalised in `did`'s typing
     /// environment), in order of occurrence: those written, and those the datatypes of local ADTs
     /// in them take as extra type parameters (see `adt_projs`).
@@ -819,7 +936,7 @@ impl<'tcx> Frontend<'tcx> {
                     ty::Adt(def, args) => {
                         for &p in self.adt_projs.get(&def.did()).into_iter().flatten() {
                             let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
-                            add(self.tcx.try_normalize_erasing_regions(env, at).unwrap_or(at.skip_normalization()), &mut out);
+                            add(normalize(self.tcx, env, at), &mut out);
                         }
                     }
                     _ => {}
@@ -950,7 +1067,11 @@ impl<'tcx> Frontend<'tcx> {
                         // a placeholder ADT is declared with the Rust type arguments only
                         if let Some(ps) = self.adt_projs.get(&did).cloned().filter(|_| !self.opaque_adts.contains_key(&did)) {
                             for p in ps {
-                                let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args).skip_normalization();
+                                let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
+                                let at = match self.proj_env {
+                                    Some(env) => normalize(self.tcx, env, at),
+                                    None => at.skip_normalization(),
+                                };
                                 a.push(self.ty(at));
                             }
                         }
@@ -965,10 +1086,10 @@ impl<'tcx> Frontend<'tcx> {
                 // associated-type projections that can be resolved (e.g. `<V2 as Add>::Output`); lifetime
                 // parameters do not matter (HOL has no regions), so they are erased first
                 let t = self.tcx.erase_and_anonymize_regions(t);
-                if let ty::Alias(_, a) = t.kind() && let Some(v) = self.proj_tvars.as_ref().and_then(|m| m.get(a)) {
+                if let Some(m) = self.proj_tvars.as_ref() && let Some(v) = self.proj_key(t).and_then(|a| m.get(&a)) {
                     return v.clone();
                 }
-                if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = self.tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
+                if !t.has_escaping_bound_vars() && !t.has_param() && let Ok(n) = try_normalize(self.tcx, ty::TypingEnv::fully_monomorphized(), rustc_middle::ty::Unnormalized::new_wip(t)) {
                     if !matches!(n.kind(), ty::Alias(..)) {
                         return self.ty(n);
                     }
@@ -1055,23 +1176,31 @@ impl<'tcx> Frontend<'tcx> {
             self.ext_types.contains_key(n) || self.used_type_names.contains(n)
         });
         let comment = format!("Rust: {}", self.tcx.def_path_str(did));
-        self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![] });
+        self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None, plain_enum: false });
         self.ext_type_ids.insert(did, n.clone());
-        // the fields' type parameters are the ADT's (see `ext_fun`)
+        // the fields' type parameters are the ADT's (see `ext_fun`; `ext_datatype` sets its own
+        // projections' type variables and typing environment)
         let fn_params = std::mem::take(&mut self.fn_params);
         let datatype = self.ext_datatype(did, &n);
         self.fn_params = fn_params;
-        if let Some((params, ctors, deps)) = datatype {
+        if let Some((params, ctors, deps, self_field)) = datatype {
+            let word = self.word_enum(did, &n);
+            if word.is_some() {
+                self.used_names.extend(word_enum_consts(&n));
+            }
+            let plain_enum = self.tcx.adt_def(did).is_enum() && params.is_empty() && !self_field;
             let t = self.ext_types.get_mut(&n).expect("registered above");
-            (t.params, t.ctors, t.deps) = (params, ctors, deps);
+            (t.params, t.ctors, t.deps, t.word, t.plain_enum) = (params, ctors, deps, word, plain_enum);
         }
         n
     }
 
     /// The datatype of the external ADT `did` (named `n`), if it is an enum or a struct with only
-    /// public fields, without const parameters, whose field types all have uRust models (see
-    /// `ExtType`). Its associated types become `adt_projs`, as for local ADTs.
-    fn ext_datatype(&mut self, did: DefId, n: &str) -> Option<(Vec<String>, Vec<(String, Vec<String>)>, Vec<String>)> {
+    /// public fields, without const parameters, whose field types all have uRust models and contain
+    /// no `&mut` reference (see `ExtType`). Its associated types become `adt_projs`, as for local
+    /// ADTs.
+    /// Also tells whether a field mentions the ADT itself (see `mentions_adt`).
+    fn ext_datatype(&mut self, did: DefId, n: &str) -> Option<(Vec<String>, Vec<(String, Vec<String>)>, Vec<String>, bool)> {
         let tcx = self.tcx;
         if !matches!(tcx.def_kind(did), DefKind::Enum | DefKind::Struct) { return None }
         let def = tcx.adt_def(did);
@@ -1085,17 +1214,19 @@ impl<'tcx> Frontend<'tcx> {
         let ftys: Vec<Vec<Ty<'tcx>>> =
             def.variants().iter().map(|v| v.fields.iter().map(|f| field_ty(tcx, f, own, env)).collect()).collect();
         let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
+        // a `&mut` reference in a field is a HOL type over the store's type variables `'addr`,
+        // `'gv`, which a datatype in the external types template does not have as parameters
+        if all.iter().any(|&t| has_mut_ref(t)) {
+            return None;
+        }
         let projs = self.projections(did, &all);
         let proj_names: Vec<String> = (0..projs.len()).map(|k| format!("'proj{}", k)).collect();
-        let saved = self.proj_tvars.take();
+        let saved = (self.proj_tvars.take(), self.proj_env.replace(env));
         self.proj_tvars = Some(
             projs
                 .iter()
                 .zip(proj_names.iter())
-                .map(|(p, v)| match p.kind() {
-                    ty::Alias(_, a) => (*a, v.clone()),
-                    _ => unreachable!("projections are aliases"),
-                })
+                .map(|(p, v)| (self.proj_key(*p).expect("projections are aliases"), v.clone()))
                 .collect(),
         );
         // modelled, checked without recording anything first
@@ -1124,9 +1255,9 @@ impl<'tcx> Frontend<'tcx> {
             }
             let mut params: Vec<String> = own.types().map(|t| self.ty(t)).collect();
             params.extend(proj_names.iter().cloned());
-            (params, ctors, deps)
+            (params, ctors, deps, mentions_adt(&all, did))
         });
-        self.proj_tvars = saved;
+        (self.proj_tvars, self.proj_env) = saved;
         if result.is_some() && !projs.is_empty() {
             self.adt_projs.insert(did, projs);
         }
@@ -1205,13 +1336,14 @@ impl<'tcx> Frontend<'tcx> {
         self.used_names.insert(n.clone());
         let sig = self.tcx.fn_sig(did).instantiate_identity().skip_binder();
         // the signature's type parameters are the external function's, not those of the item being
-        // translated, whose `Fn`-bounded parameters (by index) do not apply
-        let fn_params = std::mem::take(&mut self.fn_params);
+        // translated: its `Fn`-bounded parameters (by index), its projections' type variables and its
+        // typing environment do not apply (the signature's projections are `alias_tvars`)
+        let saved = (std::mem::take(&mut self.fn_params), self.proj_tvars.take(), self.proj_env.take());
         self.alias_tvars = Some(0);
         let params: Vec<String> = sig.inputs().iter().map(|t| self.ty(*t)).collect();
         let ret = self.ty(sig.output());
         self.alias_tvars = None;
-        self.fn_params = fn_params;
+        (self.fn_params, self.proj_tvars, self.proj_env) = saved;
         let hol_type = self.fun_type(&params, &ret);
         let ef = ExtFun { hol_name: n.clone(), rust_path: self.tcx.def_path_str(did), hol_type, arity: params.len() };
         if foreign { self.foreign_funs.insert(n.clone(), ef); } else { self.ext_funs.insert(n.clone(), ef); }
