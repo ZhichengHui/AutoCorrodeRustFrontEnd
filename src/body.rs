@@ -319,6 +319,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn ty_of(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.expr_ty(e)) }
     fn ty_adj(&self, e: &hir::Expr<'tcx>) -> Ty<'tcx> { self.mono(self.typeck.expr_ty_adjusted(e)) }
 
+    /// `str` or `String` (the list of the UTF-8 bytes, see `Frontend::ty`).
+    fn str_like(&self, t: Ty<'tcx>) -> bool {
+        t.is_str() || matches!(t.kind(), ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String"))
+    }
+
     /// A slice, array or `Vec` (possibly behind references): a uRust list.
     fn list_like(&self, t: Ty<'tcx>) -> bool {
         match t.peel_refs().kind() {
@@ -1114,6 +1119,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 // a sequence indexed by a local type (`impl Index<Var> for Vec<T>`) uses that impl
                 let it = self.ty_adj(idx).peel_refs();
                 let local_index = matches!(it.kind(), ty::Adt(def, _) if def.did().is_local());
+                // a string by a range of byte positions (a value: `&mut str` has no model)
+                if self.str_like(bt) && !local_index && !self.mut_places.contains(&e.hir_id) {
+                    return self.str_index(base, idx).map(PV::Val);
+                }
                 if !self.list_like(bt) || local_index {
                     // `base[idx]` on a local type is `*Index::index(&base, idx)`, or
                     // `*IndexMut::index_mut(&mut base, idx)` in a mutable place; the borrow of the
@@ -1165,6 +1174,28 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             }
             _ => Ok(PV::Val(self.val_unadj(e)?)),
         }
+    }
+
+    /// `base[idx]` on a string: the bytes of the range `idx`, which must lie within the string and
+    /// start and end at character boundaries, else the model panics (see AutoCorrode's
+    /// `str_index_range`).
+    fn str_index(&mut self, base: &'tcx hir::Expr<'tcx>, idx: &'tcx hir::Expr<'tcx>) -> R<Tr> {
+        // the model, `None` for `..` (the whole string)
+        let model = match self.range_kind(self.ty_adj(idx).peel_refs()) {
+            Some(RangeKind::Range | RangeKind::Inclusive) => Some("str_index_range"),
+            Some(RangeKind::From) => Some("str_index_from"),
+            Some(RangeKind::To) => Some("str_index_to"),
+            Some(RangeKind::ToInclusive) => Some("str_index_to_inclusive"),
+            Some(RangeKind::Full) => None,
+            None => return unsup(format!("indexing into `{}` with `{}`", self.ty_adj(base).peel_refs(), self.ty_adj(idx))),
+        };
+        let s = match self.index_base(base)? {
+            PV::Val(v) => v,
+            PV::Ref(r) => Tr::new(format!("* {}", r.at(200)), 200),
+        };
+        let Some(model) = model else { return Ok(s) };
+        let i = self.val(idx)?;
+        Ok(self.named_call(model, vec![s, i]))
     }
 
     /// `base[idx]` with a range `idx` and the reference `r` to `base` (a sequence): the reference
@@ -1488,23 +1519,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             LitKind::Int(v, _) => Self::int_lit(v.get(), false, t),
             LitKind::Bool(b) => Ok(Tr::atom(if *b { "true" } else { "false" })),
             LitKind::Byte(b) => Ok(Tr::atom(format!("{}_u8", b))),
-            LitKind::Char(c) => Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char(*c)?))),
-            LitKind::Str(s, _) => {
-                let s = s.as_str();
-                if names::hol_string_ok(s) {
-                    return Ok(Tr::atom(format!("\\<llangle>STR ''{}''\\<rrangle>", s)));
-                }
-                // other ASCII characters cannot be written in `''…''`: the concatenation of the
-                // printable runs and of the other characters, each as a one-character string
-                let pieces: Vec<String> = hol_str_pieces(s)?
-                    .into_iter()
-                    .map(|p| match p {
-                        StrPiece::Str(r) => format!("STR ''{}''", r),
-                        StrPiece::Char(c) => format!("String.implode [{}]", c),
-                    })
-                    .collect();
-                Ok(Tr::atom(format!("\\<llangle>({})\\<rrangle>", pieces.join(" + "))))
-            }
+            LitKind::Char(c) => Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char(*c)))),
+            LitKind::Str(s, _) => Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_str(s.as_str())))),
             LitKind::Float(..) => unsup("floating-point literal"),
             // `b"…"`: the list of its bytes (byte arrays and slices are `8 word list`)
             LitKind::ByteStr(bs, _) => {
@@ -1582,12 +1598,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Tr::atom(self.fe.variant_ctor_name(adt, vidx)))
     }
 
-    /// The constant `did` of the integer or `bool` type `t` as a literal (e.g. `u32::MAX`), if it
-    /// evaluates to one. A generic constant or a trait's associated constant is not evaluated
-    /// (rustc would abort).
+    /// The constant `did` of the integer, `bool` or `char` type `t` as a literal (e.g. `u32::MAX`,
+    /// `char::MAX`), if it evaluates to one. A generic constant or a trait's associated constant is
+    /// not evaluated (rustc would abort).
     fn scalar_const(&self, did: DefId, t: Ty<'tcx>) -> Option<R<Tr>> {
         let tcx = self.tcx;
-        if !(t.is_integral() || t.is_bool())
+        if !(t.is_integral() || t.is_bool() || t.is_char())
             || self.fe.is_trait_item(did)
             || tcx.is_static(did)
             || tcx.generics_of(did).requires_monomorphization(tcx)
@@ -1597,6 +1613,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let s = tcx.const_eval_poly(did).ok()?.try_to_scalar_int()?;
         Some(if t.is_bool() {
             Ok(Tr::atom(if s.to_bits(s.size()) != 0 { "true" } else { "false" }))
+        } else if t.is_char() {
+            let c = char::from_u32(s.to_bits(s.size()) as u32).expect("a `char` constant is a Unicode scalar value");
+            Ok(Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char(c))))
         } else {
             Self::scalar_int_lit(s, t)
         })
@@ -1622,20 +1641,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn cast(&mut self, x: &'tcx hir::Expr<'tcx>, target: Ty<'tcx>) -> R<Tr> {
         let src = self.ty_adj(x);
-        let Some(tsfx) = Self::int_suffix(target) else { return unsup(format!("`as` cast to `{}`", target)) };
+        // a `char` is its code point, a `u32` (see `Frontend::ty`): `c as T` is the code point
+        // zero-extended or truncated to `T`, and `b as char` (only from `u8`) is the byte zero-extended
+        let int_or_char = |t: Ty<'tcx>| if t.is_char() { Some("u32") } else { Self::int_suffix(t) };
+        let Some(tsfx) = int_or_char(target) else { return unsup(format!("`as` cast to `{}`", target)) };
         // `b as T` for `b: bool` is 1 or 0
         if src.is_bool() {
             let b = self.val(x)?;
             return Ok(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", b.at(20), tsfx, tsfx), 21));
         }
-        // `c as T` for `c: char` is its code point, truncated to `T` (a HOL `char` has 256 values)
-        if src.is_char() {
-            let c = self.val(x)?;
-            let h = self.hty(target);
-            let v = Tr::new(format!("\\<llangle>of_nat \\<circ> of_char\\<rrangle>\\<^sub>1({})", c.s), 999);
-            return Ok(self.typed("cast", v, &h));
-        }
-        if Self::int_suffix(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
+        if int_or_char(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
         let v = self.val(x)?;
         // `as` binds weaker than unary operators in uRust (precedence 299)
         Ok(Tr::new(format!("({}) as {}", v.s, tsfx), 299))
@@ -1702,9 +1717,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 return unsup("ordering comparison on `bool`");
             }
             return Ok(Self::mk_bin(tok, p, &lv, &rv));
-        }
-        if lt.is_char() && !matches!(op, BinOpKind::Eq | BinOpKind::Ne) {
-            return unsup("ordering comparison on `char`");
         }
         let rv = if matches!(op, BinOpKind::Shl | BinOpKind::Shr) { Self::shift_amount(r, rv, rt) } else { rv };
         let (tok, p) = Self::binop_info(op);
@@ -1880,6 +1892,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Char => "char",
             ty::Str => "str",
             ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String") => "str",
+            ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("Utf8Error") => "utf8_error",
             _ => return None,
         };
         let integer = matches!(kind, "word" | "sword");
@@ -2013,27 +2026,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         for part in &fa.parts {
             match part {
                 FmtPart::Lit(s) => {
-                    // runs of ASCII characters as strings, of other characters as code points
-                    let mut runs: Vec<(bool, String)> = vec![];
-                    for c in s.chars() {
-                        match runs.last_mut() {
-                            Some((a, r)) if *a == c.is_ascii() => r.push(c),
-                            _ => runs.push((c.is_ascii(), c.to_string())),
-                        }
-                    }
-                    for (ascii, run) in runs {
-                        if !ascii {
-                            let cs: Vec<String> = run.chars().map(|c| (c as u32).to_string()).collect();
-                            steps.push(Step::Call(format!("fmt_write_codes({}, \\<llangle>[{}] :: nat list\\<rrangle>)", f, cs.join(", "))));
-                            continue;
-                        }
-                        for piece in hol_str_pieces(&run)? {
-                            steps.push(Step::Call(match piece {
-                                StrPiece::Str(r) => format!("fmt_write_str({}, \\<llangle>STR ''{}''\\<rrangle>)", f, r),
-                                StrPiece::Char(c) => format!("fmt_write_char({}, \\<llangle>{}\\<rrangle>)", f, c),
-                            }));
-                        }
-                    }
+                    steps.push(Step::Call(format!("fmt_write_str({}, \\<llangle>{}\\<rrangle>)", f, hol_str(s))));
                 }
                 FmtPart::Ph { flags, width, precision, width_arg, precision_arg, arg } => {
                     let i = arg.unwrap_or(next);
@@ -2435,11 +2428,14 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             };
         }
         let int = Self::int_suffix(this).is_some() && rhs.is_none_or(|t| t == this);
-        if int && tcx.is_diagnostic_item(sym::Ord, tr) && name.as_str() == "cmp" {
+        // a `char` is compared by its code point (a `32 word`)
+        let char_cmp = this.is_char() && rhs.is_none_or(|t| t == this);
+        if (int || char_cmp) && tcx.is_diagnostic_item(sym::Ord, tr) && name.as_str() == "cmp" {
             return Some(lam2("cmp(a, b)".into()));
         }
         let op = Self::trait_binop(tcx, tr, name.as_str())?;
-        if int && !matches!(op, BinOpKind::Shl | BinOpKind::Shr) {
+        let comparison = matches!(op, BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge);
+        if (int && !matches!(op, BinOpKind::Shl | BinOpKind::Shr)) || (char_cmp && comparison) {
             return Some(lam2(format!("a {} b", Self::binop_info(op).0)));
         }
         if this.is_bool() && rhs == Some(this) && matches!(op, BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor) {
@@ -2826,6 +2822,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 if tcx.is_diagnostic_item(sym::TryInto, parent) {
                     return Some(StdFn::TryIntoArray);
                 }
+                // `String + &str`, `String += &str` (see `std_call`)
+                if Some(parent) == tcx.lang_items().add_trait() {
+                    return Some(StdFn::StringAdd);
+                }
+                if Some(parent) == tcx.lang_items().add_assign_trait() {
+                    return Some(StdFn::StringAddAssign);
+                }
                 // `IntoIterator::into_iter` of an iterator, or of a reference to a sequence, whose
                 // state is the sequence: the identity when the HOL types agree
                 return [sym::Into, sym::AsRef, sym::Borrow, sym::IntoIterator]
@@ -2909,14 +2912,76 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ("HashMap", "remove") => HashMapKey("hashmap_remove"),
             ("HashMap", "entry") => HashMapKey("hashmap_entry"),
             ("HashMapEntry", "or_insert") => Model("hashmap_entry_or_insert"),
+            // strings: the lists of their UTF-8 bytes, see `Frontend::ty` and AutoCorrode's
+            // `StdLib_Utf8`
+            ("str" | "String", "len") => Len,
+            ("str" | "String", "is_empty") => Model("slice_is_empty"),
+            ("String", "new" | "with_capacity") => VecNew,
+            ("String", "as_bytes" | "into_bytes" | "from_utf8_unchecked" | "into_boxed_str") => Conversion,
+            ("String", "push_str") => Model("vec_extend_from_slice"),
+            ("String", "push") => Model("string_push"),
+            ("String", "pop") => Model("string_pop"),
+            ("String", "truncate") => Model("string_truncate"),
+            ("String", "clear") => Model("vec_clear"),
             ("str", "lines") => Model("str_lines"),
             ("str", "split_whitespace") => Model("str_split_whitespace"),
             ("str", "chars") => Model("str_chars"),
+            ("str", "char_indices") => Model("str_char_indices"),
+            // the state of `Bytes` is the string itself
+            ("str", "bytes") => Conversion,
             ("str", "as_bytes") => Model("str_as_bytes"),
+            ("str", "trim") => Model("str_trim"),
+            ("str", "trim_start") => Model("str_trim_start"),
+            ("str", "trim_end") => Model("str_trim_end"),
+            ("str", "is_char_boundary") => Model("str_is_char_boundary_fn"),
+            ("str", "split_at") => Model("str_split_at"),
+            ("str", "repeat") => Model("str_repeat"),
+            ("str", "get") => StrGet,
+            ("str" | "slice", "is_ascii") => Model("bytes_is_ascii"),
+            ("str" | "slice", "eq_ignore_ascii_case") => Model("bytes_eq_ignore_ascii_case"),
+            ("str" | "slice", "to_ascii_uppercase") => Model("bytes_to_ascii_uppercase"),
+            ("str" | "slice", "to_ascii_lowercase") => Model("bytes_to_ascii_lowercase"),
+            ("str", "from_utf8") => Model("str_from_utf8"),
+            ("str", "from_utf8_unchecked") => Conversion,
+            ("String", "from_utf8") => Model("string_from_utf8"),
+            ("Utf8Error", "valid_up_to") => Model("utf8_error_valid_up_to_fn"),
+            ("Utf8Error", "error_len") => Model("utf8_error_error_len_fn"),
+            ("FromUtf8Error", "utf8_error") => Model("from_utf8_error_utf8_error"),
+            ("FromUtf8Error", "into_bytes" | "as_bytes") => Model("from_utf8_error_into_bytes"),
             // only followed by `as_bytes` (see `encode_utf8_bytes`)
             ("char", "encode_utf8") => CharEncodeUtf8,
-            ("str", "starts_with") => StrStartsWith,
+            ("str", "starts_with") => StrPattern("str_starts_with"),
+            ("str", "ends_with") => StrPattern("str_ends_with"),
+            ("str", "strip_prefix") => StrPattern("str_strip_prefix"),
+            ("str", "strip_suffix") => StrPattern("str_strip_suffix"),
+            ("str", "contains") => StrPattern("str_contains"),
+            ("str", "find") => StrPattern("str_find"),
             ("str", "parse") => StrParse,
+            // characters: their code points
+            ("char", "len_utf8") => Model("char_len_utf8"),
+            ("char", "from_u32") => Model("char_from_u32"),
+            ("char", "to_digit") => Model("char_to_digit"),
+            ("char", "from_digit") => Model("char_from_digit"),
+            ("char", "is_whitespace") => Model("char_is_whitespace_fn"),
+            ("char", "is_control") => Model("char_is_control_fn"),
+            // the ASCII methods of `u8` and `char` (only `u8` has them among the integers)
+            ("char" | "uint", "is_ascii") => AsciiTest("\\<lambda>_. True"),
+            ("char" | "uint", "is_ascii_alphabetic") => AsciiTest("ascii_is_alphabetic"),
+            ("char" | "uint", "is_ascii_uppercase") => AsciiTest("ascii_is_uppercase"),
+            ("char" | "uint", "is_ascii_lowercase") => AsciiTest("ascii_is_lowercase"),
+            ("char" | "uint", "is_ascii_alphanumeric") => AsciiTest("ascii_is_alphanumeric"),
+            ("char" | "uint", "is_ascii_digit") => AsciiTest("ascii_is_digit"),
+            ("char" | "uint", "is_ascii_hexdigit") => AsciiTest("ascii_is_hexdigit"),
+            ("char" | "uint", "is_ascii_punctuation") => AsciiTest("ascii_is_punctuation"),
+            ("char" | "uint", "is_ascii_graphic") => AsciiTest("ascii_is_graphic"),
+            ("char" | "uint", "is_ascii_whitespace") => AsciiTest("ascii_is_whitespace"),
+            ("char" | "uint", "is_ascii_control") => AsciiTest("ascii_is_control"),
+            ("char" | "uint", "to_ascii_uppercase") => Model("ascii_to_uppercase"),
+            ("char" | "uint", "to_ascii_lowercase") => Model("ascii_to_lowercase"),
+            ("char" | "uint", "eq_ignore_ascii_case") => Model("ascii_eq_ignore_case"),
+            // the type of the result is that of the call
+            ("uint", "from_str_radix") => ModelTyped("from_str_radix_word"),
+            ("int", "from_str_radix") => ModelTyped("from_str_radix_sword"),
             // bitwise operations: also on signed integers, whose HOL type is a word type
             ("uint" | "int", "wrapping_add") => Model("wrapping_add"),
             ("uint" | "int", "wrapping_sub") => Model("wrapping_sub"),
@@ -2995,14 +3060,19 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Cmp if !target.is_local() && self.hol_ordered(self.ty_adj(arg_exprs[0]).peel_refs()) => {
                 Some(self.named_call("cmp", vec![a(0), a(1)]))
             }
+            // strings by their bytes
+            Cmp if !target.is_local() && self.str_like(self.ty_adj(arg_exprs[0]).peel_refs()) => {
+                Some(self.named_call("str_cmp", vec![a(0), a(1)]))
+            }
             OptionUnwrap => Some(self.named_call("option_unwrap", vec![a(0)])),
-            OptionExpect => Some(self.named_call("option_expect", vec![a(0), a(1)])),
+            // the message is a Rust string, the panic message a HOL `String.literal`
+            OptionExpect => Some(self.named_call("option_expect_str", vec![a(0), a(1)])),
             OptionIsSome => Some(self.named_call("urust_func_option_is_some", vec![a(0)])),
             OptionIsNone => Some(self.named_call("urust_func_option_is_none", vec![a(0)])),
             OptionOkOr => Some(self.named_call("ok_or", vec![a(0), a(1)])),
             OptionTake => Some(self.named_call("take_mut_ref_option", vec![a(0)])),
             ResultUnwrap => Some(self.named_call("result_unwrap", vec![a(0)])),
-            ResultExpect => Some(self.named_call("result_expect", vec![a(0), a(1)])),
+            ResultExpect => Some(self.named_call("result_expect_str", vec![a(0), a(1)])),
             ResultIsOk => Some(self.named_call("urust_func_result_is_ok", vec![a(0)])),
             ResultIsErr => Some(self.named_call("urust_func_result_is_err", vec![a(0)])),
             ResultOk => Some(self.named_call("ok", vec![a(0)])),
@@ -3018,14 +3088,32 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Some(Tr::block(format!("{{ let {} = {}; {} () }}", tmp, a(0).s, g.join("\n"))))
             }
             RangeInclusiveNew => Some(Tr::new(format!("{} ..= {}", a(0).at(42), a(1).at(42)), 41)),
-            Conversion | SliceIter if same_hol(self) => Some(a(0)),
-            // a lossless conversion between integers (`From`, `Into`): the value, as `as` converts it
+            Conversion | SliceIter | ToString if same_hol(self) => Some(a(0)),
+            // the `Display` text of a value of a type with a model of `Display` (see `fmt_model`),
+            // with the default options; a character's is its encoding
+            ToString => {
+                let src = self.ty_adj(arg_exprs[0]).peel_refs();
+                if src.is_char() {
+                    Some(self.named_call("char_to_string", vec![a(0)]))
+                } else {
+                    self.fmt_model("Display", src).map(|n| {
+                        let text = Tr::atom(format!("\\<llangle>{}_text\\<rrangle>", n));
+                        self.named_call("fmt_to_string", vec![text, Tr::atom(format!("{}_u32", FMT_DEFAULT_FLAGS)), a(0)])
+                    })
+                }
+            }
+            // a lossless conversion between integers and characters (`From`, `Into`): the value, as
+            // `as` converts it (a `char` is its code point, a `u32`); a character to a `String`
+            // (`From`, `ToString`): its encoding
             Conversion if !arg_exprs.is_empty() => {
                 let src = self.ty_adj(arg_exprs[0]).peel_refs();
                 let dst = self.ty_of(e);
-                match Self::int_suffix(dst) {
+                let int_or_char = |t: Ty<'tcx>| if t.is_char() { Some("u32") } else { Self::int_suffix(t) };
+                match int_or_char(dst) {
                     Some(sfx) if src.is_bool() => Some(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", a(0).at(20), sfx, sfx), 21)),
-                    Some(sfx) if Self::int_suffix(src).is_some() => Some(Tr::new(format!("({}) as {}", a(0).s, sfx), 299)),
+                    Some(sfx) if int_or_char(src).is_some() => Some(Tr::new(format!("({}) as {}", a(0).s, sfx), 299)),
+                    // `String::from(c)`
+                    None if src.is_char() && self.str_like(dst) => Some(self.named_call("char_to_string", vec![a(0)])),
                     _ => None,
                 }
             }
@@ -3104,11 +3192,35 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     _ => None,
                 }
             }
-            StrStartsWith => match self.ty_adj(arg_exprs[1]).peel_refs().kind() {
-                ty::Char => Some(self.named_call("str_starts_with_char", vec![a(0), a(1)])),
-                ty::Str => Some(self.named_call("str_starts_with_str", vec![a(0), a(1)])),
-                _ => None,
-            },
+            // a `char` or a string pattern (a closure or a slice of characters has no model)
+            StrPattern(base) => {
+                let pt = self.ty_adj(arg_exprs[1]).peel_refs();
+                if pt.is_char() {
+                    Some(self.named_call(&format!("{}_char", base), vec![a(0), a(1)]))
+                } else if self.str_like(pt) {
+                    Some(self.named_call(&format!("{}_str", base), vec![a(0), a(1)]))
+                } else {
+                    None
+                }
+            }
+            AsciiTest(p) => Some(self.named_call("ascii_test", vec![Tr::atom(format!("\\<llangle>{}\\<rrangle>", p)), a(0)])),
+            // `str::get` by a range
+            StrGet => {
+                let m = match self.range_kind(self.ty_adj(arg_exprs[1]).peel_refs()) {
+                    Some(RangeKind::Range | RangeKind::Inclusive) => Some("str_get_range"),
+                    Some(RangeKind::To) => Some("str_get_to"),
+                    Some(RangeKind::ToInclusive) => Some("str_get_to_inclusive"),
+                    Some(RangeKind::From) => Some("str_get_from"),
+                    Some(RangeKind::Full) => return Ok(Some(Tr::new(format!("Some({})", a(0).s), 999))),
+                    None => None,
+                };
+                m.map(|m| self.named_call(m, vec![a(0), a(1)]))
+            }
+            // `String + &str`: the concatenation; `String += &str`: appends
+            StringAdd if self.str_like(self.ty_adj(arg_exprs[0]).peel_refs()) => Some(self.named_call("string_add", vec![a(0), a(1)])),
+            StringAddAssign if self.str_like(self.ty_adj(arg_exprs[0]).peel_refs()) => {
+                Some(self.named_call("vec_extend_from_slice", vec![a(0), a(1)]))
+            }
             // `str::parse::<F>` for an integer type `F` (the result's type is stated by `result_stated`)
             StrParse => match gargs.types().next().map(|t| t.kind()) {
                 Some(ty::Uint(_)) => Some(self.named_call("str_parse_word", vec![a(0)])),
@@ -3214,7 +3326,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         match t.kind() {
             ty::Uint(_) | ty::Bool => Some("ord_cmp".into()),
             ty::Int(_) => Some("(\\<lambda>a b. ord_cmp (sint a) (sint b))".into()),
-            ty::Char => Some("(\\<lambda>a b. ord_cmp (of_char a :: nat) (of_char b))".into()),
+            // a `char` by its code point
+            ty::Char => Some("ord_cmp".into()),
+            // strings by their bytes (see `str_ord`)
+            ty::Str => Some("str_ord".into()),
+            ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String") => Some("str_ord".into()),
             ty::Adt(d, args) if d.is_struct() && d.did().is_local() && self.fe.record_adts.contains(&d.did()) && !seen.contains(&d.did()) => {
                 // `sort` compares with `PartialOrd::lt`: `Ord` and `PartialOrd` are derived, and
                 // `lt` is derived or `PartialOrd`'s default (through the derived `partial_cmp`)
@@ -3258,7 +3374,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         Ok(Some(match t.kind() {
             ty::Uint(_) | ty::Int(_) => Self::int_lit(0, false, t)?,
             ty::Bool => Tr::atom("false"),
-            ty::Char => Tr::atom("\\<llangle>CHR 0x00\\<rrangle>"),
+            ty::Char => Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_char('\0'))),
             ty::Tuple(ts) if ts.is_empty() => Tr::atom("()"),
             ty::Tuple(ts) if ts.len() >= 2 => {
                 let mut vs = vec![];
@@ -3283,7 +3399,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                     let h = self.hty(t);
                     self.typed("dflt", Tr::atom("[]"), &h)
                 }
-                Some("String") => Tr::atom(format!("\\<llangle>STR {}{}\\<rrangle>", "''", "''")),
+                Some("String") => Tr::atom(format!("\\<llangle>{}\\<rrangle>", hol_str(""))),
                 None if d.is_struct() && d.did().is_local() && !seen.contains(&d.did()) => {
                     let Some(dflt) = self.tcx.get_diagnostic_item(Symbol::intern("default_fn")) else { return Ok(None) };
                     let derived = matches!(
@@ -3380,7 +3496,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// on words only, comparing them as signed words for the signed integer types.
     fn hol_ordered(&self, t: Ty<'tcx>) -> bool {
         match t.kind() {
-            ty::Uint(_) | ty::Int(_) => true,
+            ty::Uint(_) | ty::Int(_) | ty::Char => true,
             _ => false,
         }
     }
@@ -3955,7 +4071,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Binding(..) => unsup("`ref mut` binding"),
             PatKind::Expr(pe) => Ok((Some(format!("{} == {}", v.at(45), self.pat_expr(pe, pat)?.at(45))), vec![])),
             PatKind::Range(lo, hi, end) => {
-                if self.ty_is_char(pat) { return unsup("range pattern on `char`") }
                 let cs = self.range_conds(lo, hi, end, pat, &v.at(45))?;
                 Ok((Some(cs.into_iter().map(|c| format!("({})", c)).collect::<Vec<_>>().join(" && ")), vec![]))
             }
@@ -3987,10 +4102,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             PatKind::Ref(p, _, _) | PatKind::Deref(p) => self.pat_cond(p, v),
             _ => unsup("pattern in a match on a scalar"),
         }
-    }
-
-    fn ty_is_char(&self, pat: &'tcx hir::Pat<'tcx>) -> bool {
-        self.pat_ty(pat).peel_refs().is_char()
     }
 
     /// The conditions of the range pattern `lo..hi` / `lo..=hi` (in `pat`) on the value `v`.
@@ -4182,7 +4293,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 Ok(tmp)
             }
             PatKind::Range(lo, hi, end) => {
-                if self.ty_is_char(pat) { return unsup("range pattern on `char`") }
                 let tmp = self.fresh("rng");
                 conds.extend(self.range_conds(lo, hi, end, pat, &tmp)?);
                 Ok(tmp)
@@ -4952,7 +5062,7 @@ enum StdFn {
     BoxNew,
     Drop,
     RangeInclusiveNew,
-    /// `ToString::to_string`, `From::from`, `Into::into`, `as_slice`, ...: the identity when the
+    /// `ToOwned::to_owned`, `From::from`, `Into::into`, `as_slice`, ...: the identity when the
     /// argument and the result have the same HOL type
     Conversion,
     SliceIter,
@@ -4993,8 +5103,18 @@ enum StdFn {
     RangeContains,
     /// `<[T]>::get_mut` with an index
     SliceGetMut,
-    /// `str::starts_with` with a `char` or a `&str` pattern
-    StrStartsWith,
+    /// `ToString::to_string`
+    ToString,
+    /// a method of `str` taking a pattern (`starts_with`, `find`, ...), by the common prefix of the
+    /// names of its models for a `char` and for a string pattern
+    StrPattern(&'static str),
+    /// an ASCII class test of `u8` or `char` (`is_ascii_digit`, ...), by the HOL predicate on the code
+    AsciiTest(&'static str),
+    /// `str::get` with a range
+    StrGet,
+    /// `Add::add`, `AddAssign::add_assign` (on a `String`)
+    StringAdd,
+    StringAddAssign,
     /// `str::parse` into an integer type
     StrParse,
     /// `Ord::min`, `cmp::min` (and `max`) on unsigned integers
@@ -5046,7 +5166,7 @@ const STD_ITEMS: &[(Item, StdFn)] = &[
     (Item::Diag("box_new"), StdFn::BoxNew),
     (Item::Diag("mem_drop"), StdFn::Drop),
     (Item::Lang(LangItem::RangeInclusiveNew), StdFn::RangeInclusiveNew),
-    (Item::Diag("to_string_method"), StdFn::Conversion),
+    (Item::Diag("to_string_method"), StdFn::ToString),
     (Item::Diag("to_owned_method"), StdFn::Conversion),
     (Item::Lang(LangItem::FromFn), StdFn::Conversion),
     (Item::Diag("vec_as_slice"), StdFn::Conversion),
@@ -5063,6 +5183,8 @@ const STD_ITEMS: &[(Item, StdFn)] = &[
     (Item::Diag("mem_swap"), StdFn::Model("mem_swap")),
     (Item::Diag("mem_replace"), StdFn::Model("mem_replace")),
     (Item::Diag("default_fn"), StdFn::DefaultFn),
+    (Item::Diag("str_from_utf8"), StdFn::Model("str_from_utf8")),
+    (Item::Diag("str_from_utf8_unchecked"), StdFn::Conversion),
 ];
 
 /// `if c1 { b1 } else { if c2 { b2 } else { .. } }` for (condition, body) branches;
@@ -5102,36 +5224,31 @@ fn contains_let(e: &hir::Expr<'_>) -> bool {
     }
 }
 
-/// A part of an ASCII string as HOL text: a run of characters printable in `STR ''…''`, or a
-/// single other character (`CHR …`).
-enum StrPiece {
-    Str(String),
-    Char(String),
-}
-
-/// The ASCII string `s` as runs printable in `STR ''…''` and other characters.
-fn hol_str_pieces(s: &str) -> R<Vec<StrPiece>> {
-    if !s.is_ascii() { return unsup("string literal with non-ASCII characters") }
-    let mut out = vec![];
+/// The HOL term of a string literal (`str` is the list of its UTF-8 bytes, see `Frontend::ty`):
+/// the concatenation of the runs of characters printable in `STR ''…''`, as `str_lit (STR ''…'')`
+/// (their ASCII bytes), and of the encodings `char_utf8 c` of the other characters.
+fn hol_str(s: &str) -> String {
+    let mut pieces = vec![];
     let mut run = String::new();
     for c in s.chars() {
         if names::hol_string_ok(&c.to_string()) {
             run.push(c);
         } else {
-            if !run.is_empty() { out.push(StrPiece::Str(std::mem::take(&mut run))) }
-            out.push(StrPiece::Char(hol_char(c)?));
+            if !run.is_empty() { pieces.push(format!("str_lit (STR ''{}'')", std::mem::take(&mut run))) }
+            pieces.push(format!("char_utf8 0x{:X}", c as u32));
         }
     }
-    if !run.is_empty() { out.push(StrPiece::Str(run)) }
-    Ok(out)
+    if !run.is_empty() || pieces.is_empty() { pieces.push(format!("str_lit (STR ''{}'')", run)) }
+    pieces.join(" @ ")
 }
 
-fn hol_char(c: char) -> R<String> {
-    if !c.is_ascii() { return unsup("non-ASCII character literal") }
+/// The HOL term of a character literal (`char` is its code point, a `32 word`): a printable ASCII
+/// character as `char_code CHR ''c''`, another as its code point.
+fn hol_char(c: char) -> String {
     if c.is_ascii_alphanumeric() || " !#$%&()*+,-./:;<=>?@[]^_`{|}~".contains(c) {
-        Ok(format!("CHR ''{}''", c))
+        format!("char_code CHR ''{}''", c)
     } else {
-        Ok(format!("CHR 0x{:02X}", c as u32))
+        format!("(0x{:X} :: 32 word)", c as u32)
     }
 }
 

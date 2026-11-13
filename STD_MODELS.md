@@ -23,8 +23,8 @@
 | `i128`、`u128` | `128 sword`、`128 word` | 同上 |
 | `f32`、`f64` | 无模型：占位类型，登记为占位符 | |
 | `bool` | `bool` | |
-| `char` | HOL `char` | HOL `char` 只有 256 个值；非 ASCII 的字面量登记为占位符，其他来源的非 ASCII 字符无法表示 |
-| `str` | `String.literal` | 只能表示 ASCII；非 ASCII 字面量登记为占位符 |
+| `char` | `32 word`：码点（AutoCorrode `StdLib_Utf8`） | 值总是 Unicode 标量值（`is_scalar`），这是产生字符的途径（字面量、`u8 as char`、`char::from_u32` 等的检查）保证的不变量，不由类型保证；与 `u32` 的 HOL 类型相同 |
+| `str` | `8 word list`：UTF-8 编码的字节（写法与 `[u8]` 相同） | 值总是有效的 UTF-8（`utf8_valid`），同样是产生字符串的途径（字面量、`from_utf8` 的检查、模型）保证的不变量；`from_utf8_unchecked` 不检查，与 Rust 一样由调用者保证 |
 | `&T` | `T` | 引用的身份（地址）不保留 |
 | `&mut T` | `('addr, 'gv, T) Global_Store.ref` | |
 | `[T]` | `T list` | |
@@ -116,10 +116,18 @@
 ### String
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| `String` | `String.literal` | Isabelle | `Frontend::ty` |
-| `String` 到 `str` 的 `Deref`、`String::as_str` | 恒等 | 前端写法 | `pv_adjusted`、`std_call` |
+| `String` | `8 word list`（同 `str`） | 前端写法 | `Frontend::ty` |
+| `String` 到 `str` 的 `Deref`、`String::as_str`；`as_bytes`、`into_bytes`、`into_boxed_str`、`from_utf8_unchecked`；`str` 到 `String` 的 `to_string`、`to_owned`、`From` | 恒等（实参与结果的 HOL 类型相同） | 前端写法 | `pv_adjusted`、`std_call` |
+| `String::new`、`with_capacity` | `[]` | 前端写法 | `std_call` |
+| `len`、`is_empty`（`String` 和 `str`） | uRust `len`、`slice_is_empty`（字节数） | AutoCorrode、手写 | `std_fn`/`std_call` |
+| `push_str`、`String += &str` | `vec_extend_from_slice`（追加字节） | 手写 | 同上 |
+| `push`、`pop`、`truncate`、`clear` | `string_push`（追加编码）、`string_pop`（去掉最后一个字符的编码）、`string_truncate`（新长度不在字符边界上时 panic）、`vec_clear` | 手写 | 同上 |
+| `String + &str` | `string_add`（拼接） | 手写 | `std_fn`（`Add` 的 lang item）/`std_call` |
+| `String::from_utf8` | `string_from_utf8`：有效时 `Ok` 字节，否则 `Err` 为 `from_utf8_error`（字节和 `utf8_error`）；`FromUtf8Error` 的 `utf8_error`、`into_bytes`、`as_bytes` | 手写 | 同上 |
+| `char` 到 `String` 的 `to_string`、`From` | `char_to_string`（编码） | 手写 | `std_call` |
+| 整数、`bool` 等有 `Display` 模型的类型（见“格式化”）的 `ToString::to_string` | `fmt_to_string`：以默认选项（`FormattingOptions::new()`）算出的 `Display` 文本，编码成 UTF-8，与 Rust 的 `ToString` 的一般实现相同 | AutoCorrode `StdLib_Fmt` | `std_call` |
 
-丢掉的语义：容量；非 ASCII 内容无法表示。
+丢掉的语义：容量。
 
 ### Ordering 与比较
 | Rust | 模型 | 来源 | 位置 |
@@ -127,9 +135,12 @@
 | `Ordering` 及其变体 | `ordering` | AutoCorrode `StdLib_Ordering` | `Frontend::ty`、`unit_ctor` |
 | `Ord::cmp`（操作数为有符号或无符号整数；AutoCorrode 的 `cmp` 只定义在 word 上，有符号时按有符号数比较） | `cmp` | AutoCorrode `StdLib_Ordering` | `std_call`（`hol_ordered`）；标准库实现的字典字段（`model_field`） |
 
-`bool`、`str`、`String` 的 `Ord::cmp` 没有模型（AutoCorrode 的 `cmp` 不接受这些类型），生成外部函数模板。
+| `char` 的 `Ord::cmp` | `cmp`（按码点） | AutoCorrode `StdLib_Ordering` | `std_call`（`hol_ordered`） |
+| `str`、`String` 的 `Ord::cmp` | `str_cmp`：字节的字典序（`bytes_cmp`），即字符的字典序 | 手写 | `std_call` |
 
-字典（见 `LANGUAGE_FEATURES.md` 的“泛型与 trait”）中，标准库对同一种有模型的整数实现的 `Add`、`Sub`、`Mul`、`Div`、`Rem`、`BitAnd`、`BitOr`、`BitXor` 的方法和 `PartialOrd` 的 `lt`、`le`、`gt`、`ge` 是 uRust 的相应运算，`bool` 的 `BitAnd`、`BitOr`、`BitXor` 是 `&&`、`||`、`!=`，与直接写出的运算符的翻译（`binary`）相同（`model_field`）；移位和其他方法生成外部函数模板。
+`bool` 的 `Ord::cmp` 没有模型（AutoCorrode 的 `cmp` 不接受这个类型），生成外部函数模板。
+
+字典（见 `LANGUAGE_FEATURES.md` 的“泛型与 trait”）中，标准库对同一种有模型的整数实现的 `Add`、`Sub`、`Mul`、`Div`、`Rem`、`BitAnd`、`BitOr`、`BitXor` 的方法和 `PartialOrd` 的 `lt`、`le`、`gt`、`ge` 是 uRust 的相应运算，`bool` 的 `BitAnd`、`BitOr`、`BitXor` 是 `&&`、`||`、`!=`，`char` 的 `Ord::cmp` 和 `PartialOrd` 的 `lt`、`le`、`gt`、`ge` 是码点上的 `cmp` 和比较，与直接写出的运算符的翻译（`binary`）相同（`model_field`）；移位和其他方法生成外部函数模板。
 
 ### 相等（PartialEq）
 | Rust | 模型 | 来源 | 位置 |
@@ -181,7 +192,7 @@
 | Rust | 状态（HOL 类型） | `next`（步进函数） | 来源 | 位置 |
 |---|---|---|---|---|
 | `slice::Iter<T>`（`<[T]>::iter`，以及 `&[T]`、`&Vec<T>` 的 `into_iter`） | `T list`（剩余元素；`T` 的引用与 `T` 的 HOL 类型相同） | `list_iter_next`；`next_back` 为 `list_iter_next_back` | 手写 `StdLib_Frontend_Models` | `Frontend::ty`、`iter_step` |
-| `str::Lines`、`str::SplitWhitespace`、`str::Chars` | `String.literal list`、`char list`（剩余的行、词、字符；由 `str_lines` 等在创建时算出，`str` 不可变） | 同上 | 手写 | 同上 |
+| `str::Lines`、`str::SplitWhitespace`、`str::Chars`、`str::CharIndices`、`str::Bytes` | 剩余的行、词（字节表的表）、字符（`32 word list`）、字符及其字节偏移（`(64 word × 32 word × tnil) list`）、字节（`8 word list`）；由 `str_lines` 等在创建时算出，`str` 不可变 | 同上 | 手写 | 同上 |
 | `slice::ChunksExact<T>` | `T list list × T list × tnil`（剩余的块、余数） | `chunks_exact_next` | 手写 | 同上 |
 | `Enumerate<I>` | `I × 64 word × tnil`（内层、计数） | `enumerate_next`：计数溢出时 panic | 手写 | 同上 |
 | `Zip<A, B>` | `A × B × tnil` | `zip_next`：只在 `A` 有元素时推进 `B`（Rust 的一般实现） | 手写 | 同上 |
@@ -225,13 +236,37 @@
 ### str
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| `lines`、`split_whitespace`、`chars` | `str_lines`（按 Rust 的实现：`split_inclusive('\n')`，去掉 `\n` 和其前的 `\r`）、`str_split_whitespace`（ASCII 的 Unicode 空白：9–13、32）、`str_chars` | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
-| `as_bytes` | `str_as_bytes`（ASCII 字符的码值） | 手写 | 同上 |
-| `starts_with`（模式为 `char` 或 `&str`） | `str_starts_with_char`、`str_starts_with_str` | 手写 | 同上 |
-| `parse::<F>`（`F` 为整数类型） | `str_parse_word`、`str_parse_sword`：按 `from_str_radix(s, 10)`（可选的 `+`，有符号时可选的 `-`；非数字先于溢出报错） | 手写 | 同上 |
-| `num::ParseIntError` | `int_error_kind`（它唯一的字段 `IntErrorKind`） | 手写 | `Frontend::ty` |
+字符串是 UTF-8 字节的表，字符是码点（AutoCorrode `StdLib_Utf8` 的纯函数：编码 `char_utf8`、解码 `utf8_decode`、校验 `utf8_check`，按 `core` 的实现）。
 
-由于 `str` 是 `String.literal`（只有 ASCII），这些模型都只处理 ASCII 字符串，与 Rust 在 ASCII 字符串上的行为一致。
+| Rust | 模型 | 来源 | 位置 |
+|---|---|---|---|
+| `lines`、`split_whitespace`、`chars`、`char_indices`、`bytes` | `str_lines`（按 Rust 的实现：`split_inclusive('\n')`，去掉 `\n` 和其前的 `\r`，两者都不出现在多字节序列中）、`str_split_whitespace`（按 `char::is_whitespace`，即 Unicode `White_Space`）、`str_chars`（解码）、`str_char_indices`、恒等 | 手写 `StdLib_Frontend_Models` | `std_fn`/`std_call` |
+| `as_bytes` | `str_as_bytes`（恒等） | 手写 | 同上 |
+| `trim`、`trim_start`、`trim_end` | `str_trim` 等（去掉首尾的 `is_whitespace` 字符） | 手写 | 同上 |
+| `starts_with`、`ends_with`、`strip_prefix`、`strip_suffix`、`contains`、`find`（模式为 `char`、`&str` 或 `&String`） | `str_starts_with_char`、`str_starts_with_str` 等：在字节上比较（字符按其编码；有效 UTF-8 在有效 UTF-8 中的匹配总在字符边界上开始）；闭包、字符切片等其他模式没有模型 | 手写 | 同上 |
+| `s[r]`（`r` 为各种区间）、`get(r)`、`split_at(i)`、`is_char_boundary(i)` | `str_index_range` 等、`str_get_range` 等、`str_split_at`：按字节位置，区间越界、递减或端点不在字符边界上时 panic（`get` 为 `None`），与 Rust 相同；panic 的消息不同 | 手写 | `str_index`、`std_call` |
+| `repeat(n)` | `str_repeat`：长度溢出 `usize` 时 panic | 手写 | `std_fn`/`std_call` |
+| `is_ascii`、`eq_ignore_ascii_case`、`to_ascii_uppercase`、`to_ascii_lowercase`（`str` 和 `[u8]`） | `bytes_is_ascii` 等 | 手写 | 同上 |
+| `str::from_utf8`（函数和关联函数） | `str_from_utf8`：有效时 `Ok` 字节，否则 `Err` 为 `utf8_error`（`valid_up_to`、`error_len`，按 `run_utf8_validation` 算出）；`Utf8Error` 的 `valid_up_to`、`error_len` | 手写 | 同上 |
+| `str::from_utf8_unchecked` | 恒等（不检查，由调用者保证有效） | 前端写法 | 同上 |
+| `str::Utf8Error`、`string::FromUtf8Error` | `utf8_error`、`from_utf8_error`（由 `str::from_utf8`、`String::from_utf8` 的诊断项的结果类型确定） | 手写 | `Frontend::ty`、`std_adts_of` |
+| `parse::<F>`（`F` 为整数类型）、整数的 `from_str_radix` | `str_parse_word`、`str_parse_sword`、`from_str_radix_word`、`from_str_radix_sword`：按 `from_ascii_bytes_radix`（基数不在 2 到 36 之间时 panic；可选的 `+`，有符号时可选的 `-`；数字按 `char::to_digit`；非数字先于溢出报错） | 手写 | 同上 |
+| `num::ParseIntError` | `int_error_kind`（它唯一的字段 `IntErrorKind`） | 手写 | `Frontend::ty` |
+| `Option::expect`、`Result::expect` 的消息 | `option_expect_str`、`result_expect_str`：消息（字节）转成 HOL 的 `String.literal` 作为 panic 消息，非 ASCII 字节写成 `?`（`str_message`；panic 消息不影响语义） | 手写 | `std_call` |
+
+没有模型（生成外部函数模板）：其他 `str` 方法（例如 `split`、`replace`、`to_uppercase`、`to_lowercase`）。
+
+### char
+| Rust | 模型 | 来源 | 位置 |
+|---|---|---|---|
+| `c as T`、`b as char`（`b: u8`）、`From<u8> for char`、`From<char> for u32/u64/u128` | 按 `u32` 的整数转换 | 前端写法 | `cast`、`std_call` |
+| `char::MAX`、`char::REPLACEMENT_CHARACTER` 等常量 | 求值成字面量 | 前端写法 | `scalar_const` |
+| `from_u32` | `char_from_u32`：标量值时 `Some` | 手写 | `std_fn`/`std_call` |
+| `len_utf8`、`to_digit`、`from_digit` | `char_len_utf8`、`char_to_digit`、`char_from_digit`（基数不合法时 panic，与 Rust 相同） | 手写 | 同上 |
+| `is_whitespace`、`is_control` | `char_is_whitespace_fn`（Unicode `White_Space`）、`char_is_control_fn`（`Cc`：0–0x1F、0x7F–0x9F） | 手写 | 同上 |
+| `u8` 和 `char` 的 `is_ascii`、`is_ascii_alphabetic` 等 ASCII 类别、`to_ascii_uppercase`、`to_ascii_lowercase`、`eq_ignore_ascii_case` | `ascii_test`（类别是 `StdLib_Utf8` 中码值上的谓词）、`ascii_to_uppercase` 等 | 手写 | 同上 |
+
+需要 Unicode 数据表的方法（`is_alphabetic`、`is_alphanumeric`、`is_numeric`、`is_lowercase`、`is_uppercase`、`to_uppercase`、`to_lowercase`）没有模型，生成外部函数模板。
 
 其他整数方法（`cast_signed`、`cast_unsigned`、`abs`、`signum`、`unsigned_abs` 等）没有模型，生成外部函数模板。
 
@@ -248,11 +283,11 @@
 |---|---|---|---|
 | `fmt::Formatter` | `fmt_Formatter`（输出缓冲区与 `FormattingOptions` 的 flags、width、precision） | AutoCorrode `StdLib_Fmt` | `Frontend::ty` |
 | `fmt::Error` | `fmt_Error` | AutoCorrode `StdLib_Fmt` | `Frontend::ty`、`unit_ctor` |
-| `alloc::fmt::format`（`format!`）、`Formatter` 上的 `write_fmt`（`write!(f, …)`） | 按 `core::fmt::write` 解释 `format_args!` 的展开：前端解码模板字节串，字面片段用 `fmt_write_str`/`fmt_write_char`/`fmt_write_codes` 写出；每个占位符按它的选项新建一个 formatter，用 `rt::Argument` 构造函数所约束的格式化 trait 的 `fmt`（在参数类型上解析，引用和 `Box` 先剥去，因为它们的实现只转发给内容：本地实现直接调用，基本类型用下面的模型）写入，再把输出写到目标；每次写入（字面片段、格式化、写回输出）的错误都结束输出并作为结果，与 `fmt::write` 中的 `?` 相同，`format` 遇到错误时 panic；动态宽度或精度（`rt::Argument::from_usize`）大于 `u16::MAX` 时在构造参数时 panic；`rt::Argument::new_debug_noop` 不输出任何内容；格式化 trait 是 `rt::Argument` 构造函数的约束（`Frontend::fmt_traits`），其中 `Pointer` 对引用的实现打印地址，不剥去引用（没有模型） | 前端写法 + `StdLib_Fmt` | `fmt_call` |
+| `alloc::fmt::format`（`format!`）、`Formatter` 上的 `write_fmt`（`write!(f, …)`） | 按 `core::fmt::write` 解释 `format_args!` 的展开：前端解码模板字节串，字面片段用 `fmt_write_str` 写出；每个占位符按它的选项新建一个 formatter，用 `rt::Argument` 构造函数所约束的格式化 trait 的 `fmt`（在参数类型上解析，引用和 `Box` 先剥去，因为它们的实现只转发给内容：本地实现直接调用，基本类型用下面的模型）写入，再把输出写到目标；每次写入（字面片段、格式化、写回输出）的错误都结束输出并作为结果，与 `fmt::write` 中的 `?` 相同，`format` 遇到错误时 panic；动态宽度或精度（`rt::Argument::from_usize`）大于 `u16::MAX` 时在构造参数时 panic；`rt::Argument::new_debug_noop` 不输出任何内容；格式化 trait 是 `rt::Argument` 构造函数的约束（`Frontend::fmt_traits`），其中 `Pointer` 对引用的实现打印地址，不剥去引用（没有模型） | 前端写法 + `StdLib_Fmt` | `fmt_call` |
 | `Display`、`Debug`、`LowerHex`、`UpperHex`、`Octal`、`Binary` 的 `fmt`，用于无符号与有符号整数、`bool`、`char`、`str`、`String` | `fmt_<Trait>_<word|sword|bool|char|str>`，按 `core::fmt` 的实现移植（填充、对齐、宽度、精度、`+`、`#`、`0`、`x?`） | AutoCorrode `StdLib_Fmt` | `fmt_arg_call`、`std_call` |
 | `Formatter` 的 `write_str`、`write_char`、`pad`、`pad_integral`、`alternate`、`sign_plus`、`sign_minus`、`sign_aware_zero_pad`、`width`、`precision`、`fill`；`fmt::Write::write_str`/`write_char`（在 `Formatter` 上） | `fmt_<方法名>` | AutoCorrode `StdLib_Fmt` | `std_fn`/`std_call` |
 
-与 Rust 的差别：formatter 的输出是 Unicode 码点的列表（字面片段中的非 ASCII 字符用 `fmt_write_codes` 写出，占位符的子 formatter 的输出用 `fmt_formatter_codes` 按码点写回），但字符串是 `String.literal`，只能表示 ASCII：把含非 ASCII 字符的输出读成 `String`（`format!`）时模型中止；目标是 `fmt::Write` 的其他实现（例如 `String`、`io::Write`）时没有模型。没有模型（登记为占位符）：浮点数、指针等其他类型的格式化，派生的 `Debug`，泛型参数类型的值的格式化，作为值传递的 `fmt::Arguments`。
+formatter 的输出是 Unicode 码点的列表：写入的字符串先解码，占位符的子 formatter 的输出用 `fmt_formatter_codes` 按码点写回，读成 `String`（`format!`）时再编码成 UTF-8。与 Rust 的差别：`Debug` 对 U+0080 以上的字符不转义（Rust 按 Unicode 属性转义其中的一部分）；目标是 `fmt::Write` 的其他实现（例如 `String`、`io::Write`）时没有模型。没有模型（登记为占位符）：浮点数、指针等其他类型的格式化，派生的 `Debug`，泛型参数类型的值的格式化，作为值传递的 `fmt::Arguments`。
 
 ### 恒等形状的函数
 | Rust | 模型 | 来源 | 位置 |

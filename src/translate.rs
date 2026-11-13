@@ -728,10 +728,10 @@ fn const_data<'tcx>(fe: &mut Frontend<'tcx>, did: DefId) -> Option<String> {
 }
 
 /// Append the HOL value of the constant value `val` of type `t` (see `Frontend::ty`) to `out`:
-/// integers as numbers, `bool` as `True` / `False`, arrays as lists, tuples as tuples ending in
+/// integers and characters (code points) as numbers, `bool` as `True` / `False`, arrays as lists, tuples as tuples ending in
 /// `TNil`, `()` as `()`, `Option` and `Result` by their HOL constructors, and local ADTs (not
 /// unions, not declared as abstract types) by their datatype constructors. Anything else
-/// (floats, `char`, references, pointers, other external or standard library types, ...) has
+/// (floats, references, pointers, other external or standard library types, ...) has
 /// no data form: `None`.
 fn value_data<'tcx>(fe: &mut Frontend<'tcx>, val: ConstValue, t: Ty<'tcx>, out: &mut String) -> Option<()> {
     let tcx = fe.tcx;
@@ -750,7 +750,8 @@ fn value_data<'tcx>(fe: &mut Frontend<'tcx>, val: ConstValue, t: Ty<'tcx>, out: 
     };
     match t.kind() {
         ty::Bool => out.push_str(if val.try_to_bool()? { "True" } else { "False" }),
-        ty::Int(_) | ty::Uint(_) => {
+        // a `char` is its code point (see `Frontend::ty`)
+        ty::Int(_) | ty::Uint(_) | ty::Char => {
             let s = val.try_to_scalar_int()?;
             let bits = s.to_bits(s.size());
             if t.is_signed() {
