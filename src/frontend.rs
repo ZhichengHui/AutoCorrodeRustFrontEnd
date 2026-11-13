@@ -141,6 +141,8 @@ pub struct Frontend<'tcx> {
     pub placeholders: Vec<String>,
     /// Number of uses of placeholder types so far (see `ty_modelled`).
     placeholder_type_uses: usize,
+    /// the ADT types `ty` is translating, outermost first (see `ty`)
+    adts_in_progress: Vec<Ty<'tcx>>,
     pub fun_defs: Vec<FunDef<'tcx>>,
     pub item_comments: Vec<String>,
     /// Table used by call markers (`\u{1}C<n>\u{2}` etc.).
@@ -384,6 +386,7 @@ impl<'tcx> Frontend<'tcx> {
             opaques: Vec::new(),
             placeholders: Vec::new(),
             placeholder_type_uses: 0,
+            adts_in_progress: vec![],
             fun_defs: Vec::new(),
             item_comments: Vec::new(),
             marker_ids: Vec::new(),
@@ -953,7 +956,27 @@ impl<'tcx> Frontend<'tcx> {
     }
 
     /// Map a Rust type to a HOL type.
+    ///
+    /// An ADT's HOL type takes the HOL types of its associated-type projections (see `adt_projs`),
+    /// instantiated and normalised; one of them may contain the ADT type itself (jaq-core:
+    /// `Native<D>` holds function pointers taking a context with `&Lut<Native<D>>`, so a projection
+    /// on `D` normalises to a type containing `Native<D>`). That HOL type would be infinite: a
+    /// placeholder type instead.
     pub fn ty(&mut self, t: Ty<'tcx>) -> String {
+        if !matches!(t.kind(), ty::Adt(..)) {
+            return self.ty_inner(t);
+        }
+        if self.adts_in_progress.contains(&t) {
+            let d = format!("whose associated-type parameters contain itself {}", self.tcx.def_path_str(t.ty_adt_def().expect("an ADT").did()));
+            return self.placeholder_type(&d, 0);
+        }
+        self.adts_in_progress.push(t);
+        let r = self.ty_inner(t);
+        self.adts_in_progress.pop();
+        r
+    }
+
+    fn ty_inner(&mut self, t: Ty<'tcx>) -> String {
         match t.kind() {
             ty::Bool => "bool".into(),
             // its code point (a Unicode scalar value)

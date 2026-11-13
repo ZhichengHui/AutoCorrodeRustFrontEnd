@@ -1739,7 +1739,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let rd = inst.def_id();
                 self.tcx.impl_of_assoc(rd).is_some()
                     && (self.derived(rd) || self.fe.is_std(rd))
-                    && !args.types().any(|t| self.holds_hashmap(t, &mut vec![]))
+                    && !args.types().any(|t| self.holds_hashmap(t, &mut HashSet::new()))
             }
             _ => false,
         }
@@ -2424,7 +2424,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let this = r.self_ty();
         let rhs = r.args.types().nth(1);
         let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
-        if tcx.is_lang_item(tr, LangItem::PartialEq) && same && !self.holds_hashmap(this, &mut vec![]) {
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same && !self.holds_hashmap(this, &mut HashSet::new()) {
             return match name.as_str() {
                 "eq" => Some(lam2("a == b".into())),
                 "ne" => Some(lam2("a != b".into())),
@@ -3054,10 +3054,10 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         use StdFn::*;
         let r = match f {
             Clone => Some(a(0)),
-            Eq if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut vec![]) => {
+            Eq if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut HashSet::new()) => {
                 Some(Self::mk_bin("==", 44, &a(0), &a(1)))
             }
-            Ne if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut vec![]) => {
+            Ne if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut HashSet::new()) => {
                 Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
             }
             // AutoCorrode's `cmp` needs an `order` on the operands' HOL type
@@ -3245,7 +3245,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             // the key `K`: the first type argument of `HashMap<K, V, S>`; a borrowed key `&Q` must
             // have its HOL type
             HashMapKey(n) => {
-                let k = gargs.types().next().filter(|k| !k.has_param() && self.structural_eq_ty(*k, &mut vec![]));
+                let k = gargs.types().next().filter(|k| !k.has_param() && self.structural_eq_ty(*k, &mut HashSet::new()));
                 let key_arg_ok = |this: &mut Self, k: Ty<'tcx>| {
                     arg_exprs.get(1).is_none_or(|x| this.fe.ty(this.ty_adj(x).peel_refs()) == this.fe.ty(k))
                 };
@@ -3262,7 +3262,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => None,
             },
             VecDedup => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
-                ty::Adt(_, va) if self.structural_eq_ty(va.type_at(0), &mut vec![]) => Some(self.named_call("vec_dedup", vec![a(0)])),
+                ty::Adt(_, va) if self.structural_eq_ty(va.type_at(0), &mut HashSet::new()) => Some(self.named_call("vec_dedup", vec![a(0)])),
                 _ => None,
             },
             PartialCmp => {
@@ -3290,8 +3290,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     /// Whether `PartialEq` on `t` is structural (HOL's equality): on the primitive types, `str`,
     /// `String`, and the tuples, arrays, slices, `Vec`s and `Option`s of such types, and on local
-    /// ADTs whose `PartialEq` is derived, with such fields. `seen`: the ADTs being checked.
-    fn structural_eq_ty(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+    /// ADTs whose `PartialEq` is derived, with such fields. `seen`: the ADTs checked or being
+    /// checked, each once (otherwise exponential in mutually recursive ADTs sharing fields, see
+    /// `glue_in`). One in `seen` counts as structural: every case is a conjunction of its parts,
+    /// so a part found not structural makes the whole answer false, and the ones in `seen` are
+    /// structural or still being checked (a cycle, structural if the rest is).
+    fn structural_eq_ty(&self, t: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> bool {
         match t.kind() {
             ty::Uint(_) | ty::Int(_) | ty::Bool | ty::Char | ty::Str => true,
             // not `&mut T`: its HOL value is a reference, whose equality is the address's
@@ -3311,10 +3315,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                         self.resolve_instance(m, self.tcx.mk_args(&[t.into(), t.into()])),
                         Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), .. })) if self.derived(rd)
                     );
-                    seen.push(t);
-                    let fields = derived && d.all_fields().all(|f| self.structural_eq_ty(f.ty(self.tcx, args).skip_normalization(), seen));
-                    seen.pop();
-                    fields
+                    seen.insert(t);
+                    derived && d.all_fields().all(|f| self.structural_eq_ty(f.ty(self.tcx, args).skip_normalization(), seen))
                 }
                 None => false,
             },
@@ -3506,11 +3508,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// Whether a value of type `t` holds a `HashMap` (also in the fields of local ADTs): its
-    /// model is a list in insertion order, so HOL's equality is not the map's.
-    fn holds_hashmap(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
-        if seen.contains(&t) { return false }
-        seen.push(t);
-        let r = t.walk().any(|g| match g.kind() {
+    /// model is a list in insertion order, so HOL's equality is not the map's. A search over the
+    /// types not in `seen`, each explored once (see `glue_in`).
+    fn holds_hashmap(&self, t: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> bool {
+        if !seen.insert(t) { return false }
+        t.walk().any(|g| match g.kind() {
             ty::GenericArgKind::Type(x) => match x.kind() {
                 ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("HashMap") => true,
                 ty::Adt(d, _) if d.did().is_local() && x != t => self.holds_hashmap(x, seen),
@@ -3520,9 +3522,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => false,
             },
             _ => false,
-        });
-        seen.pop();
-        r
+        })
     }
 
     fn derived(&self, did: DefId) -> bool {
@@ -4515,7 +4515,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     fn needs_glue(&self, t: Ty<'tcx>) -> bool {
         if !self.fe.has_drop_impls { return false }
         if let Some(&r) = self.glue_cache.borrow().get(&t) { return r }
-        let r = self.glue_in(t, &mut vec![]);
+        let r = self.glue_in(t, &mut HashSet::new());
         self.glue_cache.borrow_mut().insert(t, r);
         r
     }
@@ -4526,11 +4526,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         crate::frontend::try_normalize(self.tcx, self.typing_env(), ty::Unnormalized::new_wip(t)).unwrap_or(t)
     }
 
-    fn glue_in(&self, t: Ty<'tcx>, seen: &mut Vec<Ty<'tcx>>) -> bool {
+    /// Whether a type reachable from `t` (through fields, contents, elements, captures) has a
+    /// destructor of the crate, by a depth-first search over the types not in `seen`. A type
+    /// already visited is not explored again: either it reached no destructor, or it is still
+    /// being explored by a caller, which then answers for it. (Unvisiting a type on the way back
+    /// would explore it again on every path to it: exponential in mutually recursive types that
+    /// share fields, as sqlparser's syntax tree.)
+    fn glue_in(&self, t: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> bool {
         let t = self.reveal(t);
-        if seen.contains(&t) { return false }
-        seen.push(t);
-        let r = match t.kind() {
+        if !seen.insert(t) { return false }
+        match t.kind() {
             ty::Adt(d, args) if d.did().is_local() => {
                 self.tcx.adt_destructor(d.did()).is_some()
                     || d.all_fields().any(|f| self.glue_in(f.ty(self.tcx, args).skip_normalization(), seen))
@@ -4544,9 +4549,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Array(x, _) | ty::Slice(x) => self.glue_in(*x, seen),
             ty::Closure(_, a) => a.as_closure().upvar_tys().iter().any(|x| self.glue_in(x, seen)),
             _ => false,
-        };
-        seen.pop();
-        r
+        }
     }
 
     /// The statements dropping the value `pv` of type `t` (Rust's drop glue): for a local struct
