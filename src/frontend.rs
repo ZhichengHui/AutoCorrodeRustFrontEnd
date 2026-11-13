@@ -758,8 +758,8 @@ impl<'tcx> Frontend<'tcx> {
         let ty::Adt(def, args) = t.kind() else { return None };
         let inner = |i: usize| args.types().nth(i).expect("type argument of an iterator adapter");
         Some(match (self.std_adt(def.did())?, back) {
-            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", false) => "list_iter_next".into(),
-            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars", true) => "list_iter_next_back".into(),
+            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars" | "Bytes" | "CharIndices", false) => "list_iter_next".into(),
+            ("SliceIter" | "SliceIterMut" | "VecIntoIter" | "Lines" | "SplitWhitespace" | "Chars" | "Bytes" | "CharIndices", true) => "list_iter_next_back".into(),
             ("ChunksExact", false) => "chunks_exact_next".into(),
             ("Chunks", false) => "chunks_next".into(),
             // `Filter::next` is the inner `find`, which takes the crate's fuel
@@ -949,6 +949,12 @@ impl<'tcx> Frontend<'tcx> {
         out
     }
 
+    /// The HOL type of `str` and `String`: the list of the UTF-8 bytes, written as the HOL type of
+    /// `[u8]` (the same text, so that conversions between them are recognised as the identity).
+    fn str_ty(&mut self) -> String {
+        format!("{} list", paren_ty(&self.ty(self.tcx.types.u8)))
+    }
+
     /// Map a Rust type to a HOL type.
     ///
     /// An ADT's HOL type takes the HOL types of its associated-type projections (see `adt_projs`),
@@ -973,7 +979,8 @@ impl<'tcx> Frontend<'tcx> {
     fn ty_inner(&mut self, t: Ty<'tcx>) -> String {
         match t.kind() {
             ty::Bool => "bool".into(),
-            ty::Char => "char".into(),
+            // its code point (a Unicode scalar value)
+            ty::Char => "32 word".into(),
             ty::Int(it) => match it {
                 ty::IntTy::I8 => "8 sword".into(),
                 ty::IntTy::I16 => "16 sword".into(),
@@ -989,7 +996,8 @@ impl<'tcx> Frontend<'tcx> {
                 ty::UintTy::U128 => "128 word".into(),
             },
             ty::Float(ft) => self.placeholder_type(&format!("{:?}", ft).to_lowercase(), 0),
-            ty::Str => "String.literal".into(),
+            // the bytes of its UTF-8 encoding
+            ty::Str => self.str_ty(),
             ty::Ref(_, inner, m) => {
                 let i = self.ty(*inner);
                 if m.is_mut() { format!("('addr, 'gv, {}) Global_Store.ref", i) } else { i }
@@ -1021,7 +1029,7 @@ impl<'tcx> Frontend<'tcx> {
                     }
                     Some("Box") => self.ty(targs[0]),
                     Some("Vec") => format!("{} list", paren_ty(&self.ty(targs[0]))),
-                    Some("String") => "String.literal".into(),
+                    Some("String") => self.str_ty(),
                     Some("Ordering") => "ordering".into(),
                     // AutoCorrode's model of `core::fmt` (`StdLib_Fmt`)
                     Some("Formatter") => "fmt_Formatter".into(),
@@ -1052,8 +1060,16 @@ impl<'tcx> Frontend<'tcx> {
                         paren_ty(&self.ty(targs[1])),
                         paren_ty(&self.ty(targs[0]))
                     ),
-                    Some("Lines") | Some("SplitWhitespace") => "String.literal list".into(),
-                    Some("Chars") => "char list".into(),
+                    Some("Lines") | Some("SplitWhitespace") => format!("{} list", paren_ty(&self.str_ty())),
+                    Some("Chars") => format!("{} list", paren_ty(&self.ty(self.tcx.types.char))),
+                    Some("Bytes") => self.str_ty(),
+                    // the remaining characters with their byte offsets
+                    Some("CharIndices") => {
+                        let (i, c) = (self.ty(self.tcx.types.usize), self.ty(self.tcx.types.char));
+                        format!("({} \\<times> {} \\<times> tnil) list", paren_ty(&i), paren_ty(&c))
+                    }
+                    Some("Utf8Error") => "utf8_error".into(),
+                    Some("FromUtf8Error") => "from_utf8_error".into(),
                     Some("ChunksExact") => {
                         let t = paren_ty(&self.ty(targs[0]));
                         format!("({} list list \\<times> {} list \\<times> tnil)", t, t)
@@ -1324,7 +1340,8 @@ impl<'tcx> Frontend<'tcx> {
             // the iterators keep all their type arguments (see `ty`)
             "SliceIter" | "SliceIterMut" | "ChunksExact" | "Chunks" | "VecIntoIter" | "Enumerate" | "Skip" | "Take" | "Rev" | "Copied" | "Cloned" => Some(1),
             "Zip" | "TakeWhile" | "Map" | "Filter" | "HashMap" | "HashMapEntry" => Some(2),
-            "Lines" | "SplitWhitespace" | "Chars" | "ParseIntError" | "TryFromSliceError" => Some(0),
+            "Lines" | "SplitWhitespace" | "Chars" | "Bytes" | "CharIndices" | "ParseIntError" | "TryFromSliceError" | "Utf8Error"
+            | "FromUtf8Error" => Some(0),
             _ => None,
         }
     }
@@ -1459,10 +1476,23 @@ fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
         methods_of(it, &adapters);
     }
     if let Some(sw) = tcx.get_diagnostic_item(Symbol::intern("str_split_whitespace")) {
-        methods_of(tcx.parent(sw), &[("split_whitespace", "SplitWhitespace"), ("lines", "Lines"), ("chars", "Chars")]);
+        methods_of(
+            tcx.parent(sw),
+            &[("split_whitespace", "SplitWhitespace"), ("lines", "Lines"), ("chars", "Chars"), ("bytes", "Bytes"), ("char_indices", "CharIndices")],
+        );
     }
     if let Some(si) = tcx.get_diagnostic_item(Symbol::intern("slice_iter")) {
         methods_of(tcx.parent(si), &[("chunks_exact", "ChunksExact"), ("chunks", "Chunks"), ("iter_mut", "SliceIterMut")]);
+    }
+    // `Utf8Error`, `FromUtf8Error`: the error types of `str::from_utf8` and `String::from_utf8`
+    for (item, n) in [("str_from_utf8", "Utf8Error"), ("string_from_utf8", "FromUtf8Error")] {
+        // `String::from_utf8` is missing in a crate without `alloc`
+        let Some(f) = tcx.get_diagnostic_item(Symbol::intern(item)) else { continue };
+        let ty::Adt(_, args) = tcx.fn_sig(f).skip_binder().output().skip_binder().kind() else {
+            panic!("`{}` returns a `Result`", item)
+        };
+        let ty::Adt(d, _) = args.type_at(1).kind() else { panic!("the error type of `{}` is a struct", item) };
+        out.push((d.did(), n));
     }
     // `<u8 as FromStr>::Err`: the associated type `Err` of the implementation of `FromStr` (the
     // trait of the method `from_str_method`) for `u8`
