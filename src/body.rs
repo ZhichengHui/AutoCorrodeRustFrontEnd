@@ -882,7 +882,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 }
                 Adjust::Deref(DerefAdjustKind::Builtin) => self.deref_pv(pv, cur)?,
                 Adjust::Deref(DerefAdjustKind::Overloaded(_)) => {
-                    // Box<T> ~ T, Vec<T> ~ [T] ~ list, String ~ str ~ String.literal
+                    // Box<T> ~ T, Vec<T> ~ [T] ~ list, String ~ str ~ byte list
                     let a = self.hty(cur.peel_refs());
                     let b = self.hty(target.peel_refs());
                     if a != b { return unsup(format!("overloaded dereference of `{}`", cur)) }
@@ -1476,6 +1476,12 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         })
     }
 
+    /// The suffix of an integer type, and of `char` the suffix of `u32` (a `char` is its code point,
+    /// see `Frontend::ty`): for conversions, which treat a `char` as that integer.
+    fn int_or_char_suffix(t: Ty<'tcx>) -> Option<&'static str> {
+        if t.is_char() { Some("u32") } else { Self::int_suffix(t) }
+    }
+
     /// An integer type without a uRust model: wider than 64 bits.
     fn unmodelled_int(t: Ty<'tcx>) -> bool {
         t.is_integral() && Self::int_suffix(t).is_none()
@@ -1641,16 +1647,15 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn cast(&mut self, x: &'tcx hir::Expr<'tcx>, target: Ty<'tcx>) -> R<Tr> {
         let src = self.ty_adj(x);
-        // a `char` is its code point, a `u32` (see `Frontend::ty`): `c as T` is the code point
-        // zero-extended or truncated to `T`, and `b as char` (only from `u8`) is the byte zero-extended
-        let int_or_char = |t: Ty<'tcx>| if t.is_char() { Some("u32") } else { Self::int_suffix(t) };
-        let Some(tsfx) = int_or_char(target) else { return unsup(format!("`as` cast to `{}`", target)) };
+        // `c as T` is the code point zero-extended or truncated to `T`, and `b as char` (only from
+        // `u8`) is the byte zero-extended
+        let Some(tsfx) = Self::int_or_char_suffix(target) else { return unsup(format!("`as` cast to `{}`", target)) };
         // `b as T` for `b: bool` is 1 or 0
         if src.is_bool() {
             let b = self.val(x)?;
             return Ok(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", b.at(20), tsfx, tsfx), 21));
         }
-        if int_or_char(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
+        if Self::int_or_char_suffix(src).is_none() { return unsup(format!("`as` cast from `{}`", src)) }
         let v = self.val(x)?;
         // `as` binds weaker than unary operators in uRust (precedence 299)
         Ok(Tr::new(format!("({}) as {}", v.s, tsfx), 299))
@@ -1890,8 +1895,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             ty::Int(_) => "sword",
             ty::Bool => "bool",
             ty::Char => "char",
-            ty::Str => "str",
-            ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String") => "str",
+            _ if self.str_like(t) => "str",
             ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("Utf8Error") => "utf8_error",
             _ => return None,
         };
@@ -3108,10 +3112,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             Conversion if !arg_exprs.is_empty() => {
                 let src = self.ty_adj(arg_exprs[0]).peel_refs();
                 let dst = self.ty_of(e);
-                let int_or_char = |t: Ty<'tcx>| if t.is_char() { Some("u32") } else { Self::int_suffix(t) };
-                match int_or_char(dst) {
+                match Self::int_or_char_suffix(dst) {
                     Some(sfx) if src.is_bool() => Some(Tr::new(format!("if {} {{ 1_{} }} else {{ 0_{} }}", a(0).at(20), sfx, sfx), 21)),
-                    Some(sfx) if int_or_char(src).is_some() => Some(Tr::new(format!("({}) as {}", a(0).s, sfx), 299)),
+                    Some(sfx) if Self::int_or_char_suffix(src).is_some() => Some(Tr::new(format!("({}) as {}", a(0).s, sfx), 299)),
                     // `String::from(c)`
                     None if src.is_char() && self.str_like(dst) => Some(self.named_call("char_to_string", vec![a(0)])),
                     _ => None,
@@ -3329,8 +3332,9 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             // a `char` by its code point
             ty::Char => Some("ord_cmp".into()),
             // strings by their bytes (see `str_ord`)
-            ty::Str => Some("str_ord".into()),
-            ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String") => Some("str_ord".into()),
+            _ if self.str_like(t) => Some("str_ord".into()),
+            // `Ord` on `&T` is `T`'s, and the HOL value of `&T` is that of `T`
+            ty::Ref(_, x, m) if !m.is_mut() => self.ord_cmp_term(*x, seen),
             ty::Adt(d, args) if d.is_struct() && d.did().is_local() && self.fe.record_adts.contains(&d.did()) && !seen.contains(&d.did()) => {
                 // `sort` compares with `PartialOrd::lt`: `Ord` and `PartialOrd` are derived, and
                 // `lt` is derived or `PartialOrd`'s default (through the derived `partial_cmp`)
@@ -3915,7 +3919,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
 
     fn int_like(&self, t: Ty<'tcx>) -> bool {
         let t = t.peel_refs();
-        t.is_integral() || t.is_char() || t.is_str() || matches!(t.kind(), ty::Adt(d, _) if self.fe.std_adt(d.did()) == Some("String"))
+        t.is_integral() || t.is_char() || self.str_like(t)
     }
 
     fn match_expr(&mut self, scrut: &'tcx hir::Expr<'tcx>, arms: &'tcx [hir::Arm<'tcx>]) -> R<Tr> {
@@ -4400,8 +4404,8 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     }
 
     /// `c.encode_utf8(buf).as_bytes()`: `char_encode_utf8_bytes(c, buf)`, the bytes of the encoding,
-    /// also written to the buffer; the `&mut str` in between (which `String.literal` cannot hold
-    /// for a non-ASCII character) is not kept. `None` for other calls.
+    /// also written to the buffer; the `&mut str` in between (a reference into the buffer, which
+    /// has no model) is not kept. `None` for other calls.
     fn encode_utf8_bytes(&mut self, did: DefId, recv: &'tcx hir::Expr<'tcx>) -> R<Option<Tr>> {
         if self.std_fn(did) != Some(StdFn::Model("str_as_bytes")) { return Ok(None) }
         let ExprKind::MethodCall(_, c, [buf], _) = recv.kind else { return Ok(None) };

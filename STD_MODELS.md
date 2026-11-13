@@ -118,7 +118,7 @@
 |---|---|---|---|
 | `String` | `8 word list`（同 `str`） | 前端写法 | `Frontend::ty` |
 | `String` 到 `str` 的 `Deref`、`String::as_str`；`as_bytes`、`into_bytes`、`into_boxed_str`、`from_utf8_unchecked`；`str` 到 `String` 的 `to_string`、`to_owned`、`From` | 恒等（实参与结果的 HOL 类型相同） | 前端写法 | `pv_adjusted`、`std_call` |
-| `String::new`、`with_capacity` | `[]` | 前端写法 | `std_call` |
+| `String::new`、`with_capacity` | `[]`（同 `Vec`：`with_capacity` 的实参不求值，容量超过 `isize::MAX` 时 Rust 的 panic 没有模型） | 前端写法 | `std_call` |
 | `len`、`is_empty`（`String` 和 `str`） | uRust `len`、`slice_is_empty`（字节数） | AutoCorrode、手写 | `std_fn`/`std_call` |
 | `push_str`、`String += &str` | `vec_extend_from_slice`（追加字节） | 手写 | 同上 |
 | `push`、`pop`、`truncate`、`clear` | `string_push`（追加编码）、`string_pop`（去掉最后一个字符的编码）、`string_truncate`（新长度不在字符边界上时 panic）、`vec_clear` | 手写 | 同上 |
@@ -287,7 +287,7 @@
 | `Display`、`Debug`、`LowerHex`、`UpperHex`、`Octal`、`Binary` 的 `fmt`，用于无符号与有符号整数、`bool`、`char`、`str`、`String` | `fmt_<Trait>_<word|sword|bool|char|str>`，按 `core::fmt` 的实现移植（填充、对齐、宽度、精度、`+`、`#`、`0`、`x?`） | AutoCorrode `StdLib_Fmt` | `fmt_arg_call`、`std_call` |
 | `Formatter` 的 `write_str`、`write_char`、`pad`、`pad_integral`、`alternate`、`sign_plus`、`sign_minus`、`sign_aware_zero_pad`、`width`、`precision`、`fill`；`fmt::Write::write_str`/`write_char`（在 `Formatter` 上） | `fmt_<方法名>` | AutoCorrode `StdLib_Fmt` | `std_fn`/`std_call` |
 
-formatter 的输出是 Unicode 码点的列表：写入的字符串先解码，占位符的子 formatter 的输出用 `fmt_formatter_codes` 按码点写回，读成 `String`（`format!`）时再编码成 UTF-8。与 Rust 的差别：`Debug` 对 U+0080 以上的字符不转义（Rust 按 Unicode 属性转义其中的一部分）；目标是 `fmt::Write` 的其他实现（例如 `String`、`io::Write`）时没有模型。没有模型（登记为占位符）：浮点数、指针等其他类型的格式化，派生的 `Debug`，泛型参数类型的值的格式化，作为值传递的 `fmt::Arguments`。
+formatter 的输出是 Unicode 码点的列表：写入的字符串先解码，占位符的子 formatter 的输出用 `fmt_formatter_codes` 按码点写回，读成 `String`（`format!`）时再编码成 UTF-8。`Debug` 格式化含 U+0080 以上字符的字符串或字符时模型以 `Unimplemented` 中止（Rust 按 Unicode 属性决定是否转义，没有模型）。与 Rust 的差别：目标是 `fmt::Write` 的其他实现（例如 `String`、`io::Write`）时没有模型。没有模型（登记为占位符）：浮点数、指针等其他类型的格式化，派生的 `Debug`，泛型参数类型的值的格式化，作为值传递的 `fmt::Arguments`。
 
 ### 恒等形状的函数
 | Rust | 模型 | 来源 | 位置 |

@@ -1041,7 +1041,10 @@ impl<'tcx> Frontend<'tcx> {
                     Some("Chars") => format!("{} list", paren_ty(&self.ty(self.tcx.types.char))),
                     Some("Bytes") => self.str_ty(),
                     // the remaining characters with their byte offsets
-                    Some("CharIndices") => "(64 word \\<times> 32 word \\<times> tnil) list".into(),
+                    Some("CharIndices") => {
+                        let (i, c) = (self.ty(self.tcx.types.usize), self.ty(self.tcx.types.char));
+                        format!("({} \\<times> {} \\<times> tnil) list", paren_ty(&i), paren_ty(&c))
+                    }
                     Some("Utf8Error") => "utf8_error".into(),
                     Some("FromUtf8Error") => "from_utf8_error".into(),
                     Some("ChunksExact") => {
@@ -1460,12 +1463,13 @@ fn std_adts_of(tcx: TyCtxt<'_>) -> Vec<(DefId, &'static str)> {
     }
     // `Utf8Error`, `FromUtf8Error`: the error types of `str::from_utf8` and `String::from_utf8`
     for (item, n) in [("str_from_utf8", "Utf8Error"), ("string_from_utf8", "FromUtf8Error")] {
+        // `String::from_utf8` is missing in a crate without `alloc`
         let Some(f) = tcx.get_diagnostic_item(Symbol::intern(item)) else { continue };
-        if let ty::Adt(_, args) = tcx.fn_sig(f).skip_binder().output().skip_binder().kind()
-            && let ty::Adt(d, _) = args.type_at(1).kind()
-        {
-            out.push((d.did(), n));
-        }
+        let ty::Adt(_, args) = tcx.fn_sig(f).skip_binder().output().skip_binder().kind() else {
+            panic!("`{}` returns a `Result`", item)
+        };
+        let ty::Adt(d, _) = args.type_at(1).kind() else { panic!("the error type of `{}` is a struct", item) };
+        out.push((d.did(), n));
     }
     // `<u8 as FromStr>::Err`: the associated type `Err` of the implementation of `FromStr` (the
     // trait of the method `from_str_method`) for `u8`
