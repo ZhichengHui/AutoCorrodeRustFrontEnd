@@ -2538,14 +2538,17 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             return unsup(format!("dictionaries nested more than {} deep (e.g. an implementation's dictionary needed again at growing arguments)", MAX_DICT_DEPTH));
         }
         self.impl_dicts_building.push(key);
-        let r = self.undo_calls_on_error(|bt| bt.impl_dict_fields(imp, args));
+        let r = self.impl_dict_fields(imp, args);
         self.impl_dicts_building.pop();
         r
     }
 
     /// `f`, dropping the calls and generic-call records it made if it fails: the term it was
     /// building is discarded, and the body's calls must be those of its translation (they are
-    /// the edges of the call graph, see `translate::emit_funs`).
+    /// the edges of the call graph, see `translate::emit_funs`). Used where dictionaries are
+    /// built for a call (`callee_dicts`, `dict_call`), so that a failing dictionary also drops
+    /// those built before it. (A placeholder for any other unsupported expression keeps the
+    /// calls of the subexpressions translated before the failure, as before.)
     fn undo_calls_on_error<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
         let (calls, gen_calls) = (self.calls.0.len(), self.fe.gen_calls.len());
         let r = f(self);
@@ -2661,12 +2664,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !self.fe.dict_methods(tr).contains(&did) {
             return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, has associated types in its signature other than the slots of its dictionaries, or is an internal method of the standard library) in generic code");
         }
-        let mut f = format!("{} {}", self.fe.dict_field(tr, did), paren_term(&self.dict_term(r)?));
-        for b in self.fe.own_dict_bounds(did) {
-            let b = ty::EarlyBinder::bind(tcx, b).instantiate(tcx, gargs).skip_normalization();
-            f.push(' ');
-            f.push_str(&paren_term(&self.dict_term(b)?));
-        }
+        // the dictionary and those of the method's own bounds: all or none (see `undo_calls_on_error`)
+        let f = self.undo_calls_on_error(|bt| {
+            let mut f = format!("{} {}", bt.fe.dict_field(tr, did), paren_term(&bt.dict_term(r)?));
+            for b in bt.fe.own_dict_bounds(did) {
+                let b = ty::EarlyBinder::bind(tcx, b).instantiate(tcx, gargs).skip_normalization();
+                f.push(' ');
+                f.push_str(&paren_term(&bt.dict_term(b)?));
+            }
+            Ok(f)
+        })?;
         let call = self.term_app(&f, argv);
         Ok(self.result_stated(did, call, e))
     }
