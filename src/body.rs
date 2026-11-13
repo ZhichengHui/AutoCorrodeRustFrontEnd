@@ -3577,12 +3577,21 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             _ if !modelled(self, recv) => None,
             Enumerate if modelled(self, res) => Some(tuple(vec![a(0).s, "0_usize".into()])),
             // `zip(other)`: `other` is `IntoIterator::into_iter`'d, the identity when its HOL type is
-            // that of the resulting iterator (an iterator, or a reference to a sequence)
+            // that of the resulting iterator (an iterator, or a reference to a sequence), the
+            // elements of a `Vec` whose list is that iterator's state (`vec::IntoIter`, `slice::Iter`)
             Zip => {
                 let ty::Adt(_, zargs) = res.kind() else { return None };
                 let b = zargs.types().nth(1)?;
-                let other = self.ty_adj(arg_exprs[1]).peel_refs();
-                (modelled(self, res) && self.fe.ty(other) == self.fe.ty(b)).then(|| tuple(vec![a(0).s, a(1).s]))
+                let other = self.ty_adj(arg_exprs[1]);
+                if !modelled(self, res) { return None }
+                let o = match other.peel_refs().kind() {
+                    ty::Adt(_, va) if self.is_vec(other.peel_refs()) && self.fe.ty(Ty::new_slice(self.tcx, va.type_at(0))) == self.fe.ty(b) => {
+                        self.to_val(self.vec_elems(PV::Val(a(1))))
+                    }
+                    _ if self.fe.ty(other.peel_refs()) == self.fe.ty(b) => a(1),
+                    _ => return None,
+                };
+                Some(tuple(vec![a(0).s, o.s]))
             }
             Skip | Take | Map | Filter if modelled(self, res) => Some(tuple(vec![a(0).s, a(1).s])),
             TakeWhile if modelled(self, res) => Some(tuple(vec![a(0).s, "False".into(), a(1).s])),
