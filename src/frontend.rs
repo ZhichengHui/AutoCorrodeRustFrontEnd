@@ -160,6 +160,9 @@ pub struct Frontend<'tcx> {
     /// the traits whose dictionaries are used, in order, with their datatypes' names
     pub dict_traits: Vec<DefId>,
     pub dict_names: HashMap<DefId, String>,
+    /// The fields of each trait's dictionaries (see `dict_field_names`): by method, and of the
+    /// supertraits and associated type bounds in order.
+    pub dict_fields: HashMap<DefId, (HashMap<DefId, String>, Vec<String>)>,
     instances_per_fn: HashMap<DefId, usize>,
     /// Instances named but not yet translated.
     pub pending: Vec<FnKey<'tcx>>,
@@ -187,6 +190,9 @@ pub struct Frontend<'tcx> {
     pub proj_env: Option<ty::TypingEnv<'tcx>>,
     /// The methods of each trait that are fields of its dictionaries (see `dict_methods`).
     pub dict_methods_memo: std::cell::RefCell<HashMap<DefId, Vec<DefId>>>,
+    /// The slots of each trait's dictionaries that are associated types of its other type
+    /// parameters (see `param_slots`).
+    pub param_slots_memo: std::cell::RefCell<HashMap<DefId, Vec<Ty<'tcx>>>>,
     /// The own bounds of each trait method that are dictionary parameters (see `own_dict_bounds`).
     pub own_dict_bounds_memo: std::cell::RefCell<HashMap<DefId, Vec<ty::TraitRef<'tcx>>>>,
     /// While a generic item is translated: the function types of its type parameters bounded by
@@ -397,6 +403,7 @@ impl<'tcx> Frontend<'tcx> {
             copy_names: HashMap::new(),
             dict_traits: Vec::new(),
             dict_names: HashMap::new(),
+            dict_fields: HashMap::new(),
             instances_per_fn: HashMap::new(),
             pending: Vec::new(),
             opaque_adts: HashMap::new(),
@@ -407,6 +414,7 @@ impl<'tcx> Frontend<'tcx> {
             proj_tvars: None,
             proj_env: None,
             dict_methods_memo: Default::default(),
+            param_slots_memo: Default::default(),
             own_dict_bounds_memo: Default::default(),
             fn_params: HashMap::new(),
             alloc_sites: Vec::new(),
@@ -613,6 +621,18 @@ impl<'tcx> Frontend<'tcx> {
         let n = unique(base, |n| self.used_names.contains(n) || self.used_type_names.contains(n));
         self.used_names.insert(n.clone());
         self.used_type_names.insert(n.clone());
+        n
+    }
+
+    /// `base` made unique as by `unique_global`, such that the names `with(n)` declared with it
+    /// are free too; all are reserved.
+    pub fn unique_global_with(&mut self, base: String, with: impl Fn(&str) -> Vec<String>) -> String {
+        let taken = |x: &str| self.used_names.contains(x) || self.used_type_names.contains(x);
+        let n = unique(base, |n| taken(n) || with(n).iter().any(|x| taken(x)));
+        for x in with(&n).into_iter().chain([n.clone()]) {
+            self.used_names.insert(x.clone());
+            self.used_type_names.insert(x);
+        }
         n
     }
 
