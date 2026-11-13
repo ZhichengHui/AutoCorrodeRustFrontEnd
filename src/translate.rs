@@ -834,7 +834,7 @@ fn emit_types<'tcx>(fe: &mut Frontend<'tcx>, adt_sccs: &[Vec<DefId>]) -> String 
             // the field types are at the group's parameters, and so are the projections and the
             // typing environment (`d`'s bounds there) in which the ADTs in them are normalised
             let at_shared = |p: Ty<'tcx>| ty::EarlyBinder::bind(tcx, p).instantiate(tcx, to_shared).skip_normalization();
-            let projs = fe.adt_projs.get(&d).cloned().unwrap_or_default();
+            let projs = fe.adt_proj_params(d);
             let proj_names: Vec<String> = (0..projs.len()).map(proj_tvar).collect();
             fe.proj_tvars = Some(
                 projs.into_iter().map(|p| fe.proj_key(at_shared(p)).expect("projections are aliases")).zip(proj_names.iter().cloned()).collect(),

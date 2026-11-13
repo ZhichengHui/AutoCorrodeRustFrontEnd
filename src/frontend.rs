@@ -950,27 +950,41 @@ impl<'tcx> Frontend<'tcx> {
     fn projections_except(&self, did: DefId, tys: &[Ty<'tcx>], except: &[DefId]) -> Vec<Ty<'tcx>> {
         let env = ty::TypingEnv::post_analysis(self.tcx, did);
         let mut out: Vec<Ty<'tcx>> = vec![];
-        let add = |p: Ty<'tcx>, out: &mut Vec<Ty<'tcx>>| {
-            if let ty::Alias(_, a) = p.kind()
-                && p.has_param()
-                && !out.iter().any(|q| matches!(q.kind(), ty::Alias(_, b) if b == a))
-            {
-                out.push(p);
-            }
-        };
         for &t in tys {
-            self.visit_hol_parts(self.tcx.erase_and_anonymize_regions(t), &mut |x| match x.kind() {
-                ty::Alias(..) => add(x, &mut out),
-                ty::Adt(def, args) if !except.contains(&def.did()) => {
-                    for p in self.adt_proj_params(def.did()) {
-                        let at = ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args);
-                        add(normalize(self.tcx, env, at), &mut out);
-                    }
-                }
-                _ => {}
-            });
+            self.collect_projections(env, self.tcx.erase_and_anonymize_regions(t), except, &mut vec![], &mut out);
         }
         out
+    }
+
+    /// Add the projections in `t` to `out` (once by `proj_key`; see `projections_except`): those
+    /// written and those in the projection parameters of the ADTs in it, normalised in `env`, as
+    /// `ty` translates them (a parameter may normalise to a type with projections or ADTs). `adts`:
+    /// the ADT types whose parameters are being collected; such a type within its own parameters
+    /// adds none there (`ty` renders it as a placeholder).
+    fn collect_projections(
+        &self,
+        env: ty::TypingEnv<'tcx>,
+        t: Ty<'tcx>,
+        except: &[DefId],
+        adts: &mut Vec<Ty<'tcx>>,
+        out: &mut Vec<Ty<'tcx>>,
+    ) {
+        self.visit_hol_parts(t, &mut |x| match x.kind() {
+            ty::Alias(..) => {
+                if x.has_param() && !out.iter().any(|&q| self.proj_key(q) == self.proj_key(x)) {
+                    out.push(x);
+                }
+            }
+            ty::Adt(def, args) if !except.contains(&def.did()) && !adts.contains(&x) => {
+                adts.push(x);
+                for p in self.adt_proj_params(def.did()) {
+                    let at = normalize(self.tcx, env, ty::EarlyBinder::bind(self.tcx, p).instantiate(self.tcx, *args));
+                    self.collect_projections(env, at, except, adts, out);
+                }
+                adts.pop();
+            }
+            _ => {}
+        });
     }
 
     /// Visit the aliases and the ADTs (other than the standard ones whose models keep only some of
