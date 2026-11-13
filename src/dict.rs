@@ -200,12 +200,19 @@ impl<'tcx> Frontend<'tcx> {
         let env = ty::TypingEnv::post_analysis(tcx, m);
         let mut tys = self.sig_types(m);
         for b in self.own_dict_bounds(m) {
-            tys.extend(b.args.types());
-            tys.extend(self.dict_slots(b).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
+            tys.extend(self.dict_type_parts(b, env));
         }
         let ps = self.assoc_projections(m, &tys);
         self.field_projections_memo.borrow_mut().insert(m, ps.clone());
         ps
+    }
+
+    /// The Rust types whose HOL types the dictionary type of `r` (see `dict_type`) takes as type
+    /// arguments: its trait arguments and its slots normalised in `env`.
+    fn dict_type_parts(&self, r: ty::TraitRef<'tcx>, env: ty::TypingEnv<'tcx>) -> Vec<Ty<'tcx>> {
+        let mut tys: Vec<Ty<'tcx>> = r.args.types().collect();
+        tys.extend(self.dict_slots(r).into_iter().map(|s| crate::frontend::normalize(self.tcx, env, ty::Unnormalized::new_wip(s))));
+        tys
     }
 
     /// The associated-type projections among `projections(did, tys)`.
@@ -262,9 +269,7 @@ impl<'tcx> Frontend<'tcx> {
         }
         let env = ty::TypingEnv::post_analysis(tcx, tr);
         for p in self.dict_parents(tr) {
-            let mut tys: Vec<Ty<'tcx>> = p.args.types().collect();
-            tys.extend(self.dict_slots(p).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
-            let ps = new(self.assoc_projections(tr, &tys)).into_iter().filter(|&q| self.on_trait_param(&bounds, q)).collect();
+            let ps = new(self.assoc_projections(tr, &self.dict_type_parts(p, env))).into_iter().filter(|&q| self.on_trait_param(&bounds, q)).collect();
             add(ps, &mut out);
         }
         out
@@ -292,14 +297,15 @@ impl<'tcx> Frontend<'tcx> {
     /// 0), or of such a projection (e.g. `<L::A as B>::C` with the bound `L::A: B`), each named by
     /// one of `bounds` (not by a method's own bound, nor by the bounds of an associated type's
     /// declaration, which `bounds` does not have), so that wherever a trait reference of the trait
-    /// holds, its projection is well-formed?
+    /// holds, its projection is well-formed? Each associated type must be one that may be a slot
+    /// (see `is_slot`; not a generic associated type with type parameters).
     fn on_trait_param(&self, bounds: &[ty::TraitRef<'tcx>], p: Ty<'tcx>) -> bool {
         let tcx = self.tcx;
         let mut t = p;
         loop {
             match t.kind() {
-                ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Projection { .. }) => {
-                    if !bounds.contains(&self.bound_key(a.trait_ref(tcx))) {
+                ty::Alias(_, a) if let ty::AliasTyKind::Projection { def_id } = a.kind => {
+                    if !self.is_slot(def_id) || !bounds.contains(&self.bound_key(a.trait_ref(tcx))) {
                         return false;
                     }
                     t = a.self_ty();
