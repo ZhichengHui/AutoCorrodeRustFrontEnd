@@ -1414,11 +1414,21 @@ impl<'tcx> Frontend<'tcx> {
         let arity = arity + self.adt_proj_params(did).len();
         self.ext_types.insert(n.clone(), ExtType { arity, comment, ctors: vec![], params: vec![], deps: vec![], word: None, plain_enum: false });
         self.ext_type_ids.insert(did, n.clone());
-        // the fields' type parameters are the ADT's (see `ext_fun`; `ext_datatype` sets its own
-        // projections' type variables and typing environment)
-        let fn_params = std::mem::take(&mut self.fn_params);
+        // the datatype is declared in a context of its own, not in that of the type being
+        // translated: the fields' type parameters are the ADT's (see `ext_fun`), its projections
+        // are its own (`ext_datatype` sets their type variables and typing environment; under
+        // `ext_fun`, `alias_tvars` would make others fresh type variables, which a datatype does
+        // not have), and the types being expanded are not its own (e.g. the ADT itself at a use
+        // whose type arguments are type parameters with the names of its own)
+        let saved = (
+            std::mem::take(&mut self.fn_params),
+            self.alias_tvars.take(),
+            std::mem::take(&mut self.adts_in_progress),
+            std::mem::take(&mut self.opaques),
+            std::mem::take(&mut self.fn_items),
+        );
         let datatype = self.ext_datatype(did, &n);
-        self.fn_params = fn_params;
+        (self.fn_params, self.alias_tvars, self.adts_in_progress, self.opaques, self.fn_items) = saved;
         if let Some((params, ctors, deps, self_field)) = datatype {
             let word = self.word_enum(did, &n);
             if word.is_some() {
@@ -1468,9 +1478,7 @@ impl<'tcx> Frontend<'tcx> {
         let all: Vec<Ty<'tcx>> = ftys.iter().flatten().copied().collect();
         let projs = self.adt_proj_params(did);
         let proj_names: Vec<String> = (0..projs.len()).map(|k| format!("'proj{}", k)).collect();
-        // (the fields' projections are its own: also under `ext_fun`, whose `alias_tvars` would make
-        // other projections fresh type variables, which a datatype does not have)
-        let saved = (self.proj_tvars.take(), self.proj_env.replace(env), self.alias_tvars.take());
+        let saved = (self.proj_tvars.take(), self.proj_env.replace(env));
         self.proj_tvars = Some(
             projs
                 .iter()
@@ -1506,7 +1514,7 @@ impl<'tcx> Frontend<'tcx> {
             params.extend(proj_names.iter().cloned());
             (params, ctors, deps, mentions_adt(&all, did))
         });
-        (self.proj_tvars, self.proj_env, self.alias_tvars) = saved;
+        (self.proj_tvars, self.proj_env) = saved;
         result
     }
 

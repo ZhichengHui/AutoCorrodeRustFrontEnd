@@ -96,8 +96,9 @@ struct RecordGroup {
 }
 
 /// The groups of the fields of the datatype `name` with `n` fields as `record_decl` declares them,
-/// in order: none with at most `MAX_FIELDS` fields, else groups of at most `MAX_FIELDS` fields (at
-/// least `MAX_FIELDS`, so that a group itself may be grouped again).
+/// in order: none with at most `MAX_FIELDS` fields, else at most `MAX_FIELDS` groups of
+/// `max(n / MAX_FIELDS (rounded up), MAX_FIELDS)` fields (the last may have fewer); a group with
+/// more than `MAX_FIELDS` fields is grouped again.
 fn record_groups(name: &str, n: usize) -> Vec<RecordGroup> {
     if n <= MAX_FIELDS {
         return vec![];
