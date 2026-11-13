@@ -194,6 +194,8 @@ pub struct BodyTr<'a, 'tcx> {
     /// while a dictionary field of an implementation is built (see `impl_dict`): the dictionaries
     /// for the method's own bounds that the field takes, as `λ`-bound names
     own_dicts: Vec<(ty::TraitRef<'tcx>, String)>,
+    /// the dictionaries of implementations being built, outermost first (see `impl_dict`)
+    impl_dicts_building: Vec<(DefId, GenericArgsRef<'tcx>)>,
 }
 
 /// A local owning a value with a destructor (see `BodyTr::needs_glue`), dropped where its scope
@@ -255,6 +257,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             glue_stack: vec![],
             loop_results: HashMap::new(),
             own_dicts: vec![],
+            impl_dicts_building: vec![],
         }
     }
 
@@ -2506,7 +2509,23 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The dictionary of the implementation `imp` at the generic arguments `args`: its methods
     /// (a local implementation's translated methods or default-method copies, an external one's
     /// templates), then the dictionaries of the trait's supertraits.
+    ///
+    /// A dictionary is a HOL term built from its fields; when a field (a method's function value
+    /// with its own dictionaries, or a supertrait's dictionary) needs the dictionary being built
+    /// itself (jaq-core: a method of an implementation called at the same implementation), that
+    /// term would be infinite: not supported.
     fn impl_dict(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
+        let key = (imp, self.tcx.erase_and_anonymize_regions(args));
+        if self.impl_dicts_building.contains(&key) {
+            return unsup("dictionary of an implementation that contains itself (a method of the implementation needs its own dictionary)");
+        }
+        self.impl_dicts_building.push(key);
+        let r = self.impl_dict_fields(imp, args);
+        self.impl_dicts_building.pop();
+        r
+    }
+
+    fn impl_dict_fields(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
         let tcx = self.tcx;
         let r = tcx.impl_trait_ref(imp).instantiate(tcx, args).skip_normalization();
         if imp.is_local() && tcx.is_automatically_derived(imp) {
