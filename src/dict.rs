@@ -39,68 +39,97 @@ const MAX_FIELDS: usize = 8;
 /// and the selectors of the fields are abbreviations through the groups.
 fn record_decl(name: &str, tparams: &[String], fields: &[(String, String)]) -> String {
     let head = format!("({}) {}", tparams.join(", "), name);
-    if fields.len() <= MAX_FIELDS {
+    let groups = record_groups(name, fields.len());
+    if groups.is_empty() {
         let fs: Vec<String> = fields.iter().map(|(f, t)| format!("({}: \\<open>{}\\<close>)", f, t)).collect();
         return format!("datatype {} =\n  {} {}\n\n", head, name, fs.join("\n    "));
     }
     let mut out = String::new();
-    let groups: Vec<&[(String, String)]> = fields.chunks(group_size(fields.len())).collect();
+    let mut rest = fields;
     let mut parts = vec![];
-    for (k, g) in groups.iter().enumerate() {
-        let pn = format!("{}_p{}", name, k);
+    for g in &groups {
+        let (here, later) = rest.split_at(g.fields.len());
+        rest = later;
         // the group's own fields, renamed (the field names are the abbreviations below)
-        let pf: Vec<(String, String)> = g.iter().enumerate().map(|(j, (_, t))| (format!("{}_{}", pn, j), t.clone())).collect();
-        out.push_str(&record_decl(&pn, tparams, &pf));
-        parts.push((format!("{}_part{}", name, k), format!("({}) {}", tparams.join(", "), pn), pn, pf));
+        let pf: Vec<(String, String)> = g.fields.iter().cloned().zip(here.iter().map(|(_, t)| t.clone())).collect();
+        out.push_str(&record_decl(&g.name, tparams, &pf));
+        parts.push(format!("({}: \\<open>({}) {}\\<close>)", g.selector, tparams.join(", "), g.name));
     }
-    let ps: Vec<String> = parts.iter().map(|(f, t, _, _)| format!("({}: \\<open>{}\\<close>)", f, t)).collect();
-    out.push_str(&format!("datatype {} =\n  {}_mk {}\n\n", head, name, ps.join("\n    ")));
+    let mk = record_constructor(name);
+    out.push_str(&format!("datatype {} =\n  {} {}\n\n", head, mk, parts.join("\n    ")));
     let xs: Vec<String> = (0..fields.len()).map(|i| format!("x{}", i)).collect();
     let mut i = 0;
     let mut args = vec![];
-    for (_, _, pn, pf) in &parts {
-        args.push(format!("({} {})", pn, xs[i..i + pf.len()].join(" ")));
-        i += pf.len();
+    for g in &groups {
+        args.push(format!("({} {})", g.name, xs[i..i + g.fields.len()].join(" ")));
+        i += g.fields.len();
     }
     out.push_str(&format!(
-        "abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>{}. {}_mk {}\\<close>\n\n",
+        "abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>{}. {} {}\\<close>\n\n",
         name,
         name,
         xs.join(" "),
-        name,
+        mk,
         args.join(" ")
     ));
     let mut gi = fields.iter();
-    for (part, _, _, pf) in &parts {
-        for (sel, _) in pf {
+    for g in &groups {
+        for sel in &g.fields {
             let (f, _) = gi.next().expect("a field per group field");
-            out.push_str(&format!("abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>d. {} ({} d)\\<close>\n\n", f, f, sel, part));
+            out.push_str(&format!(
+                "abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>d. {} ({} d)\\<close>\n\n",
+                f, f, sel, g.selector
+            ));
         }
     }
     out
 }
 
-/// The number of fields per group of a datatype of `n` fields declared by `record_decl` (more
-/// than `MAX_FIELDS`).
-fn group_size(n: usize) -> usize {
-    n.div_ceil(MAX_FIELDS).max(MAX_FIELDS)
+/// A group of the fields of a datatype with more than `MAX_FIELDS` fields (see `record_decl`).
+struct RecordGroup {
+    /// the selector of the group in the datatype (`name_part<k>`)
+    selector: String,
+    /// the group's datatype (`name_p<k>`)
+    name: String,
+    /// the group's datatype's fields (`name_p<k>_<j>`), one per field of the group, in order
+    fields: Vec<String>,
 }
 
-/// The names of the constants and types that `record_decl` declares for the datatype `name` with
-/// `n` fields other than `name` and the field names: those of its groups.
-fn record_group_names(name: &str, n: usize) -> Vec<String> {
+/// The groups of the fields of the datatype `name` with `n` fields as `record_decl` declares them,
+/// in order: none with at most `MAX_FIELDS` fields, else groups of at most `MAX_FIELDS` fields (at
+/// least `MAX_FIELDS`, so that a group itself may be grouped again).
+fn record_groups(name: &str, n: usize) -> Vec<RecordGroup> {
     if n <= MAX_FIELDS {
         return vec![];
     }
-    let mut out = vec![format!("{}_mk", name)];
-    let size = group_size(n);
-    for k in 0..n.div_ceil(size) {
-        let pn = format!("{}_p{}", name, k);
-        let m = size.min(n - k * size);
-        out.push(format!("{}_part{}", name, k));
-        out.extend((0..m).map(|j| format!("{}_{}", pn, j)));
-        out.extend(record_group_names(&pn, m));
-        out.push(pn);
+    let size = n.div_ceil(MAX_FIELDS).max(MAX_FIELDS);
+    (0..n.div_ceil(size))
+        .map(|k| {
+            let pn = format!("{}_p{}", name, k);
+            let m = size.min(n - k * size);
+            RecordGroup { selector: format!("{}_part{}", name, k), fields: (0..m).map(|j| format!("{}_{}", pn, j)).collect(), name: pn }
+        })
+        .collect()
+}
+
+/// The constructor of the datatype `name` holding its groups (see `record_decl`).
+fn record_constructor(name: &str) -> String {
+    format!("{}_mk", name)
+}
+
+/// The names of the constants and types that `record_decl` declares for the datatype `name` with
+/// `n` fields, other than `name` and the field names: those of its groups (see `record_groups`).
+fn record_group_names(name: &str, n: usize) -> Vec<String> {
+    let groups = record_groups(name, n);
+    if groups.is_empty() {
+        return vec![];
+    }
+    let mut out = vec![record_constructor(name)];
+    for g in groups {
+        out.push(g.selector);
+        out.extend(record_group_names(&g.name, g.fields.len()));
+        out.extend(g.fields);
+        out.push(g.name);
     }
     out
 }
@@ -120,42 +149,13 @@ impl<'tcx> Frontend<'tcx> {
     /// by a trait whose dictionaries contain those of `tr` (see `reaches_through_methods`; e.g.
     /// `Iterator::rev`, `where Self: DoubleEndedIterator`, a subtrait of `Iterator`): the datatypes
     /// would be mutually recursive through a function argument, which HOL does not admit.
-    ///
-    /// The field types are known once the trait is prepared (see `prepare_dict`); only then is
-    /// the result kept.
     pub fn dict_methods(&self, tr: DefId) -> Vec<DefId> {
         if let Some(ms) = self.dict_methods_memo.borrow().get(&tr) {
             return ms.clone();
         }
         let ms = self.find_dict_methods(tr);
-        if self.dicts_prepared.contains(&tr) {
-            self.dict_methods_memo.borrow_mut().insert(tr, ms.clone());
-        }
+        self.dict_methods_memo.borrow_mut().insert(tr, ms.clone());
         ms
-    }
-
-    /// Register the external ADTs in the types of the methods of `tr` that may be dictionary
-    /// fields (see `field_types`), and so in those of the traits whose dictionaries its
-    /// dictionaries contain or take: whether the datatype of such an ADT takes associated types as
-    /// type parameters (see `register_ext_adts`) decides the projections in the field types (see
-    /// `dict_methods`, `param_slots`), which must not change once the dictionaries are used.
-    pub fn prepare_dict(&mut self, tr: DefId) {
-        if !self.dicts_prepared.insert(tr) {
-            return;
-        }
-        let mut tys = vec![];
-        let mut next: Vec<DefId> = self.dict_parents(tr).iter().map(|p| p.def_id).collect();
-        for m in self.monomorphic_methods(tr) {
-            tys.extend(self.sig_types(m));
-            for b in self.own_dict_bounds(m) {
-                tys.extend(b.args.types());
-                next.push(b.def_id);
-            }
-        }
-        self.register_ext_adts(&tys);
-        for t in next {
-            self.prepare_dict(t);
-        }
     }
 
     fn find_dict_methods(&self, tr: DefId) -> Vec<DefId> {
@@ -214,16 +214,12 @@ impl<'tcx> Frontend<'tcx> {
     /// projections other than those slots in the fields' types. A projection in a field's type may
     /// be written or be one that the datatype of an ADT in it takes as a type parameter
     /// (`&mut EGraph<L, Self>`, whose datatype takes `<L as Language>::Discriminant`).
-    ///
-    /// As `dict_methods`, the result is kept once the trait is prepared (see `prepare_dict`).
     fn param_slots(&self, tr: DefId) -> Vec<Ty<'tcx>> {
         if let Some(ps) = self.param_slots_memo.borrow().get(&tr) {
             return ps.clone();
         }
         let ps = self.find_param_slots(tr);
-        if self.dicts_prepared.contains(&tr) {
-            self.param_slots_memo.borrow_mut().insert(tr, ps.clone());
-        }
+        self.param_slots_memo.borrow_mut().insert(tr, ps.clone());
         ps
     }
 
@@ -234,11 +230,12 @@ impl<'tcx> Frontend<'tcx> {
             .into_iter()
             .map(|s| self.proj_key(s).expect("slots are projections"))
             .collect();
+        let bounds = self.bound_keys(tr);
         let mut out: Vec<Ty<'tcx>> = vec![];
         for m in self.field_candidates(tr) {
             let new: Vec<Ty<'tcx>> =
                 self.field_projections(m).into_iter().filter(|&p| !self.proj_key(p).is_some_and(|k| base.contains(&k))).collect();
-            if new.iter().all(|&p| self.on_trait_param(tr, p)) {
+            if new.iter().all(|&p| self.on_trait_param(&bounds, p)) {
                 for p in new {
                     if !out.iter().any(|&q| self.proj_key(q) == self.proj_key(p)) {
                         out.push(p);
@@ -249,25 +246,35 @@ impl<'tcx> Frontend<'tcx> {
         out
     }
 
-    /// Is the projection `p` (in the parameters of the trait `tr`) an associated type of a type
-    /// parameter of `tr` other than `Self` (index 0), or of such a projection (e.g. `<L::A as B>::C`),
-    /// each named by a bound of `tr` (its `where` clauses, elaborated; not by a method's own bound),
-    /// so that wherever a trait reference of `tr` holds, its projection is well-formed?
-    fn on_trait_param(&self, tr: DefId, p: Ty<'tcx>) -> bool {
+    /// The trait references of the bounds of the trait `tr` (its `where` clauses, elaborated),
+    /// as `bound_key` compares them.
+    fn bound_keys(&self, tr: DefId) -> Vec<ty::TraitRef<'tcx>> {
         let tcx = self.tcx;
-        let key = |r: ty::TraitRef<'tcx>| ty::set_aliases_to_non_rigid(tcx, tcx.erase_and_anonymize_regions(r)).skip_normalization();
-        let bounds: Vec<ty::TraitRef<'tcx>> = tcx
-            .param_env(tr)
+        tcx.param_env(tr)
             .caller_bounds()
             .filter_map(|c| c.as_trait_clause())
             .filter(|c| c.polarity() == ty::ClausePolarity::Positive)
-            .map(|c| key(tcx.instantiate_bound_regions_with_erased(c).trait_ref))
-            .collect();
+            .map(|c| self.bound_key(tcx.instantiate_bound_regions_with_erased(c).trait_ref))
+            .collect()
+    }
+
+    /// The trait reference `r` with erased regions and its projections not marked rigid.
+    fn bound_key(&self, r: ty::TraitRef<'tcx>) -> ty::TraitRef<'tcx> {
+        ty::set_aliases_to_non_rigid(self.tcx, self.tcx.erase_and_anonymize_regions(r)).skip_normalization()
+    }
+
+    /// Is the projection `p` (in the parameters of a trait whose bounds are `bounds`, see
+    /// `bound_keys`) an associated type of a type parameter of the trait other than `Self` (index
+    /// 0), or of such a projection (e.g. `<L::A as B>::C`), each named by one of `bounds` (not by a
+    /// method's own bound), so that wherever a trait reference of the trait holds, its projection
+    /// is well-formed?
+    fn on_trait_param(&self, bounds: &[ty::TraitRef<'tcx>], p: Ty<'tcx>) -> bool {
+        let tcx = self.tcx;
         let mut t = p;
         loop {
             match t.kind() {
                 ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Projection { .. }) => {
-                    if !bounds.contains(&key(a.trait_ref(tcx))) {
+                    if !bounds.contains(&self.bound_key(a.trait_ref(tcx))) {
                         return false;
                     }
                     t = a.self_ty();
@@ -459,7 +466,6 @@ impl<'tcx> Frontend<'tcx> {
         }
         segs.extend(self.path_segments(tr));
         segs.push("dict".into());
-        self.prepare_dict(tr);
         let methods = self.dict_methods(tr);
         let parents = self.dict_parents(tr);
         let nfields = methods.len() + parents.len();

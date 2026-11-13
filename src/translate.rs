@@ -168,7 +168,6 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
         }
         let tr = tcx.impl_trait_ref(imp).instantiate_identity().skip_normalization().def_id;
         let implementors = tcx.impl_item_implementor_ids(imp);
-        fe.prepare_dict(tr);
         let fields = fe.dict_methods(tr);
         for &m in &default_methods {
             if tcx.trait_of_assoc(m) == Some(tr) && fields.contains(&m) && !implementors.contains_key(&m) {
@@ -287,10 +286,6 @@ fn collect_adts<'tcx>(fe: &mut Frontend<'tcx>) -> Vec<Vec<DefId>> {
     // theirs, at the group's type parameters, in order), as they share their type parameters. The
     // groups come after the ADTs they use
     for comp in &adt_sccs {
-        // external ADTs in the fields first: their datatypes may take associated types too
-        for &d in comp {
-            fe.register_ext_adts(&fields[&d]);
-        }
         if comp.len() == 1 {
             let ps = fe.projections(comp[0], &fields[&comp[0]]);
             if !ps.is_empty() {
@@ -598,9 +593,6 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
     let name = fe.fn_name(key);
     // the dictionary parameters come first (see `crate::dict`)
     let dicts = if is_fn { fe.dict_params(key) } else { vec![] };
-    for (r, _) in &dicts {
-        fe.prepare_dict(r.def_id);
-    }
     let rust_path = match key.1 {
         Inst::Generic => tcx.def_path_str(did),
         Inst::Mono(args) => tcx.def_path_str_with_args(did, args),
@@ -613,7 +605,6 @@ fn translate_fn<'tcx>(fe: &mut Frontend<'tcx>, key: FnKey<'tcx>) -> FunDef<'tcx>
         let at = |t: Ty<'tcx>| fe.at_key(key, t);
         let tys: Vec<Ty<'tcx>> = sig.inputs_and_output.iter().map(at).collect();
         if !matches!(key.1, Inst::Mono(_)) {
-            fe.register_ext_adts(&tys);
             let env = fe.inst_env(key);
             let owner = match key.1 { Inst::ImplCopy(imp) => imp, _ => did };
             fe.proj_tvars = Some(slot_tvars(fe, &dicts, owner, &tys, env));

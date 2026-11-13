@@ -24,7 +24,7 @@
 | `impl Trait` | 它的隐藏类型（编译器在类型检查后揭示的类型），泛型代码中同样 |
 | 函数项类型 | 与对应闭包相同的 HOL 函数类型（见"函数与闭包"） |
 | 本地 struct、enum | 见"条目" |
-| 标准库类型 | 见 `STD_MODELS.md`；没有模型的外部类型生成外部类型模板（`*_TypesExternal_Template.thy`；带构造子完整声明的外部类型放在 `*_TypesExternal.thy`，不是模板；构造子参数为 `'tN list` 的 datatype）；外部枚举和字段全部公开的外部结构体，若没有 const 参数、字段类型都有模型且不含 `&mut` 引用（引用的 HOL 类型含 store 的类型变量），声明为带构造子的 datatype（变体都不带字段的枚举同本地 enum 声明为 `simple_word_enum`；构造子名为类型名加变体名，结构体为 `make_` 加类型名；字段中的关联类型投影是额外的类型参数，同本地 ADT），其构造子、构造函数 `_mk` 和模式按本地 ADT 翻译 |
+| 标准库类型 | 见 `STD_MODELS.md`；没有模型的外部类型生成外部类型模板（`*_TypesExternal_Template.thy`；带构造子完整声明的外部类型放在 `*_TypesExternal.thy`，不是模板；构造子参数为 `'tN list` 的 datatype）；外部枚举和字段全部公开的外部结构体，若没有 const 参数且字段类型不含 `&mut` 引用（引用的 HOL 类型含 store 的类型变量），字段中的关联类型投影（及其中 ADT 的 datatype 带的投影）是额外的类型参数（同本地 ADT；字段类型没有模型、声明成抽象类型时也是），它们只取决于类型的定义；其中字段类型都有模型的声明为带构造子的 datatype（变体都不带字段的枚举同本地 enum 声明为 `simple_word_enum`；构造子名为类型名加变体名，结构体为 `make_` 加类型名），其构造子、构造函数 `_mk` 和模式按本地 ADT 翻译 |
 
 占位类型：`f32`、`f64`、裸指针、函数指针、含有自身的函数项类型与 `impl Trait`（例如 `fn f() -> impl Copy { f }`）、trait 对象（`dyn`）、无法规范化的投影。
 
