@@ -194,6 +194,8 @@ pub struct BodyTr<'a, 'tcx> {
     /// while a dictionary field of an implementation is built (see `impl_dict`): the dictionaries
     /// for the method's own bounds that the field takes, as `λ`-bound names
     own_dicts: Vec<(ty::TraitRef<'tcx>, String)>,
+    /// the dictionaries of implementations being built, outermost first (see `impl_dict`)
+    impl_dicts_building: Vec<(DefId, GenericArgsRef<'tcx>)>,
 }
 
 /// A local owning a value with a destructor (see `BodyTr::needs_glue`), dropped where its scope
@@ -228,6 +230,9 @@ enum UseKind {
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
 
+/// The deepest nesting of implementations' dictionaries that is built (see `BodyTr::impl_dict`).
+const MAX_DICT_DEPTH: usize = 32;
+
 impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     pub fn new(fe: &'a mut Frontend<'tcx>, key: FnKey<'tcx>) -> Self {
         let tcx = fe.tcx;
@@ -255,6 +260,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             glue_stack: vec![],
             loop_results: HashMap::new(),
             own_dicts: vec![],
+            impl_dicts_building: vec![],
         }
     }
 
@@ -2298,6 +2304,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The dictionaries `key` takes (see `Frontend::dict_params`), for its bounds at the generic
     /// arguments `kargs` of their item.
     fn callee_dicts(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<Vec<String>> {
+        // a callee whose dictionaries cannot all be built is not called with them (`local_call`
+        // falls back to an instance, or the call is a placeholder): the calls of the ones built
+        // before the failure are dropped
+        self.undo_calls_on_error(|bt| bt.callee_dicts_built(key, kargs))
+    }
+
+    fn callee_dicts_built(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<Vec<String>> {
         // a parameter of the callee bounded by an `Fn` trait is a function value (see
         // `Frontend::fn_param_types`): its argument must be a closure, a function item, or such a
         // parameter of the body (a function pointer, for one, is a placeholder type)
@@ -2506,7 +2519,47 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The dictionary of the implementation `imp` at the generic arguments `args`: its methods
     /// (a local implementation's translated methods or default-method copies, an external one's
     /// templates), then the dictionaries of the trait's supertraits.
+    ///
+    /// A dictionary is a HOL term built from its fields. A field (a method's function value with
+    /// the dictionaries for its implementation's bounds, or a supertrait's or associated type
+    /// bound's dictionary) may need the dictionary of the same implementation at the same
+    /// arguments again: the term would contain itself (jaq-core: the dictionary of `DataT for
+    /// JustLut<V>` has, for the bound `Data<'a>: HasLut<'a, Self>`, the dictionary of `HasLut`
+    /// for `&Lut<JustLut<V>>`, whose implementation requires `JustLut<V>: DataT`). Needed at other
+    /// arguments, the nesting may end or not (the arguments can grow forever, e.g. `G<V>` needing
+    /// `G<Box<V>>`), which cannot be decided in general: nesting deeper than `MAX_DICT_DEPTH` is
+    /// not supported either, as instances beyond `MAX_INSTANCES`.
     fn impl_dict(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
+        let key = (imp, self.tcx.erase_and_anonymize_regions(args));
+        if self.impl_dicts_building.contains(&key) {
+            return unsup("dictionary that contains itself (an implementation's dictionary needed again at the same arguments, through its bounds, while it is built)");
+        }
+        if self.impl_dicts_building.len() >= MAX_DICT_DEPTH {
+            return unsup(format!("dictionaries nested more than {} deep (e.g. an implementation's dictionary needed again at growing arguments)", MAX_DICT_DEPTH));
+        }
+        self.impl_dicts_building.push(key);
+        let r = self.impl_dict_fields(imp, args);
+        self.impl_dicts_building.pop();
+        r
+    }
+
+    /// `f`, dropping the calls and generic-call records it made if it fails: the term it was
+    /// building is discarded, and the body's calls must be those of its translation (they are
+    /// the edges of the call graph, see `translate::emit_funs`). Used where dictionaries are
+    /// built for a call (`callee_dicts`, `dict_call`), so that a failing dictionary also drops
+    /// those built before it. (A placeholder for any other unsupported expression keeps the
+    /// calls of the subexpressions translated before the failure, as before.)
+    fn undo_calls_on_error<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        let (calls, gen_calls) = (self.calls.0.len(), self.fe.gen_calls.len());
+        let r = f(self);
+        if r.is_err() {
+            self.calls.0.truncate(calls);
+            self.fe.gen_calls.truncate(gen_calls);
+        }
+        r
+    }
+
+    fn impl_dict_fields(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
         let tcx = self.tcx;
         let r = tcx.impl_trait_ref(imp).instantiate(tcx, args).skip_normalization();
         if imp.is_local() && tcx.is_automatically_derived(imp) {
@@ -2611,12 +2664,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         if !self.fe.dict_methods(tr).contains(&did) {
             return unsup("call of a trait method that is not a dictionary field (it returns `impl Trait`, has associated types in its signature other than the slots of its dictionaries, or is an internal method of the standard library) in generic code");
         }
-        let mut f = format!("{} {}", self.fe.dict_field(tr, did), paren_term(&self.dict_term(r)?));
-        for b in self.fe.own_dict_bounds(did) {
-            let b = ty::EarlyBinder::bind(tcx, b).instantiate(tcx, gargs).skip_normalization();
-            f.push(' ');
-            f.push_str(&paren_term(&self.dict_term(b)?));
-        }
+        // the dictionary and those of the method's own bounds: all or none (see `undo_calls_on_error`)
+        let f = self.undo_calls_on_error(|bt| {
+            let mut f = format!("{} {}", bt.fe.dict_field(tr, did), paren_term(&bt.dict_term(r)?));
+            for b in bt.fe.own_dict_bounds(did) {
+                let b = ty::EarlyBinder::bind(tcx, b).instantiate(tcx, gargs).skip_normalization();
+                f.push(' ');
+                f.push_str(&paren_term(&bt.dict_term(b)?));
+            }
+            Ok(f)
+        })?;
         let call = self.term_app(&f, argv);
         Ok(self.result_stated(did, call, e))
     }
