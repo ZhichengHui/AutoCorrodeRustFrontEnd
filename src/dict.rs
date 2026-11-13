@@ -4,7 +4,8 @@
 //! supertrait (the supertrait's dictionary); an implementation is a value of it. A generic item
 //! takes one dictionary parameter per trait bound of its signature, and a call in its body
 //! resolved to a bound calls the field of the bound's dictionary. The associated types of a
-//! trait, and those of its supertraits, are type parameters of its datatype ("slots").
+//! trait, those of its supertraits, and those of its other type parameters that its fields' types
+//! have, are type parameters of its datatype ("slots").
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -38,43 +39,98 @@ const MAX_FIELDS: usize = 8;
 /// and the selectors of the fields are abbreviations through the groups.
 fn record_decl(name: &str, tparams: &[String], fields: &[(String, String)]) -> String {
     let head = format!("({}) {}", tparams.join(", "), name);
-    if fields.len() <= MAX_FIELDS {
+    let groups = record_groups(name, fields.len());
+    if groups.is_empty() {
         let fs: Vec<String> = fields.iter().map(|(f, t)| format!("({}: \\<open>{}\\<close>)", f, t)).collect();
         return format!("datatype {} =\n  {} {}\n\n", head, name, fs.join("\n    "));
     }
     let mut out = String::new();
-    let groups: Vec<&[(String, String)]> = fields.chunks(fields.len().div_ceil(MAX_FIELDS).max(MAX_FIELDS)).collect();
+    let mut rest = fields;
     let mut parts = vec![];
-    for (k, g) in groups.iter().enumerate() {
-        let pn = format!("{}_p{}", name, k);
+    for g in &groups {
+        let (here, later) = rest.split_at(g.fields.len());
+        rest = later;
         // the group's own fields, renamed (the field names are the abbreviations below)
-        let pf: Vec<(String, String)> = g.iter().enumerate().map(|(j, (_, t))| (format!("{}_{}", pn, j), t.clone())).collect();
-        out.push_str(&record_decl(&pn, tparams, &pf));
-        parts.push((format!("{}_part{}", name, k), format!("({}) {}", tparams.join(", "), pn), pn, pf));
+        let pf: Vec<(String, String)> = g.fields.iter().cloned().zip(here.iter().map(|(_, t)| t.clone())).collect();
+        out.push_str(&record_decl(&g.name, tparams, &pf));
+        parts.push(format!("({}: \\<open>({}) {}\\<close>)", g.selector, tparams.join(", "), g.name));
     }
-    let ps: Vec<String> = parts.iter().map(|(f, t, _, _)| format!("({}: \\<open>{}\\<close>)", f, t)).collect();
-    out.push_str(&format!("datatype {} =\n  {}_mk {}\n\n", head, name, ps.join("\n    ")));
+    let mk = record_constructor(name);
+    out.push_str(&format!("datatype {} =\n  {} {}\n\n", head, mk, parts.join("\n    ")));
     let xs: Vec<String> = (0..fields.len()).map(|i| format!("x{}", i)).collect();
     let mut i = 0;
     let mut args = vec![];
-    for (_, _, pn, pf) in &parts {
-        args.push(format!("({} {})", pn, xs[i..i + pf.len()].join(" ")));
-        i += pf.len();
+    for g in &groups {
+        args.push(format!("({} {})", g.name, xs[i..i + g.fields.len()].join(" ")));
+        i += g.fields.len();
     }
     out.push_str(&format!(
-        "abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>{}. {}_mk {}\\<close>\n\n",
+        "abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>{}. {} {}\\<close>\n\n",
         name,
         name,
         xs.join(" "),
-        name,
+        mk,
         args.join(" ")
     ));
     let mut gi = fields.iter();
-    for (part, _, _, pf) in &parts {
-        for (sel, _) in pf {
+    for g in &groups {
+        for sel in &g.fields {
             let (f, _) = gi.next().expect("a field per group field");
-            out.push_str(&format!("abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>d. {} ({} d)\\<close>\n\n", f, f, sel, part));
+            out.push_str(&format!(
+                "abbreviation (input) {} where\n  \\<open>{} \\<equiv> \\<lambda>d. {} ({} d)\\<close>\n\n",
+                f, f, sel, g.selector
+            ));
         }
+    }
+    out
+}
+
+/// A group of the fields of a datatype with more than `MAX_FIELDS` fields (see `record_decl`).
+struct RecordGroup {
+    /// the selector of the group in the datatype (`name_part<k>`)
+    selector: String,
+    /// the group's datatype (`name_p<k>`)
+    name: String,
+    /// the group's datatype's fields (`name_p<k>_<j>`), one per field of the group, in order
+    fields: Vec<String>,
+}
+
+/// The groups of the fields of the datatype `name` with `n` fields as `record_decl` declares them,
+/// in order: none with at most `MAX_FIELDS` fields, else at most `MAX_FIELDS` groups of
+/// `max(n / MAX_FIELDS (rounded up), MAX_FIELDS)` fields (the last may have fewer); a group with
+/// more than `MAX_FIELDS` fields is grouped again.
+fn record_groups(name: &str, n: usize) -> Vec<RecordGroup> {
+    if n <= MAX_FIELDS {
+        return vec![];
+    }
+    let size = n.div_ceil(MAX_FIELDS).max(MAX_FIELDS);
+    (0..n.div_ceil(size))
+        .map(|k| {
+            let pn = format!("{}_p{}", name, k);
+            let m = size.min(n - k * size);
+            RecordGroup { selector: format!("{}_part{}", name, k), fields: (0..m).map(|j| format!("{}_{}", pn, j)).collect(), name: pn }
+        })
+        .collect()
+}
+
+/// The constructor of the datatype `name` holding its groups (see `record_decl`).
+fn record_constructor(name: &str) -> String {
+    format!("{}_mk", name)
+}
+
+/// The names of the constants and types that `record_decl` declares for the datatype `name` with
+/// `n` fields, other than `name` and the field names: those of its groups (see `record_groups`).
+fn record_group_names(name: &str, n: usize) -> Vec<String> {
+    let groups = record_groups(name, n);
+    if groups.is_empty() {
+        return vec![];
+    }
+    let mut out = vec![record_constructor(name)];
+    for g in groups {
+        out.push(g.selector);
+        out.extend(record_group_names(&g.name, g.fields.len()));
+        out.extend(g.fields);
+        out.push(g.name);
     }
     out
 }
@@ -110,35 +166,155 @@ impl<'tcx> Frontend<'tcx> {
             .into_iter()
             .map(|s| self.proj_key(s).expect("slots are projections"))
             .collect();
+        self.field_candidates(tr)
+            .into_iter()
+            .filter(|&m| self.field_projections(m).iter().all(|&p| self.proj_key(p).is_some_and(|k| slots.contains(&k))))
+            .collect()
+    }
+
+    /// The methods of `tr` that may be fields of its dictionaries (see `dict_methods`): those
+    /// without type parameters of their own (see `monomorphic_methods`) none of whose own bounds
+    /// is by a trait whose dictionaries contain those of `tr`.
+    fn field_candidates(&self, tr: DefId) -> Vec<DefId> {
         self.monomorphic_methods(tr)
             .into_iter()
             .filter(|&m| !self.own_dict_bounds(m).iter().any(|b| self.reaches_through_methods(b.def_id, tr, &mut vec![])))
-            .filter(|&m| {
-                let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization());
-                let env = ty::TypingEnv::post_analysis(tcx, m);
-                let mut tys: Vec<Ty<'tcx>> = sig.inputs_and_output.to_vec();
-                for b in self.own_dict_bounds(m) {
-                    tys.extend(b.args.types());
-                    tys.extend(self.dict_slots(b).into_iter().map(|s| crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s))));
-                }
-                tys.iter().all(|t| {
-                    let mut w = tcx.erase_and_anonymize_regions(*t).walk();
-                    while let Some(g) = w.next() {
-                        if let Some(x) = g.as_type()
-                            && let ty::Alias(_, a) = x.kind()
-                        {
-                            w.skip_current_subtree();
-                            if matches!(a.kind, ty::AliasTyKind::Projection { .. })
-                                && !self.proj_key(x).is_some_and(|k| slots.contains(&k))
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                })
-            })
             .collect()
+    }
+
+    /// The argument and result types of the trait method `m` (in its trait's parameters).
+    fn sig_types(&self, m: DefId) -> Vec<Ty<'tcx>> {
+        let tcx = self.tcx;
+        tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization()).inputs_and_output.to_vec()
+    }
+
+    /// The associated-type projections in the type of the dictionary field of the trait method `m`
+    /// (see `dict_decl`): in its signature and in the dictionary types of its own bounds (their
+    /// arguments and slots, see `own_dict_bounds`), those written and those that the datatypes of
+    /// ADTs in them take as type parameters (see `projections`; normalised in `m`'s typing
+    /// environment, as `dict_decl` translates them).
+    fn field_projections(&self, m: DefId) -> Vec<Ty<'tcx>> {
+        if let Some(ps) = self.field_projections_memo.borrow().get(&m) {
+            return ps.clone();
+        }
+        let tcx = self.tcx;
+        let env = ty::TypingEnv::post_analysis(tcx, m);
+        let mut tys = self.sig_types(m);
+        for b in self.own_dict_bounds(m) {
+            tys.extend(self.dict_type_parts(b, env));
+        }
+        let ps = self.assoc_projections(m, &tys);
+        self.field_projections_memo.borrow_mut().insert(m, ps.clone());
+        ps
+    }
+
+    /// The Rust types whose HOL types the dictionary type of `r` (see `dict_type`) takes as type
+    /// arguments: its trait arguments and its slots normalised in `env`.
+    fn dict_type_parts(&self, r: ty::TraitRef<'tcx>, env: ty::TypingEnv<'tcx>) -> Vec<Ty<'tcx>> {
+        let mut tys: Vec<Ty<'tcx>> = r.args.types().collect();
+        tys.extend(self.dict_slots(r).into_iter().map(|s| crate::frontend::normalize(self.tcx, env, ty::Unnormalized::new_wip(s))));
+        tys
+    }
+
+    /// The associated-type projections among `projections(did, tys)`.
+    fn assoc_projections(&self, did: DefId, tys: &[Ty<'tcx>]) -> Vec<Ty<'tcx>> {
+        self.projections(did, tys)
+            .into_iter()
+            .filter(|p| matches!(p.kind(), ty::Alias(_, a) if matches!(a.kind, ty::AliasTyKind::Projection { .. })))
+            .collect()
+    }
+
+    /// The slots of the dictionaries of `tr` that are associated types of its type parameters other
+    /// than `Self` named by its bounds (see `on_trait_param`; e.g. `<L as Language>::Discriminant`
+    /// for `trait Analysis<L: Language>`). They are those in the field types of its methods that
+    /// may be fields (see `field_candidates`, `field_projections`) without projections other than
+    /// these and the trait's other slots (see `trait_slots`), in order of occurrence: exactly the
+    /// projections other than those slots in the fields' types. A projection in a field's type may
+    /// be written or be one that the datatype of an ADT in it takes as a type parameter
+    /// (`&mut EGraph<L, Self>`, whose datatype takes `<L as Language>::Discriminant`). Then those
+    /// such projections in the dictionary types of the supertraits and associated type bounds
+    /// (see `dict_parents`; their arguments and slots, normalised in the trait's typing
+    /// environment, as `dict_decl` translates them), which are fields in any case: a projection
+    /// there that is not a slot is a placeholder type.
+    fn param_slots(&self, tr: DefId) -> Vec<Ty<'tcx>> {
+        if let Some(ps) = self.param_slots_memo.borrow().get(&tr) {
+            return ps.clone();
+        }
+        let ps = self.find_param_slots(tr);
+        self.param_slots_memo.borrow_mut().insert(tr, ps.clone());
+        ps
+    }
+
+    fn find_param_slots(&self, tr: DefId) -> Vec<Ty<'tcx>> {
+        let tcx = self.tcx;
+        let base: Vec<ty::AliasTy<'tcx>> = self
+            .trait_slots(ty::TraitRef::identity(tcx, tr))
+            .into_iter()
+            .map(|s| self.proj_key(s).expect("slots are projections"))
+            .collect();
+        let bounds = self.bound_keys(tr);
+        let new = |ps: Vec<Ty<'tcx>>| -> Vec<Ty<'tcx>> { ps.into_iter().filter(|&p| !self.proj_key(p).is_some_and(|k| base.contains(&k))).collect() };
+        let mut out: Vec<Ty<'tcx>> = vec![];
+        let add = |ps: Vec<Ty<'tcx>>, out: &mut Vec<Ty<'tcx>>| {
+            for p in ps {
+                if !out.iter().any(|&q| self.proj_key(q) == self.proj_key(p)) {
+                    out.push(p);
+                }
+            }
+        };
+        for m in self.field_candidates(tr) {
+            let ps = new(self.field_projections(m));
+            if ps.iter().all(|&p| self.on_trait_param(&bounds, p)) {
+                add(ps, &mut out);
+            }
+        }
+        let env = ty::TypingEnv::post_analysis(tcx, tr);
+        for p in self.dict_parents(tr) {
+            let ps = new(self.assoc_projections(tr, &self.dict_type_parts(p, env))).into_iter().filter(|&q| self.on_trait_param(&bounds, q)).collect();
+            add(ps, &mut out);
+        }
+        out
+    }
+
+    /// The trait references of the bounds of the trait `tr` (its `where` clauses, elaborated),
+    /// as `bound_key` compares them.
+    fn bound_keys(&self, tr: DefId) -> Vec<ty::TraitRef<'tcx>> {
+        let tcx = self.tcx;
+        tcx.param_env(tr)
+            .caller_bounds()
+            .filter_map(|c| c.as_trait_clause())
+            .filter(|c| c.polarity() == ty::ClausePolarity::Positive)
+            .map(|c| self.bound_key(tcx.instantiate_bound_regions_with_erased(c).trait_ref))
+            .collect()
+    }
+
+    /// The trait reference `r` with erased regions and its projections not marked rigid.
+    fn bound_key(&self, r: ty::TraitRef<'tcx>) -> ty::TraitRef<'tcx> {
+        ty::set_aliases_to_non_rigid(self.tcx, self.tcx.erase_and_anonymize_regions(r)).skip_normalization()
+    }
+
+    /// Is the projection `p` (in the parameters of a trait whose bounds are `bounds`, see
+    /// `bound_keys`) an associated type of a type parameter of the trait other than `Self` (index
+    /// 0), or of such a projection (e.g. `<L::A as B>::C` with the bound `L::A: B`), each named by
+    /// one of `bounds` (not by a method's own bound, nor by the bounds of an associated type's
+    /// declaration, which `bounds` does not have), so that wherever a trait reference of the trait
+    /// holds, its projection is well-formed? Each associated type must be one that may be a slot
+    /// (see `is_slot`; not a generic associated type with type parameters).
+    fn on_trait_param(&self, bounds: &[ty::TraitRef<'tcx>], p: Ty<'tcx>) -> bool {
+        let tcx = self.tcx;
+        let mut t = p;
+        loop {
+            match t.kind() {
+                ty::Alias(_, a) if let ty::AliasTyKind::Projection { def_id } = a.kind => {
+                    if !self.is_slot(def_id) || !bounds.contains(&self.bound_key(a.trait_ref(tcx))) {
+                        return false;
+                    }
+                    t = a.self_ty();
+                }
+                ty::Param(q) => return q.index != 0,
+                _ => return false,
+            }
+        }
     }
 
     /// The methods of `tr` without type or const parameters of their own, other than those with
@@ -256,8 +432,20 @@ impl<'tcx> Frontend<'tcx> {
 
     /// The associated types of a trait reference that its dictionary datatype takes as type
     /// parameters: its trait's own (without generic parameters of their own), then those of its
-    /// supertraits with dictionaries, in order.
+    /// supertraits with dictionaries, in order, then those of its other type parameters (see
+    /// `param_slots`).
     pub fn dict_slots(&self, r: ty::TraitRef<'tcx>) -> Vec<Ty<'tcx>> {
+        let tcx = self.tcx;
+        let mut out = self.trait_slots(r);
+        for p in self.param_slots(r.def_id) {
+            out.push(tcx.erase_and_anonymize_regions(ty::EarlyBinder::bind(tcx, p).instantiate(tcx, r.args).skip_normalization()));
+        }
+        out
+    }
+
+    /// The slots of `r` that are associated types of its trait and of its supertraits (with
+    /// theirs, see `dict_slots`).
+    fn trait_slots(&self, r: ty::TraitRef<'tcx>) -> Vec<Ty<'tcx>> {
         let tcx = self.tcx;
         let mut out: Vec<Ty<'tcx>> = self
             .own_slots(r.def_id)
@@ -297,7 +485,9 @@ impl<'tcx> Frontend<'tcx> {
             && tcx.opt_rpitit_info(at).is_none()
     }
 
-    /// The HOL name of the dictionary datatype of `tr` (also the name of its constructor).
+    /// The HOL name of the dictionary datatype of `tr` (also the name of its constructor). The
+    /// names of its fields (see `dict_field_names`) and of its groups (see `record_decl`) are
+    /// chosen with it.
     pub fn dict_name(&mut self, tr: DefId) -> String {
         if let Some(n) = self.dict_names.get(&tr) {
             return n.clone();
@@ -308,35 +498,56 @@ impl<'tcx> Frontend<'tcx> {
         }
         segs.extend(self.path_segments(tr));
         segs.push("dict".into());
-        let n = self.unique_global(names::type_name(&segs));
+        let methods = self.dict_methods(tr);
+        let parents = self.dict_parents(tr);
+        let nfields = methods.len() + parents.len();
+        let n = self.unique_global_with(names::type_name(&segs), |n| record_group_names(n, nfields));
         self.dict_names.insert(tr, n.clone());
         self.dict_traits.push(tr);
+        let fields = self.dict_field_names(&n, &methods, &parents);
+        self.dict_fields.insert(tr, fields);
         n
     }
 
-    /// The field of the dictionaries of `tr` holding the method `m`.
+    /// The field names of the dictionaries named `name`, by method (of `methods`, see
+    /// `dict_methods`), and of the supertraits and associated type bounds `parents` (see
+    /// `dict_parents`) in order: `name_<method>` and `name_super<k>_<trait>`, made unique among the
+    /// HOL names (two method names may be one identifier, e.g. `f` and `f_`, see
+    /// `names::ident_chars`). They are chosen in this order when the trait's dictionaries are first
+    /// named, so they do not depend on the order of the uses of its fields.
+    fn dict_field_names(&mut self, name: &str, methods: &[DefId], parents: &[ty::TraitRef<'tcx>]) -> (HashMap<DefId, String>, Vec<String>) {
+        let tcx = self.tcx;
+        let ms = methods
+            .iter()
+            .map(|&m| (m, self.unique_global(format!("{}_{}", name, names::ident_chars(tcx.item_name(m).as_str())))))
+            .collect();
+        let ps = parents
+            .iter()
+            .enumerate()
+            .map(|(k, p)| self.unique_global(format!("{}_super{}_{}", name, k, names::ident_chars(tcx.item_name(p.def_id).as_str()))))
+            .collect();
+        (ms, ps)
+    }
+
+    /// The field of the dictionaries of `tr` holding the method `m` (one of `dict_methods`).
     pub fn dict_field(&mut self, tr: DefId, m: DefId) -> String {
-        format!("{}_{}", self.dict_name(tr), names::ident_chars(self.tcx.item_name(m).as_str()))
+        self.dict_name(tr);
+        self.dict_fields[&tr].0.get(&m).expect("the method is a field of the dictionaries").clone()
     }
 
     /// The field of the dictionaries of `tr` holding the dictionary of its `k`-th supertrait or
     /// associated type bound (see `dict_parents`).
     pub fn dict_parent_field(&mut self, tr: DefId, k: usize) -> String {
-        let p = self.dict_parents(tr)[k].def_id;
-        format!("{}_super{}_{}", self.dict_name(tr), k, names::ident_chars(self.tcx.item_name(p).as_str()))
+        self.dict_name(tr);
+        self.dict_fields[&tr].1[k].clone()
     }
 
     /// The HOL type of the dictionaries for the trait reference `r` (normalised in `env`).
     pub fn dict_type(&mut self, r: ty::TraitRef<'tcx>, env: ty::TypingEnv<'tcx>) -> String {
-        let tcx = self.tcx;
         let n = self.dict_name(r.def_id);
         let mut a: Vec<String> = BASE_TVARS.iter().map(|s| s.to_string()).collect();
-        for t in r.args.types() {
+        for t in self.dict_type_parts(r, env) {
             a.push(self.ty(t));
-        }
-        for s in self.dict_slots(r) {
-            let s = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s));
-            a.push(self.ty(s));
         }
         format!("({}) {}", a.join(", "), n)
     }
@@ -533,13 +744,18 @@ impl<'tcx> Frontend<'tcx> {
             .map(|(s, v)| (self.proj_key(*s).expect("slots are projections"), v.clone()))
             .collect();
         self.proj_tvars = Some(map);
+        let saved_env = self.proj_env.take();
         let mut fields = vec![];
         for m in self.dict_methods(tr) {
-            let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization());
-            let ps: Vec<String> = sig.inputs().iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(*t))).collect();
-            let ret = self.ty(tcx.erase_and_anonymize_regions(sig.output()));
-            let f = self.dict_field(tr, m);
+            let sig = self.sig_types(m);
+            let (out, ins) = sig.split_last().expect("a signature has an output");
             let menv = ty::TypingEnv::post_analysis(tcx, m);
+            // the projections that the datatypes of ADTs take, normalised as `field_projections`
+            // finds them among the slots
+            self.proj_env = Some(menv);
+            let ps: Vec<String> = ins.iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(*t))).collect();
+            let ret = self.ty(tcx.erase_and_anonymize_regions(*out));
+            let f = self.dict_field(tr, m);
             let mut t = String::new();
             for b in self.own_dict_bounds(m) {
                 t.push_str(&format!("{} \\<Rightarrow> ", paren_ty(&self.dict_type(b, menv))));
@@ -548,12 +764,14 @@ impl<'tcx> Frontend<'tcx> {
             fields.push((f, t));
         }
         let env = ty::TypingEnv::post_analysis(tcx, tr);
+        // (the projections that the datatypes of ADTs take, normalised as `param_slots` finds them)
+        self.proj_env = Some(env);
         for (k, p) in self.dict_parents(tr).into_iter().enumerate() {
             let f = self.dict_parent_field(tr, k);
             let t = self.dict_type(p, env);
             fields.push((f, t));
         }
-        self.proj_tvars = saved;
+        (self.proj_tvars, self.proj_env) = (saved, saved_env);
         DictDecl { name, fields, tparams }
     }
 }
