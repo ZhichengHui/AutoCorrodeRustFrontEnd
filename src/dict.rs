@@ -745,13 +745,14 @@ impl<'tcx> Frontend<'tcx> {
         let saved_env = self.proj_env.take();
         let mut fields = vec![];
         for m in self.dict_methods(tr) {
-            let sig = tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(m).instantiate_identity().skip_normalization());
+            let sig = self.sig_types(m);
+            let (out, ins) = sig.split_last().expect("a signature has an output");
             let menv = ty::TypingEnv::post_analysis(tcx, m);
             // the projections that the datatypes of ADTs take, normalised as `field_projections`
             // finds them among the slots
             self.proj_env = Some(menv);
-            let ps: Vec<String> = sig.inputs().iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(*t))).collect();
-            let ret = self.ty(tcx.erase_and_anonymize_regions(sig.output()));
+            let ps: Vec<String> = ins.iter().map(|t| self.ty(tcx.erase_and_anonymize_regions(*t))).collect();
+            let ret = self.ty(tcx.erase_and_anonymize_regions(*out));
             let f = self.dict_field(tr, m);
             let mut t = String::new();
             for b in self.own_dict_bounds(m) {
