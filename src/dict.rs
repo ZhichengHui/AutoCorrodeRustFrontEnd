@@ -543,15 +543,10 @@ impl<'tcx> Frontend<'tcx> {
 
     /// The HOL type of the dictionaries for the trait reference `r` (normalised in `env`).
     pub fn dict_type(&mut self, r: ty::TraitRef<'tcx>, env: ty::TypingEnv<'tcx>) -> String {
-        let tcx = self.tcx;
         let n = self.dict_name(r.def_id);
         let mut a: Vec<String> = BASE_TVARS.iter().map(|s| s.to_string()).collect();
-        for t in r.args.types() {
+        for t in self.dict_type_parts(r, env) {
             a.push(self.ty(t));
-        }
-        for s in self.dict_slots(r) {
-            let s = crate::frontend::normalize(tcx, env, ty::Unnormalized::new_wip(s));
-            a.push(self.ty(s));
         }
         format!("({}) {}", a.join(", "), n)
     }
