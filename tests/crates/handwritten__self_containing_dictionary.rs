@@ -1,7 +1,8 @@
 // Dictionaries that contain themselves (as in jaq-core). The dictionary of `Data for J<V>` has,
 // for the bound `Self::D: Has<Self>` of its associated type, the dictionary of `Has<J<V>> for
 // L<J<V>>`, whose implementation requires `J<V>: Data`: the dictionary being built. In `G`, the
-// same cycle needs the dictionary at a bigger argument each round (`G<V>` needs `G<Box<V>>`).
+// same cycle needs the dictionary at a bigger argument each round (`G<V>` needs `G<Box<V>>`), which
+// is cut at the nesting limit.
 // Generic code passes dictionaries: as HOL terms they would be infinite, so its calls are
 // placeholders instead of an endless recursion of the frontend. At concrete types the functions
 // are translated per instance and need no dictionaries.

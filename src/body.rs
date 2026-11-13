@@ -230,6 +230,9 @@ enum UseKind {
 
 const FUEL: &str = "#[fuel(\\<epsilon>\\<open>urust_fuel\\<close>)]";
 
+/// The deepest nesting of implementations' dictionaries that is built (see `BodyTr::impl_dict`).
+const MAX_DICT_DEPTH: usize = 32;
+
 impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     pub fn new(fe: &'a mut Frontend<'tcx>, key: FnKey<'tcx>) -> Self {
         let tcx = fe.tcx;
@@ -2301,6 +2304,13 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     /// The dictionaries `key` takes (see `Frontend::dict_params`), for its bounds at the generic
     /// arguments `kargs` of their item.
     fn callee_dicts(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<Vec<String>> {
+        // a callee whose dictionaries cannot all be built is not called with them (`local_call`
+        // falls back to an instance, or the call is a placeholder): the calls of the ones built
+        // before the failure are dropped
+        self.undo_calls_on_error(|bt| bt.callee_dicts_built(key, kargs))
+    }
+
+    fn callee_dicts_built(&mut self, key: FnKey<'tcx>, kargs: GenericArgsRef<'tcx>) -> R<Vec<String>> {
         // a parameter of the callee bounded by an `Fn` trait is a function value (see
         // `Frontend::fn_param_types`): its argument must be a closure, a function item, or such a
         // parameter of the body (a function pointer, for one, is a placeholder type)
@@ -2512,32 +2522,33 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
     ///
     /// A dictionary is a HOL term built from its fields. A field (a method's function value with
     /// the dictionaries for its implementation's bounds, or a supertrait's or associated type
-    /// bound's dictionary) may need the dictionary of the same implementation again: at the same
-    /// arguments, the term would contain itself (jaq-core: the dictionary of `DataT for
+    /// bound's dictionary) may need the dictionary of the same implementation at the same
+    /// arguments again: the term would contain itself (jaq-core: the dictionary of `DataT for
     /// JustLut<V>` has, for the bound `Data<'a>: HasLut<'a, Self>`, the dictionary of `HasLut`
-    /// for `&Lut<JustLut<V>>`, whose implementation requires `JustLut<V>: DataT`); at arguments
-    /// containing the earlier ones, the terms would grow without end. Neither is supported. (At
-    /// smaller arguments, e.g. the dictionary of `Vec<Vec<u8>>` needing that of `Vec<u8>`, the
-    /// nesting ends.) A failed dictionary leaves no calls behind: the calls recorded for the
-    /// fields built before the failure are dropped with the term.
+    /// for `&Lut<JustLut<V>>`, whose implementation requires `JustLut<V>: DataT`). Needed at other
+    /// arguments, the nesting may end or not (the arguments can grow forever, e.g. `G<V>` needing
+    /// `G<Box<V>>`), which cannot be decided in general: nesting deeper than `MAX_DICT_DEPTH` is
+    /// not supported either, as instances beyond `MAX_INSTANCES`.
     fn impl_dict(&mut self, imp: DefId, args: GenericArgsRef<'tcx>) -> R<String> {
-        let args = self.tcx.erase_and_anonymize_regions(args);
-        for &(i, a) in &self.impl_dicts_building {
-            if i != imp {
-                continue;
-            }
-            if a == args {
-                return unsup("dictionary that contains itself (an implementation's dictionary needed again, through its bounds, while it is built)");
-            }
-            let earlier: Vec<Ty<'tcx>> = a.types().collect();
-            if !earlier.is_empty() && args.types().any(|t| t.walk().any(|g| g.as_type().is_some_and(|x| x != t && earlier.contains(&x)))) {
-                return unsup("dictionaries growing without end (an implementation's dictionary needed again, through its bounds, at arguments containing the earlier ones)");
-            }
+        let key = (imp, self.tcx.erase_and_anonymize_regions(args));
+        if self.impl_dicts_building.contains(&key) {
+            return unsup("dictionary that contains itself (an implementation's dictionary needed again at the same arguments, through its bounds, while it is built)");
         }
-        let (calls, gen_calls) = (self.calls.0.len(), self.fe.gen_calls.len());
-        self.impl_dicts_building.push((imp, args));
-        let r = self.impl_dict_fields(imp, args);
+        if self.impl_dicts_building.len() >= MAX_DICT_DEPTH {
+            return unsup(format!("dictionaries nested more than {} deep (e.g. an implementation's dictionary needed again at growing arguments)", MAX_DICT_DEPTH));
+        }
+        self.impl_dicts_building.push(key);
+        let r = self.undo_calls_on_error(|bt| bt.impl_dict_fields(imp, args));
         self.impl_dicts_building.pop();
+        r
+    }
+
+    /// `f`, dropping the calls and generic-call records it made if it fails: the term it was
+    /// building is discarded, and the body's calls must be those of its translation (they are
+    /// the edges of the call graph, see `translate::emit_funs`).
+    fn undo_calls_on_error<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        let (calls, gen_calls) = (self.calls.0.len(), self.fe.gen_calls.len());
+        let r = f(self);
         if r.is_err() {
             self.calls.0.truncate(calls);
             self.fe.gen_calls.truncate(gen_calls);
