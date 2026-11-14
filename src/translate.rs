@@ -125,7 +125,9 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, opts: &Options) {
     for id in items.impl_items() {
         let ii = tcx.hir_impl_item(id);
         let did = ii.owner_id.to_def_id();
-        if tcx.is_automatically_derived(tcx.parent(did)) {
+        // derived methods are modelled, except the ones translated as written (see
+        // `Frontend::translated_derived`)
+        if tcx.is_automatically_derived(tcx.parent(did)) && !fe.translated_derived(did) {
             continue;
         }
         match ii.kind {

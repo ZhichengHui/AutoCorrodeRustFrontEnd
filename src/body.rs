@@ -1789,7 +1789,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 let rd = inst.def_id();
                 self.tcx.impl_of_assoc(rd).is_some()
                     && (self.derived(rd) || self.fe.is_std(rd))
-                    && !args.types().any(|t| self.holds_hashmap(t, &mut HashSet::new()))
+                    && !args.types().any(|t| self.fe.holds_unfaithful_eq(t, &mut HashSet::new()))
             }
             _ => false,
         }
@@ -2475,6 +2475,16 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         let this = r.self_ty();
         let rhs = r.args.types().nth(1);
         let same = rhs.is_some_and(|t| self.fe.ty_dry(t).0 == self.fe.ty_dry(this).0);
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same {
+            let call = self.translated_eq(this, Tr::atom("a"), Tr::atom("b")).ok().flatten();
+            if let Some(c) = call {
+                return match name.as_str() {
+                    "eq" => Some(lam2(c.s)),
+                    "ne" => Some(lam2(format!("!{}", c.at(300)))),
+                    _ => None,
+                };
+            }
+        }
         if tcx.is_lang_item(tr, LangItem::PartialEq) && same && self.vec_of_hol_eq(this) {
             return match name.as_str() {
                 "eq" => Some("rvec_eq".into()),
@@ -2482,7 +2492,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
                 _ => None,
             };
         }
-        if tcx.is_lang_item(tr, LangItem::PartialEq) && same && !self.holds_hashmap(this, &mut HashSet::new()) {
+        if tcx.is_lang_item(tr, LangItem::PartialEq) && same && !self.fe.holds_unfaithful_eq(this, &mut HashSet::new()) {
             return match name.as_str() {
                 "eq" => Some(lam2("a == b".into())),
                 "ne" => Some(lam2("a != b".into())),
@@ -2845,6 +2855,11 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }) {
             return Some(f);
         }
+        // the discriminant of an enum (in the derived `PartialEq` of an enum, see
+        // `Frontend::translated_derived`)
+        if tcx.intrinsic(did).is_some_and(|i| i.name == sym::discriminant_value) {
+            return Some(StdFn::DiscriminantValue);
+        }
         let parent = tcx.parent(did);
         let owner = match tcx.def_kind(parent) {
             // `Into::into`, `AsRef::as_ref`, `Borrow::borrow` are their traits' only methods
@@ -3129,14 +3144,18 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             // a `Vec`'s clone is a new allocation (AutoCorrode's `rvec_clone`)
             Clone if self.is_vec(self.ty_adj(arg_exprs[0]).peel_refs()) => Some(self.named_call("rvec_clone", vec![a(0)])),
             Clone => Some(a(0)),
+            // a type whose derived `PartialEq` is translated (also through references): its `eq`
+            Eq | Ne if same_operands(self) && let Some(c) = self.translated_eq(self.ty_adj(arg_exprs[0]), a(0), a(1))? => {
+                Some(if matches!(f, Eq) { c } else { Tr::new(format!("!{}", c.at(300)), 300) })
+            }
             // the elements of `Vec`s whose elements HOL's equality compares (not the capacities)
             Eq | Ne if same_operands(self) && self.vec_of_hol_eq(self.ty_adj(arg_exprs[0]).peel_refs()) => {
                 Some(self.named_call(if matches!(f, Eq) { "rvec_eq" } else { "rvec_ne" }, vec![a(0), a(1)]))
             }
-            Eq if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut HashSet::new()) => {
+            Eq if same_operands(self) && !self.fe.holds_unfaithful_eq(self.ty_adj(arg_exprs[0]).peel_refs(), &mut HashSet::new()) => {
                 Some(Self::mk_bin("==", 44, &a(0), &a(1)))
             }
-            Ne if same_operands(self) && !self.holds_hashmap(self.ty_adj(arg_exprs[0]).peel_refs(), &mut HashSet::new()) => {
+            Ne if same_operands(self) && !self.fe.holds_unfaithful_eq(self.ty_adj(arg_exprs[0]).peel_refs(), &mut HashSet::new()) => {
                 Some(Self::mk_bin("!=", 44, &a(0), &a(1)))
             }
             // AutoCorrode's `cmp` needs an `order` on the operands' HOL type
@@ -3381,6 +3400,24 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
             },
             VecDedup => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
                 ty::Adt(_, va) if self.structural_eq_ty(va.type_at(0), &mut HashSet::new()) => Some(self.named_call("rvec_dedup", vec![a(0)])),
+                _ => None,
+            },
+            // a local enum translated to a `datatype` (one with fields): each variant's discriminant
+            DiscriminantValue => match self.ty_adj(arg_exprs[0]).peel_refs().kind() {
+                ty::Adt(def, _) if def.is_enum() && def.did().is_local() && def.variants().iter().any(|v| !v.fields.is_empty()) => {
+                    let rt = self.ty_of(e);
+                    let mut arms = vec![];
+                    for (vidx, d) in def.discriminants(self.tcx) {
+                        let env = self.typing_env();
+                        let bits = self.tcx.layout_of(env.as_query_input(d.ty)).expect("a discriminant type has a layout").size.bits();
+                        // a negative discriminant (its sign bit set) is not handled
+                        if d.ty.is_signed() && (d.val >> (bits - 1)) & 1 == 1 { return Ok(None) }
+                        let n = def.variant(vidx).fields.len();
+                        let pat = self.ctor_pat(def.did(), vidx.as_usize(), vec!["_".to_string(); n])?;
+                        arms.push(format!("{} \\<Rightarrow> {}", pat, Self::int_lit(d.val, false, rt)?.s));
+                    }
+                    Some(Tr::block(format!("match {} {{\n{}\n}}", a(0).at(20), arms.join(",\n"))))
+                }
                 _ => None,
             },
             PartialCmp => {
@@ -3642,25 +3679,6 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
-    /// Whether a value of type `t` holds a `HashMap` or a `Vec` (also in the fields of local
-    /// ADTs): the model of a map is a list in insertion order, that of a vector has its capacity,
-    /// so HOL's equality is not Rust's. A search over the types not in `seen`, each explored once
-    /// (see `glue_in`).
-    fn holds_hashmap(&self, t: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> bool {
-        if !seen.insert(t) { return false }
-        t.walk().any(|g| match g.kind() {
-            ty::GenericArgKind::Type(x) => match x.kind() {
-                ty::Adt(d, _) if matches!(self.fe.std_adt(d.did()), Some("HashMap" | "Vec")) => true,
-                ty::Adt(d, _) if d.did().is_local() && x != t => self.holds_hashmap(x, seen),
-                ty::Adt(d, args) if d.did().is_local() => {
-                    d.all_fields().any(|f| self.holds_hashmap(f.ty(self.tcx, args).skip_normalization(), seen))
-                }
-                _ => false,
-            },
-            _ => false,
-        })
-    }
-
     /// A conversion by `f` from `src` to `dst` (see `StdFn::Conversion`) between a `Vec` and the
     /// list of its elements, or `to_owned` of a `Vec`.
     fn vec_conversion(&mut self, src: Ty<'tcx>, dst: Ty<'tcx>, f: DefId) -> Option<VecConversion> {
@@ -3682,17 +3700,39 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         }
     }
 
+    /// `a == b` on the type `t` (behind references) whose derived `PartialEq` is translated (see
+    /// `Frontend::translated_derived`): the call of its `eq`; `None` for other types.
+    fn translated_eq(&mut self, t: Ty<'tcx>, a: Tr, b: Tr) -> R<Option<Tr>> {
+        let tcx = self.tcx;
+        let t = t.peel_refs();
+        let eq_trait = tcx.lang_items().eq_trait().expect("`PartialEq` is a lang item");
+        let eq = tcx
+            .associated_items(eq_trait)
+            .in_definition_order()
+            .find(|i| i.is_fn() && i.name() == sym::eq)
+            .expect("`PartialEq` has `eq`")
+            .def_id;
+        match self.resolve_instance(eq, tcx.mk_args(&[t.into(), t.into()])) {
+            Ok(Some(ty::Instance { def: ty::InstanceKind::Item(rd), args })) if self.fe.translated_derived(rd) => {
+                Ok(Some(self.local_call(rd, args, vec![a, b])?))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// A `Vec` whose elements are compared by HOL's equality (they hold no `HashMap` or `Vec`):
     /// its `PartialEq` is AutoCorrode's `rvec_eq`.
     fn vec_of_hol_eq(&self, t: Ty<'tcx>) -> bool {
         match t.kind() {
-            ty::Adt(_, args) if self.is_vec(t) => !self.holds_hashmap(args.type_at(0), &mut HashSet::new()),
+            ty::Adt(_, args) if self.is_vec(t) => !self.fe.holds_unfaithful_eq(args.type_at(0), &mut HashSet::new()),
             _ => false,
         }
     }
 
+    /// A method of a derived implementation that is modelled (not translated, see
+    /// `Frontend::translated_derived`).
     fn derived(&self, did: DefId) -> bool {
-        self.tcx.impl_of_assoc(did).map(|i| self.tcx.is_automatically_derived(i)).unwrap_or(false)
+        self.tcx.impl_of_assoc(did).map(|i| self.tcx.is_automatically_derived(i)).unwrap_or(false) && !self.fe.translated_derived(did)
     }
 
     /// Is `e` built only from locals and constants, literals, field accesses, indexing and
@@ -5306,6 +5346,8 @@ enum StdFn {
     DefaultFn,
     /// `char::encode_utf8`
     CharEncodeUtf8,
+    /// `intrinsics::discriminant_value` of a local enum
+    DiscriminantValue,
     /// `Range(Inclusive)::contains`
     RangeContains,
     /// `<[T]>::get_mut` with an index

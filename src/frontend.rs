@@ -705,6 +705,37 @@ impl<'tcx> Frontend<'tcx> {
 
     /// The standard library ADTs with a uRust counterpart, recognised by their lang or
     /// diagnostic item.
+    /// Whether a value of type `t` holds a `HashMap` or a `Vec` (also in the fields of local
+    /// ADTs): the model of a map is a list in insertion order, that of a vector has its capacity,
+    /// so HOL's equality is not Rust's. A search over the types not in `seen`, each explored once
+    /// (see `glue_in`).
+    pub fn holds_unfaithful_eq(&self, t: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> bool {
+        if !seen.insert(t) { return false }
+        t.walk().any(|g| match g.kind() {
+            ty::GenericArgKind::Type(x) => match x.kind() {
+                ty::Adt(d, _) if matches!(self.std_adt(d.did()), Some("HashMap" | "Vec")) => true,
+                ty::Adt(d, _) if d.did().is_local() && x != t => self.holds_unfaithful_eq(x, seen),
+                ty::Adt(d, args) if d.did().is_local() => {
+                    d.all_fields().any(|f| self.holds_unfaithful_eq(f.ty(self.tcx, args).skip_normalization(), seen))
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+    }
+
+    /// A method of a derived `PartialEq` implementation for a type holding a `Vec` or `HashMap`
+    /// (see `holds_unfaithful_eq`): HOL's equality is not its `eq`, so it is translated as the
+    /// code the derive generates (comparing the fields), not modelled by HOL's equality.
+    pub fn translated_derived(&self, did: DefId) -> bool {
+        let tcx = self.tcx;
+        let Some(imp) = tcx.impl_of_assoc(did) else { return false };
+        let Some(tr) = tcx.impl_opt_trait_ref(imp) else { return false };
+        tcx.is_automatically_derived(imp)
+            && tcx.is_lang_item(tr.skip_binder().def_id, LangItem::PartialEq)
+            && self.holds_unfaithful_eq(tcx.type_of(imp).instantiate_identity().skip_normalization(), &mut HashSet::new())
+    }
+
     pub fn std_adt(&self, did: DefId) -> Option<&'static str> {
         let tcx = self.tcx;
         let lang = |item| tcx.is_lang_item(did, item);

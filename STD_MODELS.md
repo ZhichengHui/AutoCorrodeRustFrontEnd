@@ -106,7 +106,7 @@
 | `<[T]>::swap` | `slice_swap`：交换两个位置，越界时 panic | 手写 | 同上 |
 | 数组重复表达式 `[x; N]`（语言构造，`N` 已知） | `vec_from_elem(x, N)`（`replicate N x`，一个列表） | 手写 | `BodyTr::expr`（`ExprKind::Repeat`） |
 
-丢掉的语义：元素的内存位置（重新分配不可见）和分配失败。未指定的容量是元素个数（或所需容量）与布局的一个确定的函数：同样的参数总得到同样的容量。含 `Vec` 的其他类型（`Option<Vec<T>>`、含 `Vec` 字段的本地类型）的 `clone` 仍是恒等（见“Clone”），所以其中 `Vec` 的容量不变，而 Rust 的克隆容量通常等于长度；它们的 `PartialEq` 不是 HOL 的相等（会比较容量），因此不再译成 `==`，而是外部函数模板。
+丢掉的语义：元素的内存位置（重新分配不可见）和分配失败。未指定的容量是元素个数（或所需容量）与布局的一个确定的函数：同样的参数总得到同样的容量。含 `Vec` 的其他类型（`Option<Vec<T>>`、含 `Vec` 字段的本地类型）的 `clone` 仍是恒等（见“Clone”），所以其中 `Vec` 的容量不变，而 Rust 的克隆容量通常等于长度；它们的 `PartialEq` 不是 HOL 的相等（会比较容量）：派生的 `PartialEq` 按派生生成的代码翻译（见“相等”），其他（`Option<Vec<T>>`、元组等标准库实现，以及元素含 `Vec` 的 `Vec` 的相等）生成外部函数模板。
 
 ### Box
 | Rust | 模型 | 来源 | 位置 |
@@ -148,7 +148,9 @@
 ### 相等（PartialEq）
 | Rust | 模型 | 来源 | 位置 |
 |---|---|---|---|
-| 标准库实现与派生实现的 `==`、`!=` | HOL `=`、`≠` | Isabelle/HOL | `binary`（`structural_eq`）、`std_call`；标准库、派生和内建实现的字典字段（`model_field`） |
+| 标准库实现与派生实现的 `==`、`!=`（类型不含 `Vec`、`HashMap`） | HOL `=`、`≠` | Isabelle/HOL | `binary`（`structural_eq`）、`std_call`；标准库、派生和内建实现的字典字段（`model_field`） |
+| 派生的 `PartialEq`，类型含 `Vec` 或 `HashMap`（它们的表示带容量或插入顺序，HOL 的相等不是 Rust 的相等） | 不建模：按派生生成的代码翻译成 `<类型>_PartialEq_eq`（逐字段比较，`Vec` 字段用 `rvec_eq`）；`!=` 是它的否定；经引用比较（`&T == &T`）和字典字段同样调用它 | 前端翻译 | `Frontend::translated_derived`、`std_call`、`model_field` |
+| `intrinsics::discriminant_value`（派生的 `PartialEq` 中），本地的、有带字段变体的枚举 | 按变体 `match`，值为 rustc 给出的判别值（负的判别值没有模型） | 前端写法 | `std_call` |
 
 丢掉的语义：字段类型有自定义（非结构）的 `PartialEq` 时，派生实现不是结构相等；外部类型（如 `HashMap`）的相等不由表示决定。
 
