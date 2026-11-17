@@ -2152,7 +2152,7 @@ impl<'a, 'tcx> BodyTr<'a, 'tcx> {
         };
         if sig.inputs().iter().any(|t| fmt_arguments(*t)) || fmt_arguments(sig.output()) {
             if sig.output().is_unit() {
-                let m = self.fe.placeholder("output (print!/println!), dropped", Some(sp));
+                let m = self.fe.ignored_output(sp);
                 self.comments.push(m);
                 return Ok(Some(Tr::atom("()")));
             }

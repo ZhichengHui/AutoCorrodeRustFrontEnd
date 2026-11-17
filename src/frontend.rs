@@ -139,6 +139,8 @@ pub struct Frontend<'tcx> {
     /// the `impl Trait` types whose hidden types `ty` is translating
     opaques: Vec<DefId>,
     pub placeholders: Vec<String>,
+    /// Output calls (`print!`, `println!`, ...) translated as `()`: registered, but not placeholders.
+    pub ignored_output: Vec<String>,
     /// Number of uses of placeholder types so far (see `ty_modelled`).
     placeholder_type_uses: usize,
     /// the ADT types `ty` is translating, outermost first (see `ty`)
@@ -397,6 +399,7 @@ impl<'tcx> Frontend<'tcx> {
             fmt_traits: fmt_traits_of(tcx),
             opaques: Vec::new(),
             placeholders: Vec::new(),
+            ignored_output: Vec::new(),
             placeholder_type_uses: 0,
             adts_in_progress: vec![],
             fun_defs: Vec::new(),
@@ -443,6 +446,16 @@ impl<'tcx> Frontend<'tcx> {
         };
         let loc = sp.map(|sp| format!("line {}: ", self.tcx.sess.source_map().lookup_char_pos(sp.lo()).line)).unwrap_or_default();
         self.placeholders.push(format!("{}{}", loc, marker));
+        marker
+    }
+
+    /// Record an output call at `sp`, translated as `()`. Output does not change the values a
+    /// function computes, so it is not a placeholder; it is still registered in `PLACEHOLDERS.txt`
+    /// (as ignored output), and the returned text marks it in a comment of the generated theory.
+    pub fn ignored_output(&mut self, sp: Span) -> String {
+        let marker = format!("IGNORED output: {}", one_line(&self.snippet(sp)));
+        let line = self.tcx.sess.source_map().lookup_char_pos(sp.lo()).line;
+        self.ignored_output.push(format!("line {}: {}", line, marker));
         marker
     }
 
