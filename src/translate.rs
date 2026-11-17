@@ -1823,6 +1823,12 @@ fn write_all(fe: &mut Frontend<'_>, opts: &Options, types_text: String, funs_tex
     for p in &fe.placeholders {
         writeln!(rep, "- {}", one_line(p)).unwrap();
     }
+    if !fe.ignored_output.is_empty() {
+        writeln!(rep, "Ignored output (print!, println!, eprint!, eprintln!; translated as `()`): {}", fe.ignored_output.len()).unwrap();
+        for p in &fe.ignored_output {
+            writeln!(rep, "- {}", one_line(p)).unwrap();
+        }
+    }
     std::fs::write(dir.join("PLACEHOLDERS.txt"), &rep).unwrap();
     eprint!("{}", rep);
 }
